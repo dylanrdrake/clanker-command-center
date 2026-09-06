@@ -3,53 +3,12 @@
 * connect providers directly, like Anthropic, OpenAI, etc..
 
 Clanker re-design — API surface and theme, cheapest first
-1. Spawn clanker instead of New session. The launch screen's "New session"
-   row becomes "Spawn clanker", and the naming screen gains a reroll: the
-   mark is hashed from the session id, so regenerating the id regenerates
-   the mark, and you keep rolling until you like the one you are about to
-   create. The only structural part is small — store.rs's create_session
-   generates the uuid itself, so the id has to be chosen on the naming
-   screen and passed down through ChatSession::create instead. No storage
-   change, no CLI change; docs are the naming-screen paragraph and the key
-   table.
-2. approval commands -> tools. `clank approval`/`/approval` become
-   `tools`, and the bare form stops being a settings dump and becomes a
-   listing: the actual tools, each with its approval status, so one command
-   answers both "what can this thing do to my machine" and "what is it
-   allowed to do without asking". Cheaper than it looks — of the 563 hits
-   for "approval" in src/ nearly all are ApprovalSettings and the gate
-   plumbing, which stay. It is the surface that moves: one clap subcommand,
-   one entry in the COMMANDS table, classify, /status's wording, 58 doc
-   hits.
-   Settle first, because it is the difference between small and medium:
-   gates are per *category* today (read/write/terminal), not per tool. A
-   listing that shows each tool with its category's status is data that
-   already exists. Per-tool gates — `tools web_fetch off` — mean new
-   storage, a migration and a new gate check, and it stops being a rename.
-3. No agents or sessions or ask mode, just clankers with or without tools.
-   (The old "create clankers" theme item is the same change said the other
-   way round, so it is folded in here.) Collapse three user-facing nouns
-   into one: today you meet `ask`, `agent`, and `session`/`tui`, plus a
-   mode inside a session that /agent and /ask flip. The only noun becomes a
-   clanker and the only question about it is whether tools are allowed;
-   "session" survives as the internal word — the table, ChatSession, the
-   code — it just stops being something a user has to learn. The widest of
-   these: 133 hits in src/ for the mode plumbing (agentic, KIND_CHAT /
-   KIND_AGENT_CHAT, mode_label), 46 in the README, plus EXAMPLES and
-   WALKTHROUGH. And not only a rename — `clank ask "..."` and `clank agent
-   "..."` are two one-shot commands distinguished by exactly the thing this
-   makes a flag, so what replaces them is a real decision, and it breaks a
-   documented CLI. The stored `kind` column can stay and be mapped, which
-   keeps this out of migration territory.
-4. Tutorial option on the picker screen. Last only because it is undefined.
+* Tutorial option on the picker screen. Last only because it is undefined.
    A static screen of keys and concepts is the smallest thing on this list
    and belongs first; an interactive walkthrough — a scripted clanker that
    talks you through spawning one, approving a tool call, backing out — is
    the largest, needs a screen mode with its own state, and is mostly
    writing content rather than code.
-
-Sequencing: 2 and 3 rewrite the same README sections and the same COMMANDS
-table, so back to back they cost noticeably less than apart.
 
 * prompt caching
 * what else could be added to verbose mode?

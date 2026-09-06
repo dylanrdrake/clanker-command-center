@@ -78,6 +78,9 @@ Edge cases:
 `8adb1a6` removed the "In this directory" / "Elsewhere" split.
 
 - `clank` → one list, newest first, no section headings.
+- Columns, left to right: mark, name, state badge, 🔨/💬, 🪙 tokens,
+  directory, when, last message. Check they stay lined up with each other
+  down the whole list, including rows whose state badge is animating.
 - Directory column: `.` for the directory you are in, `~/…` under home, a
   full path above home, `dir not recorded` for clankers saved before it was
   tracked.
@@ -350,6 +353,29 @@ clank ask "..."                            unknown command now
   look at the launch screen in another; opening it there should be refused
   with a one-line notice, and the notice should clear on the next keypress.
 - **Bare `/effort`** reports the level instead of erroring.
+
+## 14. Token counting
+
+New: every clanker keeps a running total of what it has spent.
+
+- A fresh clanker reads `🪙 0` in its title row (top right) and on its
+  launch-screen row.
+- Send one message → both go up, and to the same number. `/status` prints
+  the same total again with every digit, comma-grouped.
+- Send another → it *accumulates* rather than being replaced by the last
+  turn's cost.
+- `Ctrl-B` out and back in → the number survives. Quit `clank` entirely and
+  reopen it → still there, since it is stored on the clanker.
+- A turn with tools (several requests in one turn) should add the whole
+  loop's cost, not just the last call's — run something that makes the model
+  call two or three tools and check the jump is proportionate.
+- Cancel a turn with `Esc` part-way through → whatever had already come back
+  is still counted. A request that was paid for should not vanish because
+  the turn it belonged to was abandoned.
+- `/stream off`, then send a message → still counted. Streaming and buffered
+  requests report usage by different routes, so both need checking.
+- Against a provider that reports no usage at all, the total should simply
+  stay where it was rather than resetting or showing something odd.
 
 ## Known, not worth reporting
 

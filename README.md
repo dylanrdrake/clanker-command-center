@@ -14,6 +14,7 @@ CCC is most stable on Linux at the moment!
 - **Model selection** — Choose from configured provider's models
 - **Agentic loops** — Multi-turn execution with tool calling
 - **Persistent clankers** — `clanker`/`tui` conversations are saved to SQLite and resumable across restarts
+- **Token counting** — every clanker keeps a running 🪙 total of what it has spent, in its title row, on the launch screen, and in `/status`
 - **Secure credential storage** — API keys live in your OS keychain, not a plaintext file
 
 ## Manual Installation
@@ -433,7 +434,7 @@ exactly:
 | `/tools` | List every tool and what it may do |
 | `/sandbox <on\|off>` | Confine the agent's file writes to the working directory, or allow them anywhere. Takes effect immediately, including partway through a running turn |
 | `/sandbox` | Show whether writes are currently confined |
-| `/status` | Show every setting this clanker is running with — model, effort, temperature, iteration cap, sandbox, verbose, highlighting, streaming, what each tool may do, and the directory it runs in. The clanker-scoped counterpart to `clank status` |
+| `/status` | Show every setting this clanker is running with — model, effort, temperature, iteration cap, sandbox, verbose, highlighting, streaming, what each tool may do, the tokens it has spent, and the directory it runs in. The clanker-scoped counterpart to `clank status` |
 | `/highlight <on\|off>` | Band your own messages in the transcript, or don't. Bare `/highlight` shows the current setting |
 | `/clanker title <new title>` | Rename this clanker. Bare `/clanker` (or `/clanker title`) shows its current name |
 | `/send`, `/discard` | Answer the `$` command box — the same as `Ctrl-S` and `Ctrl-D`. Typed forms exist because terminals claim chords: Zed's takes `Ctrl-S` |
@@ -536,10 +537,15 @@ the same for the life of the clanker. It says nothing you can type — the
 clanker id isn't shown on the launch screen at all — and exists purely so a
 row you have seen before is recognisable while the list refreshes and rows
 move under you. Inside that clanker the same mark leads its title row —
-`<mark> <name>  <directory>` — and sits in the gutter beside every reply, and
-the CLI draws it too, so a reply is tied to the clanker it came from wherever
-you read it. Names repeat and directories are shared; the mark is the thing
-that says *which* clanker you are looking at.
+`<mark> <name>  <directory>`, with its token total right-aligned on the far
+side — and sits in the gutter beside every reply, and the CLI draws it too,
+so a reply is tied to the clanker it came from wherever you read it. Names
+repeat and directories are shared; the mark is the thing that says *which*
+clanker you are looking at.
+
+**Every row is one clanker, left to right:** its mark, its name, what it's
+doing, whether it has tools, what it has cost, where it runs, when it was
+last touched, and what it last said.
 
 A clanker being run by another process can be seen but not opened: only one
 process may hold a clanker at a time, since two appending turns to one
@@ -552,7 +558,8 @@ seconds so one you're running in another terminal stays current:
 
 | | Meaning |
 |---|---|
-| 🔨 / 💬 | Whether that clanker has tools, in the column beside its mark. The hammer is the one the transcript puts in front of every tool call |
+| 🔨 / 💬 | Whether that clanker has tools, in the column after its state. The hammer is the one the transcript puts in front of every tool call |
+| 🪙 `<n>` | What it has cost so far — see [Token counting](#token-counting). Abbreviated to fit the column (`1.2k`, `3.4M`); `/status` prints every digit |
 | spinner, yellow | Working — a request is in flight right now. The same animation and colour a conversation shows for itself |
 | `?` yellow | Waiting on an approval nobody has answered. A clanker you are *inside* says the same thing in its settings row — `? waiting` in place of the working spinner, since a turn stopped at a gate is not moving |
 | `✗` red | The last turn ended in an error — worth resuming to see why |
@@ -567,11 +574,11 @@ call shows the tool it asked for), but a clanker waiting on an approval shows
 *what* it's asking about instead — `needs approval — run_terminal_command: rm
 -rf build` — since that's the row you'd want to act on.
 
-The first three come from the process running the clanker, which is the only
-thing that knows them: a turn's messages are only written when it *finishes*,
-so from storage alone a request in flight looks exactly like a turn that
-failed. The rest are read from the messages themselves, and are what a
-clanker nobody is running can tell you.
+Working, waiting and failed come from the process running the clanker, which
+is the only thing that knows them: a turn's messages are only written when it
+*finishes*, so from storage alone a request in flight looks exactly like a
+turn that failed. The rest are read from the messages themselves, and are
+what a clanker nobody is running can tell you.
 
 Clankers started or deleted elsewhere appear and disappear as the list
 refreshes, and the cursor follows the clanker it was on rather than the row
@@ -676,7 +683,7 @@ Three things worth knowing:
 | `/tools` | List every tool and what it may do |
 | `/sandbox <on\|off>` | Confine the agent's file writes to the working directory, or allow them anywhere. Takes effect immediately, including partway through a running turn |
 | `/sandbox` | Show whether writes are currently confined |
-| `/status` | Show every setting this clanker is running with — model, effort, temperature, iteration cap, sandbox, verbose, highlighting, streaming, what each tool may do, and the directory it runs in. The clanker-scoped counterpart to `clank status` |
+| `/status` | Show every setting this clanker is running with — model, effort, temperature, iteration cap, sandbox, verbose, highlighting, streaming, what each tool may do, the tokens it has spent, and the directory it runs in. The clanker-scoped counterpart to `clank status` |
 | `/highlight <on\|off>` | Band your own messages in the transcript, or don't. Bare `/highlight` shows the current setting |
 | `/clanker title <new title>` | Rename this clanker. Bare `/clanker` (or `/clanker title`) shows its current name |
 
@@ -963,6 +970,39 @@ every single tool call, so changing one mid-turn applies to the turn that is
 running — which is the entire point, since revoking permission is not much
 use if it waits politely for the current work to finish.
 
+### Token counting
+
+Every clanker keeps a running total of the tokens it has spent, marked with
+a gold coin wherever it appears:
+
+- **In the clanker**, right-aligned on the title row, so what the
+  conversation has cost is in view without asking for it.
+- **On the launch screen**, a column per row, abbreviated to fit (`1.2k`,
+  `3.4M`) — which is what makes it comparable across clankers.
+- **In `/status`**, as a `Tokens` row with every digit.
+- **In `clank clanker`**, the same `/status` row, since both front ends
+  render it from the same list.
+
+What it counts is what the provider reports for each request — prompt plus
+completion, as its `usage` says — summed across every request a turn makes.
+A turn with tools is many requests, so its cost is the whole loop's, not the
+last call's. The total is added to the clanker when the turn ends, and that
+happens whether the turn finished, failed, or you cancelled it: a request
+that came back was paid for regardless of what became of the turn it
+belonged to.
+
+Two things follow from it being the provider's number rather than ours.
+Streaming requests ask for it explicitly (`stream_options.include_usage`),
+since a stream otherwise ends without ever saying; and a provider that
+reports nothing adds nothing, so the total stays where it was rather than
+being guessed at. A clanker from before this existed reads as `0`, which is
+indistinguishable from one that has never run a turn — there is no way to
+recover what was spent before it was being counted.
+
+The count is per clanker and lives on its row in the database, so it
+survives exit, follows a resume, and is what the launch screen reads for
+clankers nobody is running.
+
 ## Agentic Tools
 
 A run with tools — `clank "..." --tools`, or a clanker that has them — gives the LLM access to these:
@@ -1081,6 +1121,11 @@ From then on, the clanker's settings are entirely its own: `/model` and `/tools`
 - **`/setting default`** is a one-time snapshot instead: it reads whatever the global default currently is and saves that concrete value to the clanker right now — frozen from that point on, exactly like typing the value itself, and distinct from `clear` even when the global default happens to be unset (an `/effort default` with no global default configured saves `None` explicitly, the same as `clear` would, but as a deliberate choice rather than an indefinite fallback).
 
 Either way, every outgoing request from a clanker reads its own stored settings directly, never your global config — including for a value that's currently `None`. Later changing a global default with `clank model`/`clank temperature`/etc. never reaches into any clanker that already exists, whether that clanker has an explicit value, is nullified, or was created before you ever set the global default at all. The global defaults themselves work the same way: `clank max-iterations --clear`/`clank temperature --clear` null them out too (see [`max-iterations`](#max-iterations-value) and [`temperature`](#temperature-value)), and nothing brings them back except setting one explicitly again.
+
+A clanker's token total is stored the same way but works the other way
+round: it is the one number a turn *adds to* rather than a setting a turn
+reads, so it accumulates across every turn the clanker ever runs and is never
+re-resolved against anything global. See [Token counting](#token-counting).
 
 Each clanker gets an id (a UUID) and a title derived from your first message (or one you choose up front, in the TUI). Use:
 
