@@ -498,16 +498,38 @@ switch between once you are there — a clanker is one thing, and what it can
 do is what its tools say. A resumed clanker picks back up with the tools,
 model and effort level it was last left with.
 
-Choosing "Spawn clanker" from the launch screen asks for a name, and requires
-one — starting a clanker is meant to be deliberate, so there's no untitled
-path. The clanker is kept from the moment you confirm it, whether or not you
-ever say anything in it.
+Choosing "Deploy clanker" from the launch screen opens **Clanker
+Deployment**: a form for everything the clanker starts with, and the first
+thing you want it to do. A name is required — starting a clanker is meant to
+be deliberate, so there's no untitled path. The clanker is kept from the
+moment you deploy it, whether or not anything is ever said in it.
+
+Under **Settings** are the values the clanker is created with, each seeded
+from the configured default so pressing Enter straight away deploys what a
+new clanker always was:
+
+| | |
+|---|---|
+| `Tools` | Whether it deploys with tools — the ones `clank tools` allows, exactly as `/tools on` would give it. Off by default: what a clanker may do to your machine is a decision worth making, not one to inherit from a config file you set months ago |
+| `Model` | The model it runs, instead of `clank model`'s default |
+| `Effort` | Reasoning effort, cycling through `default` (no field sent), `low`, `medium`, `high` — plus whatever `clank effort` is set to, if that's something else |
+| `Temperature` | Emptying it is a real setting: no temperature field is sent at all, and the row says `none sent` |
+| `Sandbox` | Whether the agent's file writes are confined to the directory you're deploying from |
+
+Under **Initial Orders** is the first message, sent the moment the clanker
+opens — so a clanker can be deployed already working rather than opened and
+then told what to do. Leave it empty and it opens waiting for you, as it
+always did.
+
+Everything here can still be changed from inside the clanker with the usual
+`/model`, `/tools`, `/effort`, `/temperature` and `/sandbox`; this is where
+it's cheaper to say up front.
 
 That screen also shows the mark the new clanker will carry, and `Tab` rolls
 another. Because the mark is hashed from the clanker id, and the id is fixed
 once the clanker exists, this is the only moment it can be chosen rather than
-dealt — so keep pressing `Tab` until you get one you like, then name it and
-hit Enter.
+dealt — so keep pressing `Tab` until you get one you like, then fill the form
+in and hit Enter.
 
 Every clanker carries a small square of braille dots, hashed from its id and
 the same for the life of the clanker. It says nothing you can type — the
@@ -569,12 +591,14 @@ that clanker again.
 | `d` | Delete the selected clanker (asks to confirm) |
 | `q` | Quit |
 
-**Naming a clanker** (after choosing `Spawn clanker`)
+**Clanker Deployment** (after choosing `Deploy clanker`)
 
 | Key | Does |
 |---|---|
+| `↑` / `↓` | Move between the form's fields |
+| `←` / `→` (or `Space`) | Change the field you're on, where it holds one of a set — `Tools`, `Effort`, `Sandbox`. Typing goes into the rest |
 | `Tab` | Roll a different mark. It is hashed from the clanker id, which is fixed once the clanker exists, so this screen is the only place it can be chosen |
-| `Enter` | Spawn it with the name you typed. A blank name does nothing |
+| `Enter` | Deploy it. A blank name, a blank model, or a temperature that isn't a number is refused here — with the reason under the form, and nothing created |
 | `Esc` | Back to the list, having created nothing |
 
 Opening a clanker whose directory no longer exists asks whether to resume in

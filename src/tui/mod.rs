@@ -30,7 +30,7 @@ use crate::client::Client;
 use crate::config::ToolAccessSettings;
 use crate::conversation::{command_for, Command, Conversation};
 use crate::session::{self, ChatSession};
-use crate::store::{self, SessionSummary, StoredMessage, KIND_CHAT};
+use crate::store::{self, SessionSummary, StoredMessage, KIND_AGENT_CHAT, KIND_CHAT};
 use crate::ui::response_label;
 use anyhow::Result;
 use app::{App, ShellState, TranscriptItem};
@@ -42,7 +42,7 @@ use crossterm::event::{
 };
 use crossterm::{execute, terminal};
 use futures_util::StreamExt;
-use picker::{Activation, Picker, SessionRow};
+use picker::{Activation, Deployment, Picker, Plan, SessionRow};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use std::io::{self, Stdout};
@@ -86,15 +86,11 @@ enum Screen {
     /// Boxed for the same reason `Chat` is: it dwarfs the other variants,
     /// and every `Screen` would otherwise carry its footprint.
     Launch(Box<Picker>),
-    /// Naming a clanker before it's spawned — reached by choosing "Spawn
-    /// clanker" on the launch screen.
-    NameSession {
-        input: String,
-        /// The id it will be created with, rolled here rather than at
-        /// creation so its mark can be shown — and rolled again — before
-        /// anything is written. See [`session::new_id`].
-        id: String,
-    },
+    /// Setting a clanker up before it exists — reached by choosing "Deploy
+    /// clanker" on the launch screen. Boxed for the same reason as the
+    /// others: it is a form with several fields, and every `Screen` would
+    /// otherwise carry them.
+    Deploy(Box<Deployment>),
     Chat(Box<Chat>),
 }
 
@@ -168,23 +164,36 @@ fn current_dir() -> Option<String> {
         .map(|dir| dir.display().to_string())
 }
 
-fn open_new(context: &Context, title: String, id: String) -> Result<Chat> {
-    // A new clanker starts with no tools, and `/tools on` gives it the ones
-    // `clank tools` allows. Starting able to write to disk is not something
-    // to inherit from a config file you set months ago — the configured
-    // access says what tools may do *once they are on*, not that they are.
-    let kind = KIND_CHAT;
+fn open_new(context: &Context, plan: Plan) -> Result<Chat> {
+    // A clanker deployed with tools gets the ones `clank tools` allows —
+    // the same set `/tools on` would hand it — and one deployed without gets
+    // none at all. The configured access says what tools may do *once they
+    // are on*, which is why "on" is a choice made on the deployment screen
+    // rather than inherited from a config file you set months ago.
+    let tool_access = if plan.tools {
+        context.tool_access.clone()
+    } else {
+        ToolAccessSettings::none()
+    };
+    // Written to match the tools it is created with, so a row read without
+    // being opened says the same thing the clanker would — the same job
+    // `ChatSession::sync_kind` does for every later change.
+    let kind = if tool_access.any_tools() {
+        KIND_AGENT_CHAT
+    } else {
+        KIND_CHAT
+    };
 
     let mut session = ChatSession::create(
         store::open_db()?,
-        id,
-        context.default_model.clone(),
+        plan.id,
+        plan.model,
         kind,
-        context.effort_level.clone(),
+        plan.effort,
         context.max_iterations,
-        context.temperature,
-        ToolAccessSettings::none(),
-        context.sandbox,
+        plan.temperature,
+        tool_access,
+        plan.sandbox,
         context.verbose,
         context.highlight,
         context.stream,
@@ -192,7 +201,7 @@ fn open_new(context: &Context, title: String, id: String) -> Result<Chat> {
             .ok()
             .map(|dir| dir.display().to_string()),
     )?;
-    session.set_title(title)?;
+    session.set_title(plan.title)?;
     // The agent system prompt is not written into history: `agent.rs`'s
     // `normalize_system_prompt` strips any stored copy and prepends a fresh
     // one on every turn that has tools, which is what lets tools be turned
@@ -482,7 +491,7 @@ fn draw(terminal: &mut Tui, screen: &mut Screen, tick: usize, selection: bool) -
             "↑/↓ move · Enter open · r rename · d delete · q quit",
             tick,
         ),
-        Screen::NameSession { input, id } => picker::draw_naming(frame, input, id),
+        Screen::Deploy(deployment) => picker::draw_deployment(frame, deployment),
         Screen::Chat(chat) => render::draw(frame, &chat.app, &mut chat.transcript_cache, tick),
     })?;
     Ok(())
@@ -649,7 +658,7 @@ async fn handle_key(
 
     match screen {
         Screen::Launch(_) => handle_picker_key(context, screen, parked, key).await,
-        Screen::NameSession { .. } => handle_naming_key(context, screen, key),
+        Screen::Deploy(_) => handle_deploy_key(context, screen, key),
         Screen::Chat(chat) => {
             if handle_chat_key(&mut chat.app, &chat.conversation, key) {
                 let busy = chat.app.busy;
@@ -785,10 +794,13 @@ async fn handle_picker_key(
             };
             match activation {
                 Activation::NewSession => {
-                    *screen = Screen::NameSession {
-                        input: String::new(),
-                        id: session::new_id(),
-                    }
+                    *screen = Screen::Deploy(Box::new(Deployment::new(
+                        session::new_id(),
+                        context.default_model.clone(),
+                        context.effort_level.clone(),
+                        context.temperature,
+                        context.sandbox,
+                    )))
                 }
                 Activation::Resume(row) => {
                     match parked.iter().position(|chat| chat.app.session_id == row.id) {
@@ -826,37 +838,45 @@ async fn handle_picker_key(
     Ok(false)
 }
 
-/// Handles a keypress on the new-session naming prompt. Returns whether the
+/// Handles a keypress on the Clanker Deployment screen. Returns whether the
 /// TUI should exit (always `false` — quitting from here isn't supported,
 /// same as any other picker screen).
-fn handle_naming_key(context: &Context, screen: &mut Screen, key: KeyEvent) -> Result<bool> {
-    let Screen::NameSession { input, id } = screen else {
-        unreachable!("naming screen only")
+fn handle_deploy_key(context: &Context, screen: &mut Screen, key: KeyEvent) -> Result<bool> {
+    let Screen::Deploy(deployment) = screen else {
+        unreachable!("deployment screen only")
     };
 
     match key.code {
         KeyCode::Esc => *screen = Screen::Launch(Box::new(launch_picker()?)),
-        KeyCode::Enter => {
-            // A blank title does nothing rather than starting an untitled
-            // session: naming it is the deliberate act that creating one
-            // should take, and it's what makes the session worth keeping
-            // whether or not anything is ever said in it.
-            let title = input.trim();
-            if !title.is_empty() {
-                let title = title.to_string();
-                let id = id.clone();
-                *screen = Screen::Chat(Box::new(open_new(context, title, id)?));
+        KeyCode::Enter => match deployment.plan() {
+            Ok(plan) => {
+                let orders = plan.orders.clone();
+                let chat = open_new(context, plan)?;
+                // Sent rather than typed for you: it goes to the worker the
+                // way any message does, so the transcript, the activity the
+                // picker reads, and the turn itself all begin exactly as if
+                // you had opened the clanker and typed it.
+                if let Some(orders) = orders {
+                    chat.conversation.send(Command::Send(orders));
+                }
+                *screen = Screen::Chat(Box::new(chat));
             }
-        }
+            // Nothing is created and nothing is lost: the form stays as it
+            // is with the reason under it, which is the only place the fix
+            // can be made.
+            Err(error) => deployment.error = Some(error),
+        },
         // Another id, which means another mark: the one thing about a
         // clanker you cannot change afterwards, so it is worth being able to
-        // roll for one you like before it exists. Tab because every other
-        // key on this screen is either the name or the answer.
-        KeyCode::Tab => *id = session::new_id(),
-        KeyCode::Backspace => {
-            input.pop();
-        }
-        KeyCode::Char(c) if is_typed_char(&key) => input.push(c),
+        // roll for one you like before it exists. Tab rather than a letter
+        // because most of this screen is fields you type into.
+        KeyCode::Tab => deployment.id = session::new_id(),
+        KeyCode::Up => deployment.move_up(),
+        KeyCode::Down => deployment.move_down(),
+        KeyCode::Left => deployment.change(-1),
+        KeyCode::Right => deployment.change(1),
+        KeyCode::Backspace => deployment.backspace(),
+        KeyCode::Char(c) if is_typed_char(&key) => deployment.type_char(c),
         _ => {}
     }
     Ok(false)
@@ -1234,61 +1254,142 @@ mod tests {
         }
     }
 
+    /// A deployment screen holding `name`, as the launch screen would build
+    /// it from the configured defaults.
+    fn deploy_screen(name: &str) -> Screen {
+        let mut deployment = Deployment::new(
+            session::new_id(),
+            "test-model".to_string(),
+            None,
+            Some(0.7),
+            true,
+        );
+        deployment.name = name.to_string();
+        Screen::Deploy(Box::new(deployment))
+    }
+
     #[test]
-    fn a_blank_title_does_not_start_a_session() {
+    fn a_blank_title_does_not_deploy_a_clanker() {
         // Naming it is the deliberate act of creating one, so Enter on an
         // empty name has nothing to do — it must not fall through to
-        // starting an untitled session.
+        // deploying an untitled clanker.
         //
-        // Only the blank path is tested here: every other key on this screen
-        // reaches the database (Esc rebuilds the picker, a real title opens a
-        // session), and a unit test has no business reading the user's own.
+        // Only the refused paths are tested here: a deploy that succeeds
+        // reaches the database, and a unit test has no business writing to
+        // the user's own.
         let context = test_context();
-        let mut screen = Screen::NameSession {
-            input: "   ".to_string(),
-            id: session::new_id(),
+        let mut screen = deploy_screen("   ");
+
+        handle_deploy_key(&context, &mut screen, KeyEvent::from(KeyCode::Enter)).unwrap();
+
+        let Screen::Deploy(deployment) = &screen else {
+            panic!("a blank name should leave you on the deployment screen")
         };
+        assert_eq!(deployment.error.as_deref(), Some("A name is required"));
 
-        handle_naming_key(&context, &mut screen, KeyEvent::from(KeyCode::Enter)).unwrap();
+        // And typing takes the complaint back down: it is about to stop
+        // being true.
+        handle_deploy_key(&context, &mut screen, KeyEvent::from(KeyCode::Char('a'))).unwrap();
+        let Screen::Deploy(deployment) = &screen else {
+            unreachable!()
+        };
+        assert_eq!(deployment.error, None);
+    }
 
+    #[test]
+    fn a_temperature_that_is_not_a_number_is_refused_here() {
+        // Caught on the form rather than at creation: the alternative is a
+        // clanker that exists and fails on its first turn.
+        let context = test_context();
+        let mut screen = deploy_screen("Parser work");
+        let Screen::Deploy(deployment) = &mut screen else {
+            unreachable!()
+        };
+        deployment.focus = picker::Field::Temperature;
+        deployment.temperature = "warm".to_string();
+
+        handle_deploy_key(&context, &mut screen, KeyEvent::from(KeyCode::Enter)).unwrap();
+
+        let Screen::Deploy(deployment) = &screen else {
+            panic!("a bad temperature should leave you on the deployment screen")
+        };
         assert!(
-            matches!(screen, Screen::NameSession { .. }),
-            "a blank title should leave you on the naming screen"
+            deployment
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("Temperature")),
+            "{:?}",
+            deployment.error
         );
     }
 
     #[test]
-    fn tab_rolls_a_different_clanker_and_leaves_the_name_alone() {
+    fn tab_rolls_a_different_clanker_and_leaves_the_form_alone() {
         // The mark is hashed from the id, so a new id is the only way to a
         // new mark — and it has to happen before creation, since afterwards
         // the id is what everything else refers to.
         let context = test_context();
-        let mut screen = Screen::NameSession {
-            input: "Parser work".to_string(),
-            id: session::new_id(),
-        };
-        let Screen::NameSession { id: before, .. } = &screen else {
+        let mut screen = deploy_screen("Parser work");
+        let Screen::Deploy(deployment) = &screen else {
             unreachable!()
         };
-        let before = before.clone();
+        let before = deployment.id.clone();
 
-        handle_naming_key(&context, &mut screen, KeyEvent::from(KeyCode::Tab)).unwrap();
+        handle_deploy_key(&context, &mut screen, KeyEvent::from(KeyCode::Tab)).unwrap();
 
-        let Screen::NameSession { input, id } = &screen else {
-            panic!("Tab left the naming screen")
+        let Screen::Deploy(deployment) = &screen else {
+            panic!("Tab left the deployment screen")
         };
-        assert_ne!(*id, before, "Tab must roll a different id");
-        assert_eq!(input, "Parser work", "and must not touch what was typed");
+        assert_ne!(deployment.id, before, "Tab must roll a different id");
+        assert_eq!(
+            deployment.name, "Parser work",
+            "and must not touch what was typed"
+        );
 
         // Typing is not rerolling: only Tab moves the mark, or it would
         // change under you as you named the thing.
-        let rolled = id.clone();
-        handle_naming_key(&context, &mut screen, KeyEvent::from(KeyCode::Char('!'))).unwrap();
-        let Screen::NameSession { input, id } = &screen else {
+        let rolled = deployment.id.clone();
+        handle_deploy_key(&context, &mut screen, KeyEvent::from(KeyCode::Char('!'))).unwrap();
+        let Screen::Deploy(deployment) = &screen else {
             unreachable!()
         };
-        assert_eq!(*id, rolled);
-        assert_eq!(input, "Parser work!");
+        assert_eq!(deployment.id, rolled);
+        assert_eq!(deployment.name, "Parser work!");
+    }
+
+    #[test]
+    fn the_form_walks_its_fields_and_changes_only_the_focused_one() {
+        let context = test_context();
+        let mut screen = deploy_screen("Parser work");
+
+        // Down from the name lands on Tools, which Space and ←/→ toggle —
+        // and typing must not reach it, or a stray letter would silently
+        // arm a clanker.
+        handle_deploy_key(&context, &mut screen, KeyEvent::from(KeyCode::Down)).unwrap();
+        let Screen::Deploy(deployment) = &screen else {
+            unreachable!()
+        };
+        assert_eq!(deployment.focus, picker::Field::Tools);
+        assert!(!deployment.tools, "a fresh form deploys with no tools");
+
+        handle_deploy_key(&context, &mut screen, KeyEvent::from(KeyCode::Right)).unwrap();
+        let Screen::Deploy(deployment) = &screen else {
+            unreachable!()
+        };
+        assert!(deployment.tools);
+        assert_eq!(
+            deployment.name, "Parser work",
+            "the name is not the focused field any more"
+        );
+
+        handle_deploy_key(&context, &mut screen, KeyEvent::from(KeyCode::Char('x'))).unwrap();
+        let Screen::Deploy(deployment) = &screen else {
+            unreachable!()
+        };
+        assert_eq!(
+            deployment.name, "Parser work",
+            "a letter aimed at a choice field types nowhere"
+        );
     }
 
     #[test]

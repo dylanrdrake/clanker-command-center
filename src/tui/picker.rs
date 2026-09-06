@@ -449,7 +449,7 @@ pub fn draw(
     .split(frame.area());
 
     let mut lines: Vec<Line> = Vec::new();
-    // Set by a row that wants a blank line after it. Only "Spawn clanker"
+    // Set by a row that wants a blank line after it. Only "Deploy clanker"
     // does, to keep it off the top of the list proper.
     let mut trailing_blank = false;
     // Which built line the cursor is on, which is what the list has to keep
@@ -469,7 +469,7 @@ pub fn draw(
         let mut spans = vec![Span::styled(marker, Style::new().cyan().bold())];
         match item {
             LaunchItem::NewSession => {
-                spans.push(Span::styled("Spawn clanker", base.green()));
+                spans.push(Span::styled("Deploy clanker", base.green()));
                 // Still set apart from the sessions below it, now that no
                 // heading does that: it is the one row that isn't one.
                 trailing_blank = true;
@@ -662,16 +662,261 @@ pub fn draw(
     }
 }
 
-/// The prompt shown before a clanker is spawned, so it starts with a real
-/// name instead of "Untitled". Leaving it blank falls back to the usual
-/// behavior: derived from the first message once there is one.
+/// Which row of the deployment form has the cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Field {
+    Name,
+    Tools,
+    Model,
+    Effort,
+    Temperature,
+    Sandbox,
+    Orders,
+}
+
+impl Field {
+    /// Top to bottom: both the order the form draws in and what ↑/↓ walk,
+    /// from the one list, so the two cannot disagree.
+    const ORDER: [Field; 7] = [
+        Field::Name,
+        Field::Tools,
+        Field::Model,
+        Field::Effort,
+        Field::Temperature,
+        Field::Sandbox,
+        Field::Orders,
+    ];
+
+    fn index(self) -> usize {
+        Self::ORDER
+            .iter()
+            .position(|field| *field == self)
+            .expect("every field is in ORDER")
+    }
+
+    /// Whether typing goes into this field. The rest hold one of a fixed set
+    /// of values, chosen with ←/→ — a letter has nothing to do there, which
+    /// is what frees Space to toggle them.
+    fn is_text(self) -> bool {
+        matches!(
+            self,
+            Field::Name | Field::Model | Field::Temperature | Field::Orders
+        )
+    }
+}
+
+/// The effort levels ←/→ walk. Not a closed set as far as any provider is
+/// concerned — `clank effort` deliberately doesn't validate against a list,
+/// since models vary in what they accept — so a configured value that isn't
+/// one of these is added to the cycle rather than dropped from it.
+const EFFORTS: [&str; 3] = ["low", "medium", "high"];
+
+/// What a clanker is being deployed with, before it exists: the form on the
+/// Clanker Deployment screen.
 ///
-/// Also where its mark is chosen. The mark is hashed from the session id, so
-/// it cannot be changed once the session exists — this screen holds an id
-/// that has not been written yet, and Tab rolls another, which is the only
-/// point at which the thing you will be looking at for the next week is
-/// yours to pick rather than dealt to you.
-pub fn draw_naming(frame: &mut Frame, input: &str, id: &str) {
+/// Every field here is something a clanker would otherwise start with the
+/// configured default for and need a slash command to change once it was
+/// running. Seeding them from that default and letting them be changed *here*
+/// costs nothing at deploy time and saves the first two minutes of every
+/// clanker's life being spent on `/tools on` and `/model`.
+pub struct Deployment {
+    /// The id it will be created with, rolled here rather than at creation
+    /// so its mark can be shown — and rolled again — before anything is
+    /// written. See [`crate::session::new_id`].
+    pub id: String,
+    pub name: String,
+    /// Whether it deploys with tools. A clanker with none can only talk, and
+    /// that is still what a fresh form offers: turning them on is a decision
+    /// worth making rather than inheriting.
+    pub tools: bool,
+    pub model: String,
+    pub effort: Option<String>,
+    /// Held as text rather than a number so it can be emptied — which is a
+    /// real value (no temperature field sent at all), and not one any number
+    /// could stand in for. Parsed when you deploy, so a typo is caught here
+    /// instead of failing on the first turn.
+    pub temperature: String,
+    pub sandbox: bool,
+    /// The first message, sent the moment the clanker opens. Empty means it
+    /// opens waiting for you, which is what deploying one has always done.
+    pub orders: String,
+    pub focus: Field,
+    /// Why the last Enter didn't deploy, shown in place of the key hints —
+    /// the same place the launch screen puts its notice, for the same
+    /// reason: it is where you are already looking when nothing happened.
+    pub error: Option<String>,
+    /// The effort levels this form cycles through, including whatever was
+    /// configured if it isn't one of the usual three. `None` is one of them:
+    /// sending no effort field at all is a setting, not the absence of one.
+    efforts: Vec<Option<String>>,
+}
+
+/// A validated deployment, ready to create a clanker from.
+pub struct Plan {
+    pub id: String,
+    pub title: String,
+    pub tools: bool,
+    pub model: String,
+    pub effort: Option<String>,
+    pub temperature: Option<f32>,
+    pub sandbox: bool,
+    pub orders: Option<String>,
+}
+
+impl Deployment {
+    /// A fresh form, seeded from the configured defaults every other new
+    /// clanker starts with — so pressing Enter straight away deploys exactly
+    /// what this screen used to, and everything else is a deliberate change
+    /// from that.
+    pub fn new(
+        id: String,
+        model: String,
+        effort: Option<String>,
+        temperature: Option<f32>,
+        sandbox: bool,
+    ) -> Self {
+        let mut efforts: Vec<Option<String>> = std::iter::once(None)
+            .chain(EFFORTS.iter().map(|level| Some(level.to_string())))
+            .collect();
+        if let Some(configured) = &effort {
+            if !efforts.iter().any(|level| level.as_deref() == Some(configured)) {
+                efforts.push(Some(configured.clone()));
+            }
+        }
+
+        Deployment {
+            id,
+            name: String::new(),
+            // Off, like every clanker before this screen existed: what it
+            // may do to your machine is not something to inherit from a
+            // config file you set months ago.
+            tools: false,
+            model,
+            effort,
+            temperature: temperature.map(|n| n.to_string()).unwrap_or_default(),
+            sandbox,
+            orders: String::new(),
+            focus: Field::Name,
+            error: None,
+            efforts,
+        }
+    }
+
+    pub fn move_up(&mut self) {
+        self.error = None;
+        let at = self.focus.index();
+        self.focus = Field::ORDER[at.checked_sub(1).unwrap_or(Field::ORDER.len() - 1)];
+    }
+
+    pub fn move_down(&mut self) {
+        self.error = None;
+        self.focus = Field::ORDER[(self.focus.index() + 1) % Field::ORDER.len()];
+    }
+
+    /// Types into the focused field, if it takes typing.
+    pub fn type_char(&mut self, c: char) {
+        // Whatever the last Enter objected to, you are now doing something
+        // about it — and an error still sitting there while you fix it reads
+        // as a second, current complaint.
+        self.error = None;
+        match self.focus {
+            Field::Name => self.name.push(c),
+            Field::Model => self.model.push(c),
+            Field::Temperature => self.temperature.push(c),
+            Field::Orders => self.orders.push(c),
+            // Space is the only character that reaches a choice field, and
+            // it steps it along — see `is_text`.
+            Field::Tools | Field::Effort | Field::Sandbox => {
+                if c == ' ' {
+                    self.change(1);
+                }
+            }
+        }
+    }
+
+    pub fn backspace(&mut self) {
+        self.error = None;
+        match self.focus {
+            Field::Name => self.name.pop(),
+            Field::Model => self.model.pop(),
+            Field::Temperature => self.temperature.pop(),
+            Field::Orders => self.orders.pop(),
+            _ => None,
+        };
+    }
+
+    /// Steps the focused choice field by `delta` — ←/→, and Space forwards.
+    /// A text field has nothing to step, and stays as typed.
+    pub fn change(&mut self, delta: isize) {
+        self.error = None;
+        match self.focus {
+            Field::Tools => self.tools = !self.tools,
+            Field::Sandbox => self.sandbox = !self.sandbox,
+            Field::Effort => {
+                let at = self
+                    .efforts
+                    .iter()
+                    .position(|level| *level == self.effort)
+                    .unwrap_or(0) as isize;
+                let len = self.efforts.len() as isize;
+                self.effort = self.efforts[(at + delta).rem_euclid(len) as usize].clone();
+            }
+            _ => {}
+        }
+    }
+
+    /// What this form deploys, or why it can't.
+    ///
+    /// Checked here rather than at creation so a bad temperature is a line
+    /// on this screen with the form still in front of you, not a clanker
+    /// that exists and fails on its first turn.
+    pub fn plan(&self) -> Result<Plan, String> {
+        let title = self.name.trim();
+        if title.is_empty() {
+            // The one field with no default worth guessing: naming a clanker
+            // is the deliberate act of starting it.
+            return Err("A name is required".to_string());
+        }
+
+        let model = self.model.trim();
+        if model.is_empty() {
+            return Err("A model is required".to_string());
+        }
+
+        let temperature = match self.temperature.trim() {
+            "" => None,
+            typed => match typed.parse::<f32>() {
+                Ok(n) if n >= 0.0 => Some(n),
+                _ => {
+                    return Err(
+                        "Temperature must be 0 or greater, or empty to send none".to_string()
+                    )
+                }
+            },
+        };
+
+        let orders = self.orders.trim();
+        Ok(Plan {
+            id: self.id.clone(),
+            title: title.to_string(),
+            tools: self.tools,
+            model: model.to_string(),
+            effort: self.effort.clone(),
+            temperature,
+            sandbox: self.sandbox,
+            orders: (!orders.is_empty()).then(|| orders.to_string()),
+        })
+    }
+}
+
+/// The screen a clanker is deployed from: its name, its mark, what it starts
+/// able to do, and what it is being sent in to do.
+///
+/// The mark is hashed from the session id, so it cannot be changed once the
+/// session exists — this screen holds an id that has not been written yet,
+/// and Tab rolls another, which is the only point at which the thing you
+/// will be looking at for the next week is yours to pick rather than dealt.
+pub fn draw_deployment(frame: &mut Frame, deployment: &Deployment) {
     let areas = Layout::vertical([
         Constraint::Length(1), // title
         Constraint::Length(1), // rule
@@ -681,16 +926,16 @@ pub fn draw_naming(frame: &mut Frame, input: &str, id: &str) {
     .split(frame.area());
 
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled("clank", Style::new().bold()))),
+        Paragraph::new(Line::from(Span::styled(
+            "Clanker Deployment",
+            Style::new().bold(),
+        ))),
         areas[0],
     );
     draw_rule(frame, areas[1], None);
 
-    // The mark this session will carry for the rest of its life, shown
-    // before it has one: it is hashed from an id that does not have to be
-    // kept, so this is the only moment it can be chosen rather than dealt.
-    let (mark, mark_style) = identicon(id);
-    let lines = vec![
+    let (mark, mark_style) = identicon(&deployment.id);
+    let mut lines = vec![
         Line::raw(""),
         Line::from(vec![
             Span::raw("  "),
@@ -698,21 +943,95 @@ pub fn draw_naming(frame: &mut Frame, input: &str, id: &str) {
             Span::styled("  Tab for another", Style::new().dark_gray()),
         ]),
         Line::raw(""),
-        Line::from(vec![
-            Span::styled("  Clanker name  ", Style::new().dark_gray()),
-            Span::raw(input.to_string()),
-            Span::styled("▏", Style::new().yellow()),
-        ]),
+        field_row(deployment, Field::Name, "Name", 0),
+        Line::raw(""),
+        Line::from(Span::styled("  Settings", Style::new().bold())),
+        field_row(deployment, Field::Tools, "Tools", 2),
+        field_row(deployment, Field::Model, "Model", 2),
+        field_row(deployment, Field::Effort, "Effort", 2),
+        field_row(deployment, Field::Temperature, "Temperature", 2),
+        field_row(deployment, Field::Sandbox, "Sandbox", 2),
+        Line::raw(""),
+        Line::from(Span::styled("  Initial Orders", Style::new().bold())),
     ];
+    // The orders take a whole row to themselves rather than sitting after a
+    // label: it is a message, and a message that has to fit beside "Orders"
+    // is one nobody would type.
+    lines.push(field_row(deployment, Field::Orders, "", 2));
     frame.render_widget(Paragraph::new(Text::from(lines)), areas[2]);
 
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            " A name is required · Tab reroll · Enter spawn · Esc cancel",
+    let hint = match &deployment.error {
+        Some(error) => Line::from(Span::styled(
+            format!(" {error}"),
+            Style::new().red().bold(),
+        )),
+        None => Line::from(Span::styled(
+            " ↑/↓ move · ←/→ change · Tab reroll · Enter deploy · Esc cancel",
             Style::new().dark_gray(),
-        ))),
-        areas[3],
-    );
+        )),
+    };
+    frame.render_widget(Paragraph::new(hint), areas[3]);
+}
+
+/// One row of the form: the focus marker, the label, and the value — with a
+/// cursor after it when it is a text field with the focus, since that is the
+/// only field a keystroke would land in.
+fn field_row(deployment: &Deployment, field: Field, label: &str, indent: usize) -> Line<'static> {
+    const LABEL_WIDTH: usize = 14;
+
+    let focused = deployment.focus == field;
+    let mut spans = vec![Span::styled(
+        if focused { "❯ " } else { "  " },
+        Style::new().cyan().bold(),
+    )];
+    if indent > 0 {
+        spans.push(Span::raw(" ".repeat(indent)));
+    }
+    if !label.is_empty() {
+        spans.push(Span::styled(
+            format!("{label:<LABEL_WIDTH$}"),
+            Style::new().dark_gray(),
+        ));
+    }
+
+    let (value, style) = match field {
+        Field::Name => (deployment.name.clone(), Style::new()),
+        // The colours the launch screen gives 🔨 and 💬, so a clanker
+        // deployed with tools looks like the row it will become.
+        Field::Tools if deployment.tools => ("on".to_string(), Style::new().yellow()),
+        Field::Tools => ("off".to_string(), Style::new().cyan()),
+        Field::Model => (deployment.model.clone(), Style::new()),
+        Field::Effort => match &deployment.effort {
+            Some(level) => (level.clone(), Style::new()),
+            None => ("default".to_string(), Style::new().dark_gray()),
+        },
+        // The placeholders say what an empty field *means*, and only when
+        // the cursor is elsewhere: typed into, the field is what you typed,
+        // and prose sitting where your text goes would read as text you have
+        // to delete first.
+        Field::Temperature if deployment.temperature.is_empty() && !focused => {
+            ("none sent".to_string(), Style::new().dark_gray())
+        }
+        Field::Temperature => (deployment.temperature.clone(), Style::new()),
+        Field::Sandbox => (
+            if deployment.sandbox { "on" } else { "off" }.to_string(),
+            Style::new(),
+        ),
+        Field::Orders if deployment.orders.is_empty() && !focused => (
+            "none — it opens waiting for you".to_string(),
+            Style::new().dark_gray(),
+        ),
+        Field::Orders => (deployment.orders.clone(), Style::new()),
+    };
+
+    spans.push(Span::styled(
+        value,
+        if focused { style.bold() } else { style },
+    ));
+    if focused && field.is_text() {
+        spans.push(Span::styled("▏", Style::new().yellow()));
+    }
+    Line::from(spans)
 }
 
 /// A token count squeezed into the few characters a list row can spare —
@@ -1029,12 +1348,12 @@ mod tests {
         assert!(picker_of(vec![busy_row]).has_working_session());
     }
 
-    /// Renders the naming screen off-screen, the same way.
-    fn naming_to_string(input: &str, id: &str, width: u16, height: u16) -> String {
+    /// Renders the deployment screen off-screen, the same way.
+    fn deployment_to_string(deployment: &Deployment, width: u16, height: u16) -> String {
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
         terminal
-            .draw(|frame| draw_naming(frame, input, id))
+            .draw(|frame| draw_deployment(frame, deployment))
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
         (0..buffer.area.height)
@@ -1047,19 +1366,32 @@ mod tests {
             .join("\n")
     }
 
-    #[test]
-    fn the_first_row_spawns_a_clanker() {
-        let out = picker_to_string(&picker_of(vec![]), 60, 10);
-        assert!(out.contains("Spawn clanker"), "{out}");
+    /// A form as the launch screen builds one, named and otherwise fresh.
+    fn deployment(id: &str, name: &str) -> Deployment {
+        let mut deployment = Deployment::new(
+            id.to_string(),
+            "openrouter/auto".to_string(),
+            None,
+            Some(0.7),
+            true,
+        );
+        deployment.name = name.to_string();
+        deployment
     }
 
     #[test]
-    fn naming_shows_the_mark_the_clanker_will_carry() {
+    fn the_first_row_deploys_a_clanker() {
+        let out = picker_to_string(&picker_of(vec![]), 60, 10);
+        assert!(out.contains("Deploy clanker"), "{out}");
+    }
+
+    #[test]
+    fn deployment_shows_the_mark_the_clanker_will_carry() {
         // The mark is hashed from the id, so this is the one moment it can
         // be seen before it is committed to — and the screen has to actually
         // show it, or rerolling is rolling blind.
         let id = "4f2a91b2-3c1d-4e8a-9f02-7b6c5d4e3a21";
-        let out = naming_to_string("Parser work", id, 60, 10);
+        let out = deployment_to_string(&deployment(id, "Parser work"), 60, 20);
         assert!(out.contains(&identicon(id).0), "{out}");
         assert!(out.contains("Parser work"), "{out}");
         assert!(out.contains("Tab"), "the reroll key is offered: {out}");
@@ -1067,6 +1399,97 @@ mod tests {
         // A different id is a different mark, which is the whole point.
         let other = "0000ffff-3c1d-4e8a-9f02-7b6c5d4e3a21";
         assert_ne!(identicon(id).0, identicon(other).0);
+    }
+
+    #[test]
+    fn the_deployment_screen_names_itself_and_both_its_sections() {
+        let id = "4f2a91b2-3c1d-4e8a-9f02-7b6c5d4e3a21";
+        let out = deployment_to_string(&deployment(id, "Parser work"), 60, 20);
+
+        assert!(out.contains("Clanker Deployment"), "{out}");
+        assert!(out.contains("Settings"), "{out}");
+        assert!(out.contains("Initial Orders"), "{out}");
+        // Every setting it can be deployed with, named on its own row.
+        for label in ["Name", "Tools", "Model", "Effort", "Temperature", "Sandbox"] {
+            assert!(out.contains(label), "no {label} row in:\n{out}");
+        }
+    }
+
+    #[test]
+    fn an_unset_setting_says_what_that_means_rather_than_showing_a_gap() {
+        // The same rule `/status` follows: a nullified setting does
+        // something specific, and a blank cell reads as a bug.
+        let id = "4f2a91b2-3c1d-4e8a-9f02-7b6c5d4e3a21";
+        let mut form = deployment(id, "Parser work");
+        form.temperature = String::new();
+        // Off the placeholder fields, or the cursor would sit in the middle
+        // of the prose explaining them.
+        form.focus = Field::Name;
+
+        let out = deployment_to_string(&form, 60, 20);
+        assert!(out.contains("default"), "an unset effort: {out}");
+        assert!(out.contains("none sent"), "an emptied temperature: {out}");
+        assert!(out.contains("none —"), "no orders: {out}");
+    }
+
+    #[test]
+    fn a_deployment_plans_what_it_was_filled_in_with() {
+        let mut form = deployment("4f2a91b2-3c1d-4e8a-9f02-7b6c5d4e3a21", "  Parser work  ");
+        form.tools = true;
+        form.orders = "  read src/parser.rs  ".to_string();
+
+        let plan = form.plan().expect("a named form deploys");
+        assert_eq!(plan.title, "Parser work", "trimmed, like a rename is");
+        assert!(plan.tools);
+        assert_eq!(plan.temperature, Some(0.7));
+        assert_eq!(plan.orders.as_deref(), Some("read src/parser.rs"));
+
+        // Orders are optional: with none, the clanker opens waiting.
+        form.orders = "   ".to_string();
+        assert_eq!(form.plan().unwrap().orders, None);
+    }
+
+    #[test]
+    fn effort_cycles_through_the_usual_levels_and_none() {
+        let mut form = deployment("4f2a91b2-3c1d-4e8a-9f02-7b6c5d4e3a21", "t");
+        form.focus = Field::Effort;
+        assert_eq!(form.effort, None, "unset is where a fresh form starts");
+
+        for expected in ["low", "medium", "high"] {
+            form.change(1);
+            assert_eq!(form.effort.as_deref(), Some(expected));
+        }
+        // Round trip: past the last level is back to sending none at all,
+        // which is a setting rather than the absence of one.
+        form.change(1);
+        assert_eq!(form.effort, None);
+        form.change(-1);
+        assert_eq!(form.effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn a_configured_effort_outside_the_usual_three_stays_reachable() {
+        // `clank effort` doesn't validate against a list, because models
+        // differ in what they take — so a form seeded with one of those must
+        // not quietly drop it on the first ←/→.
+        let mut form = Deployment::new(
+            "4f2a91b2-3c1d-4e8a-9f02-7b6c5d4e3a21".to_string(),
+            "openrouter/auto".to_string(),
+            Some("xhigh".to_string()),
+            None,
+            true,
+        );
+        form.focus = Field::Effort;
+        assert_eq!(form.effort.as_deref(), Some("xhigh"));
+
+        form.change(1);
+        assert_eq!(form.effort, None, "past the end is the unset entry");
+        form.change(-1);
+        assert_eq!(
+            form.effort.as_deref(),
+            Some("xhigh"),
+            "and the configured level is still in the cycle"
+        );
     }
 
     /// Renders the launch screen off-screen so the list can be asserted on.

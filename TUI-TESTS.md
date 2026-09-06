@@ -109,7 +109,7 @@ regenerated each tick. It should look like noise, not a clock.
 
 Fixed after this plan was written; the exact sequence that lost one:
 
-1. Launch `clank`, choose **Spawn clanker**, give it a name.
+1. Launch `clank`, choose **Deploy clanker**, give it a name.
 2. `Ctrl-B` straight back out without typing anything.
 3. Resume it from the picker.
 4. `Ctrl-B` back out again.
@@ -228,21 +228,37 @@ Then the things that must not have broken:
   should stay at full brightness. Scroll back and forth: the two should be
   distinguishable at a glance, without reading `sent` / `not sent`.
 
-## 10. Spawning a clanker
+## 10. Deploying a clanker
 
-- `clank` → the first row reads **Spawn clanker**, not "New clanker".
-- Enter on it → the naming screen shows a mark above the name field, with
-  `Tab for another` beside it.
+- `clank` → the first row reads **Deploy clanker**, not "New clanker".
+- Enter on it → the screen's title bar reads **Clanker Deployment**, and it
+  shows a mark above the name field with `Tab for another` beside it, a
+  **Settings** section, and an **Initial Orders** one.
 - `Tab` repeatedly → the mark should change every press, shape and colour,
   and whatever you have typed must stay put.
+- `↑`/`↓` → the `❯` marker walks every row, wrapping at both ends. Typing
+  reaches the text fields only: on `Tools`, `Effort` or `Sandbox` a letter
+  should do nothing, and `←`/`→` (or Space) should change the value.
+- Enter with a blank name → nothing is created, and `A name is required`
+  appears where the key hints were. Type a character → it disappears again.
+- Empty the `Temperature` field → the row reads `none sent` once you move
+  off it. Type `warm` into it and press Enter → refused, with the reason
+  under the form.
 - Type a name, `Tab` some more, then Enter → the clanker that opens should
   carry **the mark that was on screen when you pressed Enter**, both in the
   reply gutter and on its row back in the list. A different one means the id
   being shown is not the id being created.
-- `Esc` from the naming screen → nothing is created; the list is unchanged.
+- Deploy one with `Tools` on → `/status` inside it says tools are on, and its
+  row in the list carries 🔨 rather than 💬. Deploy one with a `Model` or
+  `Effort` you changed on the form → `/status` says the same values back.
+- Deploy one with **Initial Orders** filled in → it opens with that message
+  already in the transcript and a turn already running, exactly as if you had
+  typed it. Backing out with `Ctrl-B` should show it `working` in the list.
+- `Esc` from the deployment screen → nothing is created; the list is
+  unchanged.
 - `clank clankers list` → the same mark again, drawn by the CLI.
 - Inside the clanker, the top row reads `<mark> <name>  <directory>`, with
-  the same mark as its row and its reply gutter. Spawn two clankers with the
+  the same mark as its row and its reply gutter. Deploy two clankers with the
   same name and check the top rows still tell them apart.
 
 ## 11. Tools, three ways
