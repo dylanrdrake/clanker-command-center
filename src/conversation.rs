@@ -191,6 +191,12 @@ pub enum Event {
     TitleChanged {
         title: String,
     },
+    /// The session's running token total changed — sent after every turn
+    /// (completed, failed, or cancelled) that spent any, so it reflects
+    /// what's now stored rather than only what a full turn added.
+    TokensUsed {
+        total_tokens: i64,
+    },
 }
 
 /// Handle to a running conversation worker.
@@ -534,6 +540,12 @@ impl Worker {
         let temperature = self.session.temperature();
         let gates = self.gates.clone();
         let steering = self.steering.clone();
+        // Cloned into the spawned task below; this handle stays here so the
+        // total can be read back once the turn ends, however it ends —
+        // including aborted by `Cancel`, which is why this isn't threaded
+        // through the task's return value instead.
+        let usage = agent::UsageTracker::default();
+        let usage_for_turn = usage.clone();
         // Snapshotted per turn, like model and effort: streaming shapes how
         // the next request is made, not what a running tool may do.
         let stream = self.session.stream();
@@ -556,6 +568,7 @@ impl Worker {
                     effort_level,
                     stream,
                     &steering,
+                    &usage_for_turn,
                 )
                 .await
             } else {
@@ -567,6 +580,7 @@ impl Worker {
                     temperature,
                     effort_level,
                     stream,
+                    &usage_for_turn,
                 )
                 .await
             };
@@ -733,6 +747,16 @@ impl Worker {
         // never stopped waiting, only the store holding them changed.
         for text in self.steering.take() {
             queue.push_back(text);
+        }
+
+        // Read regardless of how the turn ended: a cancelled or failed turn
+        // can still have completed some requests before that happened, and
+        // those tokens were spent whether or not the turn as a whole
+        // succeeded.
+        if let Err(e) = self.session.add_tokens(usage.total() as i64) {
+            let _ = self.events.send(Event::Agent(AgentEvent::Error {
+                message: format!("Failed to save token usage: {e}"),
+            }));
         }
 
         self.persist();
@@ -1013,6 +1037,9 @@ impl Worker {
         }
         let _ = self.events.send(Event::TitleChanged {
             title: self.session.title().to_string(),
+        });
+        let _ = self.events.send(Event::TokensUsed {
+            total_tokens: self.session.total_tokens(),
         });
     }
 }

@@ -215,6 +215,9 @@ pub struct App {
     /// `/temperature`/`/temperature default`. `None` means nullified, same
     /// deal as `max_iterations`.
     pub temperature: Option<f32>,
+    /// Total tokens spent across this clanker's turns so far. Updated after
+    /// each turn finishes, from [`crate::conversation::Event::TokensUsed`].
+    pub total_tokens: i64,
     /// Changes with `/tools`. Also what says whether this clanker has tools
     /// at all — the thing that used to be a separate mode.
     pub tool_access: ToolAccessSettings,
@@ -305,6 +308,7 @@ impl App {
             working_dir: None,
             max_iterations: None,
             temperature: None,
+            total_tokens: 0,
             tool_access: ToolAccessSettings::default(),
             input_history: Vec::new(),
             history_cursor: None,
@@ -504,6 +508,9 @@ impl App {
             // Purely cosmetic — the header re-renders with whatever this
             // is next frame, with no need to call it out in the transcript.
             Event::TitleChanged { title } => self.title = title,
+            // Same deal: the header's gold-coin badge re-renders with the
+            // new total next frame, with nothing worth a transcript line.
+            Event::TokensUsed { total_tokens } => self.total_tokens = total_tokens,
             Event::Agent(event) => self.apply_agent(event),
         }
     }
@@ -1659,6 +1666,19 @@ mod tests {
         });
         assert_eq!(a.title, "Write me a snake game");
         // Purely cosmetic — nothing is added to the transcript for it.
+        assert_eq!(a.transcript.len(), before);
+    }
+
+    #[test]
+    fn tokens_used_updates_silently() {
+        let mut a = app();
+        assert_eq!(a.total_tokens, 0);
+        let before = a.transcript.len();
+
+        a.apply(Event::TokensUsed { total_tokens: 150 });
+        assert_eq!(a.total_tokens, 150);
+        // Same deal as the title: the header's badge picks it up next
+        // frame, so nothing is added to the transcript for it.
         assert_eq!(a.transcript.len(), before);
     }
 

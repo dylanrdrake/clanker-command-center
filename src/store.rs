@@ -66,6 +66,12 @@ pub struct SessionSummary {
     /// The sampling temperature this session is currently set to — same
     /// deal as `max_iterations`.
     pub temperature: Option<f64>,
+    /// Total tokens (prompt plus completion, as the provider reports it)
+    /// spent across every turn this session has run. `0` for a session
+    /// written before this was tracked, same as one that has simply never
+    /// made a request — there's no way to tell the two apart after the fact,
+    /// and reading it as "none spent" is the safe default either way.
+    pub total_tokens: i64,
     /// What each tool may do in this session — a snapshot of the configured
     /// default taken when it was created, mutable from inside it with
     /// `/tools`.
@@ -183,6 +189,16 @@ pub fn open_db() -> Result<Connection> {
     ensure_column(&conn, "sessions", "verbose", "INTEGER NOT NULL DEFAULT 0")?;
     ensure_column(&conn, "sessions", "max_iterations", "INTEGER")?;
     ensure_column(&conn, "sessions", "temperature", "REAL")?;
+    // Running total of tokens spent across this session's turns. Absent on
+    // a row written before this existed, which reads as `0` — indistinguishable
+    // from a session that simply hasn't made a request yet, which is the
+    // right default for both.
+    ensure_column(
+        &conn,
+        "sessions",
+        "total_tokens",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
     // Who holds the session, so a claim can only be renewed or released by
     // the process that took it. Null on rows written before claims existed,
     // which reads as unheld — correct, since no live process owns them.
@@ -451,6 +467,17 @@ pub fn set_session_temperature(
     conn.execute(
         "UPDATE sessions SET temperature = ?1 WHERE id = ?2",
         params![temperature, session_id],
+    )?;
+    Ok(())
+}
+
+/// Adds to a session's running token total. Additive rather than a set,
+/// unlike every other per-session setting here — this isn't a value `/tools`-
+/// style commands replace, it's a running count a turn contributes to.
+pub fn add_session_tokens(conn: &Connection, session_id: &str, tokens: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE sessions SET total_tokens = total_tokens + ?1 WHERE id = ?2",
+        params![tokens, session_id],
     )?;
     Ok(())
 }
@@ -851,7 +878,7 @@ fn message_preview(content: Option<&str>, tool_calls: Option<&str>) -> String {
 pub fn list_sessions(conn: &Connection) -> Result<Vec<SessionSummary>> {
     let mut stmt = conn.prepare(
         "SELECT id, title, model, kind, effort_level, verbose, max_iterations, temperature, \
-         approval_read, approval_write, approval_terminal, sandbox, stream, working_dir, activity, activity_detail, created_at, updated_at, highlight, heartbeat, tool_access \
+         approval_read, approval_write, approval_terminal, sandbox, stream, working_dir, activity, activity_detail, created_at, updated_at, highlight, heartbeat, tool_access, total_tokens \
          FROM sessions ORDER BY updated_at DESC",
     )?;
 
@@ -882,6 +909,7 @@ pub fn list_sessions(conn: &Connection) -> Result<Vec<SessionSummary>> {
             created_at: row.get(16)?,
             updated_at: row.get(17)?,
             highlight: row.get(18)?,
+            total_tokens: row.get(21)?,
         })
     })?;
 
@@ -945,7 +973,7 @@ pub fn find_session(conn: &Connection, id_or_prefix: &str) -> Result<Option<Sess
 fn load_summary(conn: &Connection, id: &str) -> Result<Option<SessionSummary>> {
     let mut stmt = conn.prepare(
         "SELECT id, title, model, kind, effort_level, verbose, max_iterations, temperature, \
-         approval_read, approval_write, approval_terminal, sandbox, stream, working_dir, activity, activity_detail, created_at, updated_at, highlight, heartbeat, tool_access \
+         approval_read, approval_write, approval_terminal, sandbox, stream, working_dir, activity, activity_detail, created_at, updated_at, highlight, heartbeat, tool_access, total_tokens \
          FROM sessions WHERE id = ?1",
     )?;
 
@@ -979,6 +1007,7 @@ fn load_summary(conn: &Connection, id: &str) -> Result<Option<SessionSummary>> {
             created_at: row.get(16)?,
             updated_at: row.get(17)?,
             highlight: row.get(18)?,
+            total_tokens: row.get(21)?,
         }))
     } else {
         Ok(None)
@@ -1208,6 +1237,7 @@ mod tests {
                 activity_detail    TEXT,
                 heartbeat          INTEGER,
                 claim_owner        TEXT,
+                total_tokens       INTEGER NOT NULL DEFAULT 0,
                 created_at      INTEGER NOT NULL,
                 updated_at      INTEGER NOT NULL
             );
@@ -2059,6 +2089,39 @@ mod tests {
 
         set_session_temperature(&conn, &id, None).unwrap();
         assert_eq!(find_session(&conn, &id).unwrap().unwrap().temperature, None);
+    }
+
+    #[test]
+    fn a_fresh_session_has_spent_no_tokens_and_add_session_tokens_sums() {
+        let conn = memory_db();
+        let id = crate::session::new_id();
+        create_session(
+            &conn,
+            &id,
+            "model-a",
+            KIND_CHAT,
+            None,
+            Some(20),
+            Some(0.7),
+            &ToolAccessSettings::default(),
+            true,
+            false,
+            true,
+            true,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(find_session(&conn, &id).unwrap().unwrap().total_tokens, 0);
+
+        // Additive, unlike every other per-session setting: a turn
+        // contributes to the running total rather than replacing it.
+        add_session_tokens(&conn, &id, 120).unwrap();
+        add_session_tokens(&conn, &id, 30).unwrap();
+        assert_eq!(
+            find_session(&conn, &id).unwrap().unwrap().total_tokens,
+            150
+        );
     }
 
     #[test]

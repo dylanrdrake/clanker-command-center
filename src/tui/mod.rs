@@ -304,6 +304,7 @@ fn start_chat(
     app.highlight = session.highlight();
     app.max_iterations = session.max_iterations();
     app.temperature = session.temperature();
+    app.total_tokens = session.total_tokens();
     app.tool_access = session.tool_access().clone();
     app.sandbox = session.sandbox();
     app.stream = session.stream();
@@ -995,6 +996,7 @@ fn dispatch_submission(app: &mut App, text: &str, send: &mut impl FnMut(Command)
                         stream: app.stream,
                         working_dir: app.working_dir.as_deref(),
                         tool_access: &tool_access,
+                        total_tokens: app.total_tokens,
                     });
                     app.transcript.push(TranscriptItem::SessionStatus(rows));
                 }

@@ -235,6 +235,27 @@ pub struct SessionSettings<'a> {
     pub stream: bool,
     pub working_dir: Option<&'a str>,
     pub tool_access: &'a ToolAccessSettings,
+    pub total_tokens: i64,
+}
+
+/// A token count with `,`-grouped thousands, since a long-running clanker's
+/// total is exactly the kind of number that's unreadable as a bare string of
+/// digits.
+pub fn format_tokens(n: i64) -> String {
+    let sign = if n < 0 { "-" } else { "" };
+    let digits = n.unsigned_abs().to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, ch) in digits.chars().enumerate() {
+        // Not `.is_multiple_of()`: that needs a newer Rust than the
+        // README's stated 1.70 floor.
+        #[allow(clippy::manual_is_multiple_of)]
+        let at_group_boundary = i > 0 && (digits.len() - i) % 3 == 0;
+        if at_group_boundary {
+            grouped.push(',');
+        }
+        grouped.push(ch);
+    }
+    format!("{sign}{grouped}")
 }
 
 /// `/status` as label/value rows, ready for either front end to draw.
@@ -285,6 +306,10 @@ pub fn session_settings_rows(settings: &SessionSettings) -> Vec<(String, String)
         ("Verbose".to_string(), on_off(settings.verbose)),
         ("Highlight".to_string(), on_off(settings.highlight)),
         ("Streaming".to_string(), on_off(settings.stream)),
+        (
+            "Tokens".to_string(),
+            format!("🪙 {}", format_tokens(settings.total_tokens)),
+        ),
         (
             "Directory".to_string(),
             settings
@@ -1743,6 +1768,7 @@ mod tests {
             stream: true,
             working_dir: None,
             tool_access: &tool_access,
+            total_tokens: 0,
         });
         let value = |label: &str| {
             rows.iter()
@@ -1763,6 +1789,7 @@ mod tests {
              · replace_in_file ask · run_terminal_command never"
         );
         assert_eq!(value("Directory"), "not recorded");
+        assert_eq!(value("Tokens"), "🪙 0");
     }
 
     #[test]
@@ -1783,6 +1810,7 @@ mod tests {
             stream: false,
             working_dir: Some("/home/dev/project"),
             tool_access: &tool_access,
+            total_tokens: 12345,
         });
         let value = |label: &str| {
             rows.iter()
@@ -1804,6 +1832,16 @@ mod tests {
              · replace_in_file ask · run_terminal_command never"
         );
         assert_eq!(value("Directory"), "/home/dev/project");
+        assert_eq!(value("Tokens"), "🪙 12,345");
+    }
+
+    #[test]
+    fn format_tokens_groups_thousands() {
+        assert_eq!(format_tokens(0), "0");
+        assert_eq!(format_tokens(999), "999");
+        assert_eq!(format_tokens(1000), "1,000");
+        assert_eq!(format_tokens(1_234_567), "1,234,567");
+        assert_eq!(format_tokens(-42), "-42");
     }
 
     #[test]

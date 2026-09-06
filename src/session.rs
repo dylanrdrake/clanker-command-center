@@ -172,6 +172,10 @@ pub struct ChatSession {
     max_iterations: Option<usize>,
     /// This session's sampling temperature — same deal as `max_iterations`.
     temperature: Option<f32>,
+    /// Running total of tokens spent across this session's turns. `0` for a
+    /// new session and for one written before this was tracked — see
+    /// [`crate::store::SessionSummary::total_tokens`].
+    total_tokens: i64,
     /// What each tool may do in this session, always concrete (unlike
     /// `effort_level`/`max_iterations`/`temperature` there's no "unset,
     /// defer to config" state once a turn actually needs to check them).
@@ -288,6 +292,7 @@ impl ChatSession {
             sandbox,
             stream,
             working_dir,
+            total_tokens: 0,
             messages: Vec::new(),
             title_set: false,
             saved_len: 0,
@@ -344,6 +349,7 @@ impl ChatSession {
                 working_dir: summary.working_dir.clone(),
                 temperature: summary.temperature.map(|n| n as f32),
                 tool_access: summary.tool_access.clone(),
+                total_tokens: summary.total_tokens,
                 messages,
                 title_set,
                 saved_len,
@@ -478,6 +484,24 @@ impl ChatSession {
     /// This session's `/temperature` override, if one is set.
     pub fn temperature(&self) -> Option<f32> {
         self.temperature
+    }
+
+    /// Total tokens spent across every turn this session has run.
+    pub fn total_tokens(&self) -> i64 {
+        self.total_tokens
+    }
+
+    /// Adds to this session's running token total and records it
+    /// immediately — there's nothing to snapshot per turn here, unlike
+    /// `temperature`/`max_iterations`: it's a running count each turn
+    /// contributes to, not a setting a turn starts with.
+    pub fn add_tokens(&mut self, tokens: i64) -> Result<()> {
+        if tokens == 0 {
+            return Ok(());
+        }
+        store::add_session_tokens(&self.conn, &self.id, tokens)?;
+        self.total_tokens += tokens;
+        Ok(())
     }
 
     /// Binds this session's writes to a claim, so they stop if it is lost.
@@ -773,6 +797,7 @@ mod tests {
                 activity_detail    TEXT,
                 heartbeat          INTEGER,
                 claim_owner        TEXT,
+                total_tokens       INTEGER NOT NULL DEFAULT 0,
                 created_at      INTEGER NOT NULL,
                 updated_at      INTEGER NOT NULL
             );
@@ -1008,6 +1033,26 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(summary.temperature, None);
+    }
+
+    #[test]
+    fn add_tokens_sums_and_persists() {
+        let mut session = memory_session();
+        assert_eq!(session.total_tokens(), 0);
+
+        session.add_tokens(120).unwrap();
+        session.add_tokens(30).unwrap();
+        assert_eq!(session.total_tokens(), 150);
+        let summary = store::find_session(&session.conn, session.id())
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.total_tokens, 150);
+
+        // A resumed session picks the running total back up rather than
+        // starting over.
+        let (resumed, _) =
+            ChatSession::resume(session.conn, &summary, summary.model.clone()).unwrap();
+        assert_eq!(resumed.total_tokens(), 150);
     }
 
     fn session_in(dir: Option<&str>) -> ChatSession {

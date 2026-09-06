@@ -1472,6 +1472,7 @@ fn apply_submission(
                 stream: session.stream(),
                 working_dir: session.working_dir(),
                 tool_access: &tool_access,
+                total_tokens: session.total_tokens(),
             });
             let width = rows.iter().map(|(label, _)| label.len()).max().unwrap_or(0);
             println!("\n{}", "Clanker:".blue());
@@ -1701,6 +1702,7 @@ async fn cmd_clanker(
                 // failed are still the two that a list of sessions most
                 // needs, and both are visible from here.
                 session.set_activity(Some(store::Activity::Working), None);
+                let usage = agent::UsageTracker::default();
                 let turn = if session.is_agentic() {
                     let max_iterations = session.max_iterations();
                     let gates = SessionGates::new(
@@ -1722,6 +1724,7 @@ async fn cmd_clanker(
                         // line, works, then reads the next one. The TUI is
                         // where a message can join a turn in progress.
                         &agent::Steering::default(),
+                        &usage,
                     )
                     .await
                 } else {
@@ -1733,6 +1736,7 @@ async fn cmd_clanker(
                         temperature,
                         effort_level,
                         session_stream,
+                        &usage,
                     )
                     .await
                 };
@@ -1746,6 +1750,9 @@ async fn cmd_clanker(
                     Err(e) => println!("{} {}\n", "✗".red(), e),
                 }
                 session.set_activity(failed.then_some(store::Activity::Failed), None);
+                if let Err(e) = session.add_tokens(usage.total() as i64) {
+                    eprintln!("{} Failed to save token usage: {}", "✗".red(), e);
+                }
 
                 if let Err(e) = session.persist_pending() {
                     eprintln!("{} Failed to save message: {}", "✗".red(), e);
@@ -1936,6 +1943,7 @@ async fn cmd_agent(
     }
 
     session.set_activity(Some(store::Activity::Working), None);
+    let usage = agent::UsageTracker::default();
     let turn = agent::run_agent_turn(
         &client,
         &mut ui,
@@ -1948,11 +1956,15 @@ async fn cmd_agent(
         stream,
         // Nothing can join a turn that has no input to type into.
         &agent::Steering::default(),
+        &usage,
     )
     .await;
 
     let failed = turn.is_err();
     session.set_activity(failed.then_some(store::Activity::Failed), None);
+    if let Err(e) = session.add_tokens(usage.total() as i64) {
+        eprintln!("{} Failed to save token usage: {}", "✗".red(), e);
+    }
 
     // Persisted before the error is returned: the turn's messages are worth
     // keeping either way, and a failed run that saved nothing would be

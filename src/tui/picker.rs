@@ -34,6 +34,8 @@ pub struct SessionRow {
     /// When the process running it last checked in, so a state it claimed and
     /// then died holding can be told apart from one that's still true.
     pub heartbeat: Option<i64>,
+    /// Total tokens spent across this session's turns so far.
+    pub total_tokens: i64,
 }
 
 impl From<SessionSummary> for SessionRow {
@@ -48,6 +50,7 @@ impl From<SessionSummary> for SessionRow {
             activity: summary.activity,
             activity_detail: summary.activity_detail,
             heartbeat: summary.heartbeat,
+            total_tokens: summary.total_tokens,
         }
     }
 }
@@ -170,15 +173,19 @@ fn state_badge(state: LastState, held: bool, tick: usize) -> (String, Style) {
 }
 
 // Fixed columns, so the preview can be given whatever the line has left.
-const MARKER_WIDTH: usize = 2 + ICON_WIDTH + 1 + BADGE_WIDTH + 1; // marker, mark, badge, gaps
-                                                                  // One glyph and a gutter. `mode_label` returns a two-column emoji that
-                                                                  // `column` pads as one `char`, so the cell draws a column wider than this
-                                                                  // says — harmlessly, since every row carries one and they stay aligned with
-                                                                  // each other.
+const MARK_WIDTH: usize = 2 + ICON_WIDTH + 1; // selection marker, mark, gap
+                                               // One glyph and a gutter. `mode_label` returns a two-column emoji that
+                                               // `column` pads as one `char`, so the cell draws a column wider than this
+                                               // says — harmlessly, since every row carries one and they stay aligned with
+                                               // each other.
 const KIND_WIDTH: usize = 3;
 const TITLE_WIDTH: usize = 24;
 const DIR_WIDTH: usize = 24;
 const WHEN_WIDTH: usize = 8;
+/// Same misalignment tradeoff as `KIND_WIDTH`: `🪙 ` is a two-column glyph
+/// that `column` pads as one `char`, drawing a column wider than this says —
+/// harmless, since every row carries exactly one.
+const TOKENS_WIDTH: usize = 9;
 
 /// Below this a preview says too little to be worth the clutter.
 const MIN_PREVIEW: usize = 12;
@@ -468,14 +475,17 @@ pub fn draw(
                 trailing_blank = true;
             }
             LaunchItem::Resume(row) => {
-                // Identity first, then state: what the session is, then what
-                // it's doing.
+                // Identity first, then name, then state: what the session
+                // is, what it's called, then what it's doing.
                 let (mark, mark_style) = identicon(&row.id);
                 spans.push(Span::styled(mark, mark_style));
                 spans.push(Span::raw(" "));
 
+                spans.push(Span::styled(column(&row.title, TITLE_WIDTH), base));
+
                 let (glyph, style) = state_badge(row.last_state(), row.is_held(), tick);
                 spans.push(Span::styled(format!("{glyph} "), style));
+
                 spans.push(Span::styled(
                     column(mode_label(row.is_agentic()), KIND_WIDTH),
                     if row.is_agentic() {
@@ -484,19 +494,26 @@ pub fn draw(
                         Style::new().cyan()
                     },
                 ));
-                spans.push(Span::styled(column(&row.title, TITLE_WIDTH), base));
+
+                spans.push(Span::styled(
+                    column(
+                        &format!("🪙 {}", format_tokens_compact(row.total_tokens)),
+                        TOKENS_WIDTH,
+                    ),
+                    Style::new().dark_gray(),
+                ));
 
                 // Now that the list isn't grouped by directory, every row
                 // carries its own. `.` for the one you are in, which is the
                 // common case and the one worth making shortest; otherwise
                 // `~`-relative, or absolute for anything above home.
-                let dir = match &row.working_dir {
+                let row_dir = match &row.working_dir {
                     Some(d) if Some(d.as_str()) == dir => ".".to_string(),
                     Some(d) => home_relative(d),
                     None => "dir not recorded".to_string(),
                 };
                 spans.push(Span::styled(
-                    column(&dir, DIR_WIDTH),
+                    column(&row_dir, DIR_WIDTH),
                     Style::new().dark_gray(),
                 ));
 
@@ -505,7 +522,14 @@ pub fn draw(
                     Style::new().dark_gray(),
                 ));
 
-                let used = MARKER_WIDTH + KIND_WIDTH + TITLE_WIDTH + DIR_WIDTH + WHEN_WIDTH;
+                let used = MARK_WIDTH
+                    + TITLE_WIDTH
+                    + BADGE_WIDTH
+                    + 1
+                    + KIND_WIDTH
+                    + TOKENS_WIDTH
+                    + DIR_WIDTH
+                    + WHEN_WIDTH;
 
                 // Whatever is left of the line goes to what was last said,
                 // so the row describes where the session got to rather than
@@ -691,6 +715,20 @@ pub fn draw_naming(frame: &mut Frame, input: &str, id: &str) {
     );
 }
 
+/// A token count squeezed into the few characters a list row can spare —
+/// `format_tokens` in `ui.rs` is for `/status`, where there's room for every
+/// digit; this is for a column that has to sit beside four others.
+fn format_tokens_compact(n: i64) -> String {
+    let n = n.max(0);
+    if n < 1_000 {
+        return n.to_string();
+    }
+    if n < 1_000_000 {
+        return format!("{:.1}k", n as f64 / 1_000.0);
+    }
+    format!("{:.1}M", n as f64 / 1_000_000.0)
+}
+
 /// One cell of the row grid: the text truncated to fit and padded out to
 /// `width`, always leaving a two-space gutter so a full-width value can't
 /// run into the column after it.
@@ -814,6 +852,7 @@ mod tests {
             activity: None,
             activity_detail: None,
             heartbeat: None,
+            total_tokens: 0,
         }
     }
 

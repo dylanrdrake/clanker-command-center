@@ -69,6 +69,7 @@ pub async fn run_agent(
         effort_level,
         stream,
         &Steering::default(),
+        &UsageTracker::default(),
     )
     .await
 }
@@ -92,6 +93,7 @@ async fn request_turn(
     tools: Option<Vec<serde_json::Value>>,
     effort_level: Option<String>,
     stream: bool,
+    usage: &UsageTracker,
 ) -> Result<ChatMessage> {
     normalize_system_prompt(&mut messages, tools.is_some());
 
@@ -113,7 +115,15 @@ async fn request_turn(
                 StreamEvent::Content(text) => {
                     ui.event(AgentEvent::AssistantDelta { text }).await;
                 }
-                StreamEvent::Done(message) => assembled = Some(message),
+                StreamEvent::Done {
+                    message,
+                    usage: request_usage,
+                } => {
+                    if let Some(request_usage) = request_usage {
+                        usage.add(request_usage.total_tokens);
+                    }
+                    assembled = Some(message);
+                }
             }
         }
 
@@ -128,6 +138,9 @@ async fn request_turn(
                 effort_level,
             )
             .await?;
+        if let Some(request_usage) = response.usage {
+            usage.add(request_usage.total_tokens);
+        }
         response
             .choices
             .into_iter()
@@ -194,6 +207,10 @@ fn drop_dangling_reasoning(message: &mut ChatMessage) {
 /// reply, append it. The `chat` counterpart to [`run_agent_turn`], so both
 /// modes reach a front end through the same events instead of `chat` being
 /// open-coded by each caller.
+// Same reasoning as `run_agent`/`run_agent_turn`: the parameters are the
+// turn's inputs, and a struct would only move the argument list somewhere
+// else.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_chat_turn(
     client: &Client,
     ui: &mut impl AgentUi,
@@ -202,6 +219,7 @@ pub async fn run_chat_turn(
     temperature: Option<f32>,
     effort_level: Option<String>,
     stream: bool,
+    usage: &UsageTracker,
 ) -> Result<Option<String>> {
     ui.event(AgentEvent::RequestStarted).await;
     let turn = request_turn(
@@ -213,6 +231,7 @@ pub async fn run_chat_turn(
         None,
         effort_level.clone(),
         stream,
+        usage,
     )
     .await;
     ui.event(AgentEvent::RequestFinished).await;
@@ -283,6 +302,30 @@ impl Steering {
     }
 }
 
+/// Sums the token usage a turn's requests report, so a caller can add it to
+/// a clanker's running total once the turn finishes.
+///
+/// A turn is one request with no tools, or as many as `max_iterations` with
+/// them — and a provider reports usage per request, not per turn — so this
+/// is where the pieces get added up. Cheap to clone, like [`Steering`]: the
+/// turn runs on its own task, and the caller needs a handle it can still
+/// read from after handing the other one in.
+#[derive(Clone, Debug, Default)]
+pub struct UsageTracker {
+    total: Arc<Mutex<u64>>,
+}
+
+impl UsageTracker {
+    fn add(&self, tokens: u64) {
+        *self.total.lock().expect("usage tracker poisoned") += tokens;
+    }
+
+    /// Everything accumulated so far, in tokens.
+    pub fn total(&self) -> u64 {
+        *self.total.lock().expect("usage tracker poisoned")
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run_agent_turn(
     client: &Client,
@@ -295,6 +338,7 @@ pub async fn run_agent_turn(
     effort_level: Option<String>,
     stream: bool,
     steering: &Steering,
+    usage: &UsageTracker,
 ) -> Result<Option<String>> {
     // Unlike `temperature`/`effort_level`, there's no provider to fall back
     // to a default for this — it never leaves the process, so a missing cap
@@ -341,6 +385,7 @@ pub async fn run_agent_turn(
             Some(tool_definitions.clone()),
             effort_level.clone(),
             stream,
+            usage,
         )
         .await;
         ui.event(AgentEvent::RequestFinished).await;
@@ -478,6 +523,7 @@ mod tests {
             None,
             false,
             &steering,
+            &UsageTracker::default(),
         )
         .await;
 
@@ -518,6 +564,17 @@ mod tests {
         assert_eq!(steering.take(), vec!["one".to_string()]);
         // A second iteration must not re-inject what the first already sent.
         assert!(steering.take().is_empty());
+    }
+
+    #[test]
+    fn usage_tracker_sums_across_clones() {
+        // The whole point: a turn runs on another task holding a clone, and
+        // the caller reads the total back through the handle it kept.
+        let caller = UsageTracker::default();
+        let worker = caller.clone();
+        worker.add(10);
+        worker.add(5);
+        assert_eq!(caller.total(), 15);
     }
 
     #[test]
@@ -564,6 +621,7 @@ mod tests {
             None,
             false,
             &Steering::default(),
+            &UsageTracker::default(),
         )
         .await
         .expect_err("no cap is an error, not a default");

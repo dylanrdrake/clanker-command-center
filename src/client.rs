@@ -155,6 +155,16 @@ pub struct ChatRequest {
     /// requests to providers that don't expect it are unchanged.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream: Option<bool>,
+    /// Asks a streaming provider to emit a final usage-only chunk before
+    /// `[DONE]` (OpenAI/OpenRouter's `stream_options.include_usage`). Only
+    /// meaningful alongside `stream`, so it's built and omitted the same way.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_options: Option<StreamOptions>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StreamOptions {
+    pub include_usage: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -162,9 +172,24 @@ pub struct ReasoningEffort {
     pub effort: String,
 }
 
+/// Token accounting for one request, as providers report it on
+/// `ChatResponse`/the final streamed chunk. Missing entirely on a provider
+/// that doesn't report usage, which is why every caller treats it as
+/// optional rather than assuming a count is always available.
+///
+/// Only the total is kept: nothing here breaks it down into prompt versus
+/// completion tokens, so there's nothing else worth parsing out of it yet.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Deserialize)]
+pub struct Usage {
+    #[serde(default)]
+    pub total_tokens: u64,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ChatResponse {
     pub choices: Vec<Choice>,
+    #[serde(default)]
+    pub usage: Option<Usage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -178,7 +203,13 @@ pub struct Choice {
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
     Content(String),
-    Done(ChatMessage),
+    Done {
+        message: ChatMessage,
+        /// Set when the provider sent a final usage chunk — only requested
+        /// when `stream_options.include_usage` went out, and not every
+        /// provider honors it even then.
+        usage: Option<Usage>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -198,6 +229,10 @@ pub enum StreamEvent {
 struct StreamChunk {
     #[serde(default)]
     choices: Vec<StreamChoice>,
+    /// Present only on the final chunk of a stream that asked for it — see
+    /// `StreamOptions::include_usage`.
+    #[serde(default)]
+    usage: Option<Usage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -288,6 +323,10 @@ struct StreamAccumulator {
     /// block's `text`/`summary` incrementally across chunks, same shape as
     /// `tool_calls` above), and merged with [`merge_reasoning_detail`].
     reasoning_details: BTreeMap<u64, serde_json::Value>,
+    /// The most recent usage chunk seen, if any. Overwritten rather than
+    /// summed: providers that report it send one cumulative total for the
+    /// whole request, typically on a final chunk with empty `choices`.
+    usage: Option<Usage>,
 }
 
 /// Folds one incoming reasoning-detail chunk into the block accumulated so
@@ -327,6 +366,10 @@ impl StreamAccumulator {
     fn push_payload(&mut self, payload: &str) -> Result<Option<String>> {
         let chunk: StreamChunk =
             serde_json::from_str(payload).map_err(|e| anyhow!("Malformed stream chunk: {e}"))?;
+
+        if let Some(usage) = chunk.usage {
+            self.usage = Some(usage);
+        }
 
         let mut new_text = None;
         for choice in chunk.choices {
@@ -382,6 +425,12 @@ impl StreamAccumulator {
         }
 
         Ok(new_text)
+    }
+
+    /// The last usage chunk seen so far, if the provider has sent one. Read
+    /// before [`Self::finish`] consumes the accumulator.
+    fn usage(&self) -> Option<Usage> {
+        self.usage
     }
 
     fn finish(self) -> ChatMessage {
@@ -653,6 +702,16 @@ impl Client {
             reasoning_effort,
             reasoning,
             stream: if stream { Some(true) } else { None },
+            // Only meaningful alongside `stream`; omitted for the buffered
+            // path so a provider that rejects unrecognized fields on a
+            // non-streaming request is unaffected.
+            stream_options: if stream {
+                Some(StreamOptions {
+                    include_usage: true,
+                })
+            } else {
+                None
+            },
         }
     }
 
@@ -788,7 +847,8 @@ impl Client {
                 }
             }
 
-            yield StreamEvent::Done(accumulator.finish());
+            let usage = accumulator.usage();
+            yield StreamEvent::Done { message: accumulator.finish(), usage };
         }
     }
 
@@ -1218,6 +1278,7 @@ mod deser_tests {
             reasoning_effort: None,
             reasoning: None,
             stream: Some(true),
+            stream_options: None,
         };
 
         let skeleton = request_skeleton(&request);
@@ -1267,6 +1328,34 @@ mod deser_tests {
         let json = request_json(Config::default(), Some(0.7), None);
         let sent = json["temperature"].as_f64().expect("a number");
         assert!((sent - 0.7).abs() < 1e-6, "{json}");
+    }
+
+    #[test]
+    fn stream_options_asks_for_usage_only_when_streaming() {
+        // Buffered requests get no usage-only final chunk to ask for in the
+        // first place, and a provider that rejects unrecognized fields
+        // should never see this one on a request it wasn't built for.
+        let request = Client::for_test(Config::default()).build_request(
+            "m".to_string(),
+            vec![],
+            None,
+            None,
+            None,
+            false,
+        );
+        let json = serde_json::to_value(&request).unwrap();
+        assert!(json.get("stream_options").is_none(), "{json}");
+
+        let request = Client::for_test(Config::default()).build_request(
+            "m".to_string(),
+            vec![],
+            None,
+            None,
+            None,
+            true,
+        );
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["stream_options"]["include_usage"], true, "{json}");
     }
 
     #[test]
@@ -1426,6 +1515,28 @@ mod deser_tests {
             None
         );
         assert_eq!(acc.finish().content, None);
+    }
+
+    #[test]
+    fn a_usage_chunk_is_captured_and_readable_before_finish() {
+        let mut acc = StreamAccumulator::default();
+        acc.push_payload(&content_chunk("hi")).unwrap();
+        assert_eq!(acc.usage(), None, "no usage chunk has arrived yet");
+
+        acc.push_payload(r#"{"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}"#)
+            .unwrap();
+        let usage = acc.usage().expect("usage chunk was sent");
+        assert_eq!(usage.total_tokens, 12);
+    }
+
+    #[test]
+    fn a_later_usage_chunk_replaces_rather_than_sums() {
+        // Providers report one cumulative total for the whole request, not a
+        // per-chunk delta.
+        let mut acc = StreamAccumulator::default();
+        acc.push_payload(r#"{"usage":{"total_tokens":5}}"#).unwrap();
+        acc.push_payload(r#"{"usage":{"total_tokens":12}}"#).unwrap();
+        assert_eq!(acc.usage().unwrap().total_tokens, 12);
     }
 
     #[test]

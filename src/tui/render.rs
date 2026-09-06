@@ -417,6 +417,18 @@ fn draw_title(frame: &mut Frame, area: Rect, app: &App) {
         ));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+
+    // Right-aligned on the same row, the way `draw_rule`'s scroll hint
+    // overlays its divider — this is the one place a clanker's running
+    // total is always in view, not just on `/status`'s one-time printout.
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!("🪙 {} ", crate::ui::format_tokens(app.total_tokens)),
+            Style::new().yellow(),
+        )))
+        .right_aligned(),
+        area,
+    );
 }
 
 /// A subtle full-width divider, standing in for the borders the screen used
@@ -2876,11 +2888,13 @@ mod tests {
         let title_row = out.lines().next().unwrap();
 
         // The same mark the gutter and the launch screen draw for it — not a
-        // second one derived from something else.
+        // second one derived from something else. Checked as a prefix, not
+        // full equality: the token badge rides right-aligned on the same
+        // row — see `the_title_row_carries_the_token_badge_top_right`.
         let (mark, _) = identicon(&app.session_id);
-        assert_eq!(
-            title_row.trim_end(),
-            format!("{mark} Write me a snake game  /tmp/snake")
+        assert!(
+            title_row.starts_with(&format!("{mark} Write me a snake game  /tmp/snake")),
+            "{title_row}"
         );
     }
 
@@ -2893,10 +2907,29 @@ mod tests {
         app.working_dir = None;
         let out = render_to_string(&app, 60, 20);
         let (mark, _) = identicon(&app.session_id);
-        assert_eq!(
-            out.lines().next().unwrap().trim_end(),
-            format!("{mark} Older clanker")
+        assert!(
+            out.lines()
+                .next()
+                .unwrap()
+                .starts_with(&format!("{mark} Older clanker")),
+            "{out}"
         );
+    }
+
+    #[test]
+    fn the_title_row_carries_the_token_badge_top_right() {
+        let mut app = sample_app();
+        app.title = "Older clanker".to_string();
+        app.total_tokens = 12345;
+        let out = render_to_string(&app, 60, 20);
+        let title_row = out.lines().next().unwrap();
+
+        assert!(title_row.contains('🪙'), "{title_row}");
+        let title_at = title_row.find("Older clanker").expect("title shown");
+        let tokens_at = title_row.find("12,345").expect("token count shown");
+        // Right-aligned: the badge sits at the end of the row, well clear
+        // of the title, not tucked in right after it like the directory is.
+        assert!(tokens_at > title_at, "{title_row}");
     }
 
     #[test]
