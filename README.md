@@ -1082,9 +1082,18 @@ Three things decide when it happens:
 The seam always lands on one of your own messages, and never inside a
 tool-calling exchange: a tool result whose call was folded away would
 reference something the provider can no longer see, and the request would be
-rejected outright. The last couple of your turns are never folded — a summary
-is a poor substitute for what the model is in the middle of doing, and a fine
-one for what it finished an hour ago.
+rejected outright.
+
+Which of your messages it lands on is bounded twice over. It starts at the
+second-to-last one — a summary is a poor substitute for what the model is in
+the middle of doing, and a fine one for what it finished an hour ago — and
+moves later if keeping that much would keep more than a quarter of the
+threshold. That second bound is what makes compaction worth doing on a
+tool-heavy clanker, where one instruction followed by forty tool calls is a
+single "turn" worth tens of thousands of tokens; keeping two of those left so
+little headroom that the prompt crossed the threshold again almost
+immediately. The turn in progress is never folded either way, however large
+it grows.
 
 Compaction runs *between* turns, never during one. Automatic compaction
 happens after you press Enter and before the request goes out, which is why a

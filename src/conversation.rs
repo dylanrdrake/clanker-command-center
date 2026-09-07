@@ -947,7 +947,7 @@ impl Worker {
         forced: bool,
     ) -> CompactOutcome {
         let from = self.session.compacted_seq();
-        let Some(cut) = crate::compact::seam(self.session.messages(), from) else {
+        let Some(cut) = crate::compact::seam(self.session.messages(), from, self.compact_at) else {
             if forced {
                 let _ = self.events.send(Event::CompactionSkipped {
                     reason: "There isn't enough history past the last compaction to fold away yet"

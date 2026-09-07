@@ -20,11 +20,41 @@ use crate::client::{ChatMessage, Client};
 
 /// How many of the most recent user turns are never folded away.
 ///
-/// The seam is chosen so this many user messages remain after it, which in
-/// practice keeps the exchange in progress and the one before it verbatim.
+/// A ceiling, not a promise: the seam starts here and moves later if keeping
+/// this many turns would keep more than [`tail_budget`] allows. What is
+/// promised is the other end — the turn in progress is never folded, however
+/// large it is.
+///
 /// A summary is a poor substitute for what the model is in the middle of
 /// doing; it is a fine substitute for what it finished an hour ago.
 const KEEP_RECENT_TURNS: usize = 2;
+
+/// What fraction of the compaction threshold the kept tail may occupy.
+///
+/// Turn count alone is the wrong bound, and real clankers show why: one
+/// instruction followed by forty tool calls is a single "turn" worth 30k
+/// tokens, so keeping two of them left a floor of ~33k against a 60k
+/// threshold — compaction crossed the line again within a turn or two and
+/// spent a compactor call each time to fold one instruction's work.
+///
+/// A quarter leaves three quarters of the threshold as headroom, so a
+/// clanker compacts once every few turns rather than every other one. Taken
+/// as a fraction rather than a fixed number of tokens because a threshold
+/// lowered to 10k would otherwise be unreachable: a tail that cannot fit
+/// under the line means compacting on every single turn and never getting
+/// below it.
+const TAIL_FRACTION: u64 = 4;
+
+/// Bytes per token, for judging a span without a tokenizer.
+///
+/// Deliberately low. Tool-call JSON and file dumps tokenize far worse than
+/// prose, and those are what a compacted history is made of — measured
+/// against a real provider-reported prompt on a tool-heavy clanker, the
+/// whole request came out at ~2.6 bytes per token. Erring small overestimates
+/// the tail, which folds slightly more than needed; erring large would let
+/// the tail creep over the threshold, which is the failure this exists to
+/// prevent.
+const BYTES_PER_TOKEN: usize = 3;
 
 /// The longest any single message is rendered at inside the compaction
 /// request. A 200KB file dump is exactly what makes a history worth
@@ -91,7 +121,7 @@ pub fn summary_message(summary: &str) -> String {
 /// `None` when there is nothing worth folding: fewer than
 /// [`KEEP_RECENT_TURNS`] user turns past the existing seam, or a cut that
 /// would not advance it.
-pub fn seam(messages: &[ChatMessage], from: usize) -> Option<usize> {
+pub fn seam(messages: &[ChatMessage], from: usize, compact_at: Option<u64>) -> Option<usize> {
     let user_turns: Vec<usize> = messages
         .iter()
         .enumerate()
@@ -100,13 +130,57 @@ pub fn seam(messages: &[ChatMessage], from: usize) -> Option<usize> {
         .map(|(i, _)| i)
         .collect();
 
-    // Everything there is to fold is already inside the turns being kept.
-    if user_turns.len() <= KEEP_RECENT_TURNS {
+    if user_turns.is_empty() {
         return None;
     }
 
-    let cut = user_turns[user_turns.len() - KEEP_RECENT_TURNS];
+    // Where turn count alone would put it, then later if what that keeps is
+    // too big to be worth keeping. Never past the last one: the exchange in
+    // progress stays verbatim even when it alone blows the budget, because
+    // there is nothing else left to fold and summarizing what the model is
+    // in the middle of is how a turn loses the thread.
+    let last = user_turns.len() - 1;
+    let budget = tail_budget(compact_at);
+    let mut at = user_turns.len().saturating_sub(KEEP_RECENT_TURNS);
+    while at < last && estimated_tokens(&messages[user_turns[at]..]) > budget {
+        at += 1;
+    }
+
+    // Not `>=`: a seam that doesn't move folds nothing and would rewrite the
+    // same summary for the same span.
+    let cut = user_turns[at];
     (cut > from).then_some(cut)
+}
+
+/// How many tokens the kept tail may occupy, from the threshold that will be
+/// measured against it. Falls back to the default threshold for a clanker
+/// with automatic compaction turned off, where `/compact` is the only way in
+/// and there is no configured number to derive from.
+fn tail_budget(compact_at: Option<u64>) -> u64 {
+    compact_at.unwrap_or(crate::config::DEFAULT_COMPACT_AT) / TAIL_FRACTION
+}
+
+/// Roughly what a span costs, for choosing between candidate seams.
+///
+/// An estimate is enough here and a tokenizer would not be worth carrying:
+/// this only ever decides which user turn the seam lands on, so being a third
+/// out moves it by at most one turn. The summary that will sit in front of
+/// the tail isn't counted — it isn't written yet when this runs — which is
+/// part of why [`BYTES_PER_TOKEN`] errs on the small side.
+fn estimated_tokens(messages: &[ChatMessage]) -> u64 {
+    let bytes: usize = messages
+        .iter()
+        .map(|message| {
+            message.content.as_deref().map_or(0, str::len)
+                + message.tool_calls.as_ref().map_or(0, |calls| {
+                    calls
+                        .iter()
+                        .map(|call| call.function.name.len() + call.function.arguments.len())
+                        .sum::<usize>()
+                })
+        })
+        .sum();
+    (bytes / BYTES_PER_TOKEN) as u64
 }
 
 /// Renders one message the way the compactor should read it: who said it,
@@ -297,7 +371,7 @@ mod tests {
             message("user", "three"),
         ];
         // Three user turns, two kept: the cut is the second one.
-        assert_eq!(seam(&messages, 0), Some(2));
+        assert_eq!(seam(&messages, 0, None), Some(2));
         assert_eq!(messages[2].role, "user");
     }
 
@@ -312,7 +386,7 @@ mod tests {
             message("tool", "done"),
             message("user", "and again"),
         ];
-        let cut = seam(&messages, 0).expect("three user turns is enough to fold one");
+        let cut = seam(&messages, 0, None).expect("three user turns is enough to fold one");
         assert_eq!(
             messages[cut].role, "user",
             "cutting anywhere else strands a tool result from the call that produced it"
@@ -326,7 +400,7 @@ mod tests {
             message("assistant", "reply"),
             message("user", "two"),
         ];
-        assert_eq!(seam(&messages, 0), None);
+        assert_eq!(seam(&messages, 0, None), None);
     }
 
     #[test]
@@ -340,7 +414,7 @@ mod tests {
         ];
         // Already folded through 2, so only "three"/"four"/"five" are in
         // play and the cut is the second-to-last of those.
-        assert_eq!(seam(&messages, 2), Some(3));
+        assert_eq!(seam(&messages, 2, None), Some(3));
     }
 
     #[test]
@@ -353,7 +427,66 @@ mod tests {
         ];
         // From 2 there are two user turns left, which is exactly what is
         // kept — folding would move nothing.
-        assert_eq!(seam(&messages, 2), None);
+        assert_eq!(seam(&messages, 2, None), None);
+    }
+
+    /// A message of `tokens` estimated size, as a tool result would be.
+    fn bulk(role: &str, tokens: usize) -> ChatMessage {
+        message(role, &"x".repeat(tokens * BYTES_PER_TOKEN))
+    }
+
+    #[test]
+    fn a_tail_too_big_for_the_budget_moves_the_seam_later() {
+        // The shape a real clanker had: one instruction, then a long run of
+        // tool calls, repeated. Keeping two of those "turns" kept ~40k
+        // against a 60k threshold, so the prompt crossed the line again
+        // almost immediately.
+        let messages = [
+            message("user", "first instruction"),
+            bulk("tool", 20_000),
+            message("user", "second instruction"),
+            bulk("tool", 20_000),
+            message("user", "third instruction"),
+            bulk("tool", 5_000),
+        ];
+
+        // Turn count alone keeps the last two: from index 2, ~45k of tail.
+        assert_eq!(
+            seam(&messages, 0, Some(60_000)),
+            Some(4),
+            "the budget is 15k, so the seam moves on to the last turn"
+        );
+    }
+
+    #[test]
+    fn the_turn_in_progress_is_never_folded_however_big_it_is() {
+        // Nothing else is left to fold, and summarizing what the model is in
+        // the middle of is how a turn loses the thread.
+        let messages = [
+            message("user", "first"),
+            bulk("tool", 5_000),
+            message("user", "second"),
+            bulk("tool", 90_000),
+        ];
+        assert_eq!(seam(&messages, 0, Some(60_000)), Some(2));
+    }
+
+    #[test]
+    fn the_budget_follows_the_threshold_rather_than_a_fixed_number() {
+        // A threshold lowered to 10k with a fixed 15k tail could never get
+        // under the line: it would compact on every turn and never succeed.
+        let messages = [
+            message("user", "first"),
+            bulk("tool", 4_000),
+            message("user", "second"),
+            bulk("tool", 4_000),
+            message("user", "third"),
+            bulk("tool", 500),
+        ];
+        // 60k threshold: a 15k budget, and ~8.5k of tail from index 2 fits.
+        assert_eq!(seam(&messages, 0, Some(60_000)), Some(2));
+        // 10k threshold: a 2.5k budget, so it has to move on.
+        assert_eq!(seam(&messages, 0, Some(10_000)), Some(4));
     }
 
     #[test]

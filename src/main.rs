@@ -1628,10 +1628,11 @@ async fn compact_cli(
     client: &Client,
     session: &mut ChatSession,
     model: &str,
+    compact_at: Option<u64>,
     forced: bool,
 ) -> Result<()> {
     let from = session.compacted_seq();
-    let Some(cut) = compact::seam(session.messages(), from) else {
+    let Some(cut) = compact::seam(session.messages(), from, compact_at) else {
         if forced {
             println!(
                 "{} There isn't enough history past the last compaction to fold away yet",
@@ -1854,7 +1855,9 @@ async fn cmd_clanker(
 
         match ui::classify(&line) {
             ui::Submission::Compact => {
-                if let Err(e) = compact_cli(&client, &mut session, &compactor, true).await {
+                if let Err(e) =
+                    compact_cli(&client, &mut session, &compactor, compact_at, true).await
+                {
                     println!("{} Compaction failed: {}", "✗".red(), e);
                 }
                 println!();
@@ -1866,7 +1869,9 @@ async fn cmd_clanker(
                 if compact_at.is_some_and(|threshold| session.prompt_tokens() >= threshold) {
                     // Reported, not fatal: an oversized history makes for a
                     // worse request, not an impossible one.
-                    if let Err(e) = compact_cli(&client, &mut session, &compactor, false).await {
+                    if let Err(e) =
+                        compact_cli(&client, &mut session, &compactor, compact_at, false).await
+                    {
                         println!("{} Compaction failed: {}", "✗".red(), e);
                     }
                 }
