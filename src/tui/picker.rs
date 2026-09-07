@@ -174,10 +174,10 @@ fn state_badge(state: LastState, held: bool, tick: usize) -> (String, Style) {
 
 // Fixed columns, so the preview can be given whatever the line has left.
 const MARK_WIDTH: usize = 2 + ICON_WIDTH + 1; // selection marker, mark, gap
-                                               // One glyph and a gutter. `mode_label` returns a two-column emoji that
-                                               // `column` pads as one `char`, so the cell draws a column wider than this
-                                               // says — harmlessly, since every row carries one and they stay aligned with
-                                               // each other.
+                                              // One glyph and a gutter. `mode_label` returns a two-column emoji that
+                                              // `column` pads as one `char`, so the cell draws a column wider than this
+                                              // says — harmlessly, since every row carries one and they stay aligned with
+                                              // each other.
 const KIND_WIDTH: usize = 3;
 const TITLE_WIDTH: usize = 24;
 const DIR_WIDTH: usize = 24;
@@ -470,6 +470,24 @@ pub fn draw(
         match item {
             LaunchItem::NewSession => {
                 spans.push(Span::styled("Deploy clanker", base.green()));
+                // Where it would land. A clanker is created in the directory
+                // the launch screen was opened from and keeps it for good, so
+                // this is the one fact about the row that can be wrong in a
+                // way you'd want to catch before pressing Enter rather than
+                // after. `~`-relative like every other directory here.
+                if let Some(dir) = dir {
+                    const LABEL: &str = " to: ";
+                    spans.push(Span::styled(LABEL, base.green()));
+                    spans.push(Span::styled(
+                        truncate(
+                            &home_relative(dir),
+                            width.saturating_sub(
+                                marker.len() + "Deploy clanker".len() + LABEL.len(),
+                            ),
+                        ),
+                        Style::new().dark_gray(),
+                    ));
+                }
                 // Still set apart from the sessions below it, now that no
                 // heading does that: it is the one row that isn't one.
                 trailing_blank = true;
@@ -779,7 +797,10 @@ impl Deployment {
             .chain(EFFORTS.iter().map(|level| Some(level.to_string())))
             .collect();
         if let Some(configured) = &effort {
-            if !efforts.iter().any(|level| level.as_deref() == Some(configured)) {
+            if !efforts
+                .iter()
+                .any(|level| level.as_deref() == Some(configured))
+            {
                 efforts.push(Some(configured.clone()));
             }
         }
@@ -961,10 +982,7 @@ pub fn draw_deployment(frame: &mut Frame, deployment: &Deployment) {
     frame.render_widget(Paragraph::new(Text::from(lines)), areas[2]);
 
     let hint = match &deployment.error {
-        Some(error) => Line::from(Span::styled(
-            format!(" {error}"),
-            Style::new().red().bold(),
-        )),
+        Some(error) => Line::from(Span::styled(format!(" {error}"), Style::new().red().bold())),
         None => Line::from(Span::styled(
             " ↑/↓ move · ←/→ change · Tab reroll · Enter deploy · Esc cancel",
             Style::new().dark_gray(),
@@ -1380,9 +1398,23 @@ mod tests {
     }
 
     #[test]
-    fn the_first_row_deploys_a_clanker() {
+    fn the_first_row_deploys_a_clanker_and_says_where() {
+        // The directory is where the clanker would be created, which it
+        // keeps for good — worth reading before pressing Enter rather than
+        // after.
         let out = picker_to_string(&picker_of(vec![]), 60, 10);
-        assert!(out.contains("Deploy clanker"), "{out}");
+        assert!(out.contains("Deploy clanker to:"), "{out}");
+        assert!(out.contains(&home_relative(HERE)), "{out}");
+    }
+
+    #[test]
+    fn the_deploy_row_fits_a_narrow_terminal() {
+        // The path is the last thing on the line, so an unbounded one would
+        // run off the edge rather than being wrapped.
+        let out = picker_to_string(&picker_of(vec![]), 30, 10);
+        for line in out.lines() {
+            assert!(line.chars().count() <= 30, "{line:?} in {out}");
+        }
     }
 
     #[test]

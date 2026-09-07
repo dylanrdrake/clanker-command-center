@@ -553,8 +553,12 @@ switch between once you are there — a clanker is one thing, and what it can
 do is what its tools say. A resumed clanker picks back up with the tools,
 model and effort level it was last left with.
 
-Choosing "Deploy clanker" from the launch screen opens **Clanker
-Deployment**: a form for everything the clanker starts with, and the first
+The launch screen's first row names the directory it would deploy into —
+`Deploy clanker to: ~/code/thing`. A clanker is created in the directory
+`clank` was started from and keeps it for good, so that is the one thing
+about the row worth checking before pressing Enter rather than after.
+
+Choosing "Deploy clanker" opens **Clanker Deployment**: a form for everything the clanker starts with, and the first
 thing you want it to do. A name is required — starting a clanker is meant to
 be deliberate, so there's no untitled path. The clanker is kept from the
 moment you deploy it, whether or not anything is ever said in it.
