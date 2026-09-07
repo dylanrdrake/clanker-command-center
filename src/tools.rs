@@ -599,9 +599,14 @@ fn write_file(
         fs::write(&path, content)?;
     }
 
+    // The path is not repeated in the message: `filepath` beside it already
+    // carries it, and better — canonicalized, where the message would have
+    // quoted the raw argument. Two copies of it read as a bug in `/verbose`,
+    // which lists every field of a result on its own row. `replace_in_file`
+    // has always returned the bare "File updated" for the same reason.
     Ok(json!({
         "success": true,
-        "message": format!("File written: {}", filepath),
+        "message": "File written",
         "filepath": path.to_string_lossy()
     }))
 }
@@ -1023,6 +1028,26 @@ mod tests {
         let allowed = write_file(&inside, "x", "write", true).unwrap();
         assert_eq!(allowed["success"], true, "{allowed}");
         fs::remove_file(&inside).ok();
+    }
+
+    #[test]
+    fn a_written_file_reports_its_path_once() {
+        // `/verbose` lists every field of a result on its own row, so a
+        // message that restated the path printed it twice under the call
+        // that already named it in its header.
+        let name = format!("clank-write-test-{}-once.txt", std::process::id());
+        let result = write_file(&name, "x", "write", true).unwrap();
+        fs::remove_file(&name).ok();
+
+        assert_eq!(result["success"], true, "{result}");
+        assert_eq!(
+            result["message"], "File written",
+            "the message must not carry the path — `filepath` beside it does"
+        );
+        assert!(
+            result["filepath"].as_str().unwrap().ends_with(&name),
+            "{result}"
+        );
     }
 
     #[test]
