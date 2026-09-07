@@ -1,5 +1,6 @@
 mod agent;
 mod client;
+mod compact;
 mod config;
 mod conversation;
 mod crypto;
@@ -111,6 +112,28 @@ enum Commands {
         url: Option<String>,
 
         /// Clear the stored endpoint (falls back to the OpenRouter default)
+        #[arg(long)]
+        clear: bool,
+    },
+
+    /// Show or set the model that compacts a clanker's history
+    Compactor {
+        /// Model to compact with (omit to show the current one)
+        name: Option<String>,
+
+        /// Clear the stored compactor (falls back to openrouter/auto)
+        #[arg(long)]
+        clear: bool,
+    },
+
+    /// Show or set the prompt size that sets compaction going
+    CompactAt {
+        /// Prompt tokens a request has to reach before the next turn
+        /// compacts first (omit to show the current threshold)
+        value: Option<u64>,
+
+        /// Clear it — nothing compacts on its own, and `/compact` inside a
+        /// clanker becomes the only way to compact at all
         #[arg(long)]
         clear: bool,
     },
@@ -364,6 +387,16 @@ fn resolve_model(config: &config::Config, cli_model: Option<String>) -> String {
         .unwrap_or_else(|| config::DEFAULT_MODEL.to_string())
 }
 
+/// The model that compacts a clanker's history. No flag to override it: it
+/// is a global setting, and a per-clanker one is the next thing to build
+/// here rather than a per-invocation one — see [`config::Config::compactor`].
+fn resolve_compactor(config: &config::Config) -> String {
+    config
+        .compactor
+        .clone()
+        .unwrap_or_else(|| config::DEFAULT_MODEL.to_string())
+}
+
 /// `None` if neither the flag nor the config default is set — genuinely no
 /// value, not a hardcoded floor. `ask`/`agent`/a new `session` pass this
 /// straight through: a request goes out with no `temperature` field, and an
@@ -411,6 +444,8 @@ async fn main() -> Result<()> {
         Some(Commands::Models) => cmd_models().await?,
         Some(Commands::Model { name, clear }) => cmd_model(name, clear).await?,
         Some(Commands::Endpoint { url, clear }) => cmd_endpoint(url, clear).await?,
+        Some(Commands::Compactor { name, clear }) => cmd_compactor(name, clear).await?,
+        Some(Commands::CompactAt { value, clear }) => cmd_compact_at(value, clear).await?,
         Some(Commands::EffortStyle { value, clear }) => cmd_effort_style(value, clear).await?,
         Some(Commands::Headers { action }) => cmd_headers(action).await?,
         Some(Commands::Tools { state, target }) => cmd_tools(state, target).await?,
@@ -550,6 +585,14 @@ async fn cmd_status() -> Result<()> {
             .unwrap_or(config::DEFAULT_EFFORT_STYLE)
     );
     println!("  Streaming: {}", if config.stream { "on" } else { "off" });
+    println!("  Compactor: {}", resolve_compactor(&config));
+    println!(
+        "  Compact at: {}",
+        match config.compact_at {
+            Some(threshold) => format!("{} prompt tokens", ui::format_tokens(threshold as i64)),
+            None => "off — /compact only".to_string(),
+        }
+    );
     println!("  Sandbox: {}", if config.sandbox { "on" } else { "off" });
     println!("  Verbose: {}", if config.verbose { "on" } else { "off" });
     println!(
@@ -1096,6 +1139,77 @@ async fn cmd_effort_level(value: Option<String>, clear: bool) -> Result<()> {
     Ok(())
 }
 
+/// `clank compactor [name] [--clear]` — the model that does the summarizing.
+/// Clearing falls back to the same default an unset model does, rather than
+/// switching compaction off; `clank compact-at --clear` is the off switch.
+async fn cmd_compactor(name: Option<String>, clear: bool) -> Result<()> {
+    let mut config = load_config()?;
+
+    if clear {
+        config.compactor = None;
+        save_config(&config)?;
+        println!(
+            "{} Compactor cleared, falling back to {}",
+            "✓".green(),
+            config::DEFAULT_MODEL
+        );
+        return Ok(());
+    }
+
+    match name {
+        Some(name) => {
+            config.compactor = Some(name.clone());
+            save_config(&config)?;
+            println!("{} Compactor set to {}", "✓".green(), name);
+        }
+        None => {
+            println!("Current compactor: {}", resolve_compactor(&config));
+        }
+    }
+
+    Ok(())
+}
+
+/// `clank compact-at [n] [--clear]` — how large a request's prompt has to get
+/// before the next turn summarizes the older part of the conversation first.
+async fn cmd_compact_at(value: Option<u64>, clear: bool) -> Result<()> {
+    let mut config = load_config()?;
+
+    if clear {
+        config.compact_at = None;
+        save_config(&config)?;
+        println!(
+            "{} Automatic compaction turned off — /compact still works inside a clanker",
+            "✓".green()
+        );
+        return Ok(());
+    }
+
+    match value {
+        Some(0) => anyhow::bail!(
+            "A threshold of 0 would compact before every turn. Give a token count,              or --clear to turn automatic compaction off."
+        ),
+        Some(value) => {
+            config.compact_at = Some(value);
+            save_config(&config)?;
+            println!(
+                "{} Compacting once a request's prompt reaches {} tokens",
+                "✓".green(),
+                ui::format_tokens(value as i64)
+            );
+        }
+        None => match config.compact_at {
+            Some(threshold) => println!(
+                "Compacting once a request's prompt reaches {} tokens",
+                ui::format_tokens(threshold as i64)
+            ),
+            None => println!("Automatic compaction is off — /compact only"),
+        },
+    }
+
+    Ok(())
+}
+
 async fn cmd_models() -> Result<()> {
     let config = load_config()?;
     let client = Client::new(config)?;
@@ -1263,6 +1377,8 @@ fn apply_submission(
     default_max_iterations: Option<usize>,
     default_temperature: Option<f32>,
     default_effort_level: Option<String>,
+    compactor: &str,
+    compact_at: Option<u64>,
 ) -> Result<()> {
     match submission {
         ui::Submission::Message(_) => unreachable!("handled by the caller"),
@@ -1473,6 +1589,8 @@ fn apply_submission(
                 working_dir: session.working_dir(),
                 tool_access: &tool_access,
                 total_tokens: session.total_tokens(),
+                compactor,
+                compact_at,
             });
             let width = rows.iter().map(|(label, _)| label.len()).max().unwrap_or(0);
             println!("\n{}", "Clanker:".blue());
@@ -1486,10 +1604,54 @@ fn apply_submission(
         ui::Submission::ShowSandbox => {
             println!("{}", ui::sandbox_notice(session.sandbox(), false).blue());
         }
+        // Needs the client and an await, which this has neither of — the
+        // chat loop takes it before reaching here, the same way it takes an
+        // ordinary message.
+        ui::Submission::Compact => unreachable!("handled by the caller"),
         ui::Submission::UnknownCommand(message) => {
             println!("{} {}", "✗".red(), message);
         }
     }
+    Ok(())
+}
+
+/// Compacts a plain-CLI session's history, printing what happened in the
+/// same words the TUI puts in its transcript.
+///
+/// The worker's [`conversation::Worker::compact`] equivalent, minus the
+/// select loop: this front end is a blocking prompt, so there is nothing to
+/// stay responsive for while the summary is written.
+///
+/// `forced` is `/compact` rather than the threshold firing, and decides only
+/// whether having nothing to fold is worth saying — see the worker's for why.
+async fn compact_cli(
+    client: &Client,
+    session: &mut ChatSession,
+    model: &str,
+    forced: bool,
+) -> Result<()> {
+    let from = session.compacted_seq();
+    let Some(cut) = compact::seam(session.messages(), from) else {
+        if forced {
+            println!(
+                "{} There isn't enough history past the last compaction to fold away yet",
+                "✓".green()
+            );
+        }
+        return Ok(());
+    };
+
+    println!("{}", ui::compacting_notice(model).blue());
+    let span = session.messages()[from..cut].to_vec();
+    let previous = session.compaction_summary().map(str::to_string);
+    let compacted = compact::compact(client, model, previous.as_deref(), &span).await?;
+
+    // Spent on this clanker's behalf, so it counts against this clanker.
+    if let Err(e) = session.add_tokens(compacted.tokens as i64) {
+        eprintln!("{} Failed to save token usage: {}", "✗".red(), e);
+    }
+    session.set_compaction(cut, compacted.summary)?;
+    println!("{}", ui::compacted_notice(cut).blue());
     Ok(())
 }
 
@@ -1532,6 +1694,11 @@ async fn cmd_clanker(
     let default_max_iterations = resolve_max_iterations(&config, max_iterations);
     let default_temperature = resolve_temperature(&config, temperature);
     let default_effort_level = resolve_effort_level(&config, effort_level);
+    // Read before `config` moves into the client below. Global settings, so
+    // unlike the three above there is nothing per-clanker to resolve them
+    // against — see `Config::compactor`.
+    let compactor = resolve_compactor(&config);
+    let compact_at = config.compact_at;
 
     let mut prior_prompts: Vec<String> = Vec::new();
     let mut session = match resume {
@@ -1686,7 +1853,24 @@ async fn cmd_clanker(
         }
 
         match ui::classify(&line) {
+            ui::Submission::Compact => {
+                if let Err(e) = compact_cli(&client, &mut session, &compactor, true).await {
+                    println!("{} Compaction failed: {}", "✗".red(), e);
+                }
+                println!();
+            }
             ui::Submission::Message(text) => {
+                // Before the message is recorded, so what gets summarized is
+                // the conversation up to now rather than the question that
+                // is about to be asked of it.
+                if compact_at.is_some_and(|threshold| session.prompt_tokens() >= threshold) {
+                    // Reported, not fatal: an oversized history makes for a
+                    // worse request, not an impossible one.
+                    if let Err(e) = compact_cli(&client, &mut session, &compactor, false).await {
+                        println!("{} Compaction failed: {}", "✗".red(), e);
+                    }
+                }
+
                 session.push_user(text);
                 if let Err(e) = session.persist_pending() {
                     eprintln!("{} Failed to save message: {}", "✗".red(), e);
@@ -1703,6 +1887,13 @@ async fn cmd_clanker(
                 // needs, and both are visible from here.
                 session.set_activity(Some(store::Activity::Working), None);
                 let usage = agent::UsageTracker::default();
+                // What the provider sees, which is not the whole history
+                // once this clanker has been compacted. The turn appends to
+                // this copy and everything past `sent` is folded back into
+                // the session below — the agent loop can no longer be handed
+                // the session's own vector, because the two differ.
+                let mut messages = session.request_messages();
+                let sent = messages.len();
                 let turn = if session.is_agentic() {
                     let max_iterations = session.max_iterations();
                     let gates = SessionGates::new(
@@ -1713,7 +1904,7 @@ async fn cmd_clanker(
                     agent::run_agent_turn(
                         &client,
                         &mut ui,
-                        session.messages_mut(),
+                        &mut messages,
                         &model,
                         max_iterations,
                         temperature,
@@ -1731,7 +1922,7 @@ async fn cmd_clanker(
                     agent::run_chat_turn(
                         &client,
                         &mut ui,
-                        session.messages_mut(),
+                        &mut messages,
                         &model,
                         temperature,
                         effort_level,
@@ -1740,6 +1931,10 @@ async fn cmd_clanker(
                     )
                     .await
                 };
+
+                for message in messages.into_iter().skip(sent) {
+                    session.push(message);
+                }
 
                 let failed = turn.is_err();
                 match turn {
@@ -1752,6 +1947,11 @@ async fn cmd_clanker(
                 session.set_activity(failed.then_some(store::Activity::Failed), None);
                 if let Err(e) = session.add_tokens(usage.total() as i64) {
                     eprintln!("{} Failed to save token usage: {}", "✗".red(), e);
+                }
+                // How big the last request was, which is what decides
+                // whether the next one compacts first.
+                if let Err(e) = session.set_prompt_tokens(usage.last_prompt()) {
+                    eprintln!("{} Failed to save the prompt size: {}", "✗".red(), e);
                 }
 
                 if let Err(e) = session.persist_pending() {
@@ -1766,6 +1966,8 @@ async fn cmd_clanker(
                     default_max_iterations,
                     default_temperature,
                     default_effort_level.clone(),
+                    &compactor,
+                    compact_at,
                 ) {
                     println!("{} {}", "✗".red(), e);
                 }
@@ -1991,6 +2193,8 @@ async fn cmd_tui() -> Result<()> {
         highlight: config.highlight,
         selection: config.selection,
         stream: config.stream,
+        compactor: config.compactor.clone(),
+        compact_at: config.compact_at,
         client: Arc::new(Client::new(config)?),
     };
 

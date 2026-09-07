@@ -205,6 +205,9 @@ pub enum Submission {
     ShowTitle,
     /// Prints/shows every in-session command and what it does.
     ShowHelp,
+    /// `/compact` — fold the earlier conversation into a summary now,
+    /// without waiting for it to grow past the configured threshold.
+    Compact,
     /// A line that named a known command (`/effort`, `/max-iterations`,
     /// `/temperature`/`/temp`, `/tools`, `/sandbox`) but wasn't a valid
     /// invocation of
@@ -236,6 +239,13 @@ pub struct SessionSettings<'a> {
     pub working_dir: Option<&'a str>,
     pub tool_access: &'a ToolAccessSettings,
     pub total_tokens: i64,
+    /// The model that compacts this clanker's history, and the prompt size
+    /// that sets it going. Configuration rather than session state — every
+    /// other row here is something the clanker owns — but they change what a
+    /// turn does, and `/status` is where someone looks to find out why a
+    /// turn paused to summarize itself.
+    pub compactor: &'a str,
+    pub compact_at: Option<u64>,
 }
 
 /// A token count with `,`-grouped thousands, since a long-running clanker's
@@ -309,6 +319,17 @@ pub fn session_settings_rows(settings: &SessionSettings) -> Vec<(String, String)
         (
             "Tokens".to_string(),
             format!("🪙 {}", format_tokens(settings.total_tokens)),
+        ),
+        (
+            "Compactor".to_string(),
+            match settings.compact_at {
+                Some(threshold) => format!(
+                    "{} at {} prompt tokens",
+                    settings.compactor,
+                    format_tokens(threshold as i64)
+                ),
+                None => format!("{} — /compact only, never automatic", settings.compactor),
+            },
         ),
         (
             "Directory".to_string(),
@@ -441,6 +462,24 @@ pub fn sandbox_notice(sandbox: bool, changed: bool) -> String {
         "off — writes allowed anywhere"
     };
     format!("Sandbox {verb} {state}")
+}
+
+/// What a clanker says when it starts compacting. Named with the model
+/// doing it: the compactor is a global setting a user may not have looked at
+/// in a while, and a pause explained by an unfamiliar model name is a pause
+/// they can act on.
+pub fn compacting_notice(model: &str) -> String {
+    format!("Compacting the earlier conversation with {model}...")
+}
+
+/// What it says when the summary lands. `folded` is how many messages the
+/// summary now stands in for — the whole span since the start, not just what
+/// this pass added, because that is what the next request leaves out.
+pub fn compacted_notice(folded: usize) -> String {
+    let plural = if folded == 1 { "message" } else { "messages" };
+    format!(
+        "Compacted — the first {folded} {plural} are now sent as a summary.          They are still here to scroll back through."
+    )
 }
 
 pub fn classify(text: &str) -> Submission {
@@ -633,6 +672,12 @@ pub fn classify(text: &str) -> Submission {
         }
     }
 
+    if let Some(rest) = trimmed.strip_prefix("/compact") {
+        if rest.trim().is_empty() {
+            return Submission::Compact;
+        }
+    }
+
     if let Some(rest) = trimmed.strip_prefix("/status") {
         if rest.trim().is_empty() {
             return Submission::ShowStatus;
@@ -762,7 +807,7 @@ struct Command {
     usage: Option<&'static str>,
 }
 
-const COMMANDS: [Command; 19] = [
+const COMMANDS: [Command; 20] = [
     Command {
         word: "help",
         syntax: "/help",
@@ -834,6 +879,12 @@ const COMMANDS: [Command; 19] = [
         syntax: "/stream [on|off]",
         blurb: "Stream replies token-by-token, or wait for the whole one",
         usage: Some("/stream <on|off>"),
+    },
+    Command {
+        word: "compact",
+        syntax: "/compact",
+        blurb: "Fold the earlier conversation into a summary now",
+        usage: Some("/compact"),
     },
     Command {
         word: "status",
@@ -1769,6 +1820,8 @@ mod tests {
             working_dir: None,
             tool_access: &tool_access,
             total_tokens: 0,
+            compactor: "openrouter/auto",
+            compact_at: None,
         });
         let value = |label: &str| {
             rows.iter()
@@ -1811,6 +1864,8 @@ mod tests {
             working_dir: Some("/home/dev/project"),
             tool_access: &tool_access,
             total_tokens: 12345,
+            compactor: "openrouter/auto",
+            compact_at: Some(60_000),
         });
         let value = |label: &str| {
             rows.iter()

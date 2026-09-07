@@ -218,6 +218,12 @@ pub struct App {
     /// Total tokens spent across this clanker's turns so far. Updated after
     /// each turn finishes, from [`crate::conversation::Event::TokensUsed`].
     pub total_tokens: i64,
+    /// The model that compacts this clanker's history and the prompt size
+    /// that sets it going, copied off the configuration when the clanker was
+    /// opened. Held only so `/status` can report them: nothing here acts on
+    /// them, the worker does — see [`crate::conversation::Worker`].
+    pub compactor: String,
+    pub compact_at: Option<u64>,
     /// Changes with `/tools`. Also what says whether this clanker has tools
     /// at all — the thing that used to be a separate mode.
     pub tool_access: ToolAccessSettings,
@@ -290,6 +296,12 @@ impl App {
         App {
             transcript: Vec::new(),
             model_browser: None,
+            // Overwritten from the configuration by whoever opens the
+            // clanker; the fallback here is the same model an unset
+            // `compactor` resolves to, so a status readout never says
+            // nothing at all.
+            compactor: crate::config::DEFAULT_MODEL.to_string(),
+            compact_at: None,
             input: String::new(),
             cursor: 0,
             busy: false,
@@ -511,6 +523,18 @@ impl App {
             // Same deal: the header's gold-coin badge re-renders with the
             // new total next frame, with nothing worth a transcript line.
             Event::TokensUsed { total_tokens } => self.total_tokens = total_tokens,
+            // Compaction is a pause with nothing streaming out of it, so it
+            // announces itself and then says how it went — the same shape as
+            // any other notice, rather than a status line of its own.
+            Event::Compacting { model } => self
+                .transcript
+                .push(TranscriptItem::Notice(crate::ui::compacting_notice(&model))),
+            Event::Compacted { folded } => self
+                .transcript
+                .push(TranscriptItem::Notice(crate::ui::compacted_notice(folded))),
+            Event::CompactionSkipped { reason } => {
+                self.transcript.push(TranscriptItem::Notice(reason))
+            }
             Event::Agent(event) => self.apply_agent(event),
         }
     }

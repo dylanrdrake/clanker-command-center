@@ -381,3 +381,37 @@ New: every clanker keeps a running total of what it has spent.
 
 - `clank model --clear extra-arg` exits 0 and silently ignores the name.
   Pre-existing; `--clear` just wins.
+## 15. Compaction
+
+New: a long clanker folds its older turns into a summary rather than
+resending them.
+
+- `clank compactor` and `clank compact-at` with no argument print the current
+  values; `clank status` shows both rows. Setting each one reports it back,
+  and `--clear` on the first falls back to `openrouter/auto` while `--clear`
+  on the second says automatic compaction is off.
+- `/compact` in a clanker with only a message or two → "There isn't enough
+  history past the last compaction to fold away yet", and nothing changes.
+- Build up four or five exchanges, then `/compact` → a notice naming the
+  compactor model, then one saying how many messages are now sent as a
+  summary. **The transcript must be unchanged** — scroll up and every
+  original message is still there, word for word.
+- Send a message after that → the reply should show the model still knows
+  what was discussed before the seam. The 🪙 total should have gone up by the
+  compaction's own cost as well as the turn's.
+- `Ctrl-B` out and back in, then quit and reopen → the seam survives, so a
+  second `/compact` folds only what has been said since, not the whole
+  history again.
+- `Esc` while "Compacting..." is on screen → cancelled cleanly, nothing
+  folded, and the clanker still works. A message typed during it should still
+  be waiting afterwards rather than lost.
+- `/compact` typed while a turn is running → refused with "A turn is
+  running", not silently ignored.
+- `clank compact-at 500` on a clanker that has already spent more than that,
+  then send a message → it compacts on its own before the turn, with the same
+  pair of notices. Put the threshold back afterwards.
+- The same in `clank clanker` (the line-based front end), which compacts
+  through its own path: both the automatic pause and `/compact` should print
+  the same two notices.
+- Against a provider that reports no `prompt_tokens`, automatic compaction
+  should never fire — and `/compact` should still work.

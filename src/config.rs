@@ -226,6 +226,17 @@ pub const DEFAULT_EFFORT_STYLE: &str = "nested";
 /// and that has to keep meaning "use this".
 pub const DEFAULT_MODEL: &str = "openrouter/auto";
 
+/// The prompt size, in tokens, a clanker's history has to reach before the
+/// compactor folds the older part of it into a summary.
+///
+/// A default rather than an off switch, because compaction is what the
+/// setting is for — but a generous one. Most conversations never reach it;
+/// the ones that do are the long agentic runs where a single file read sits
+/// in every request from then on, which is exactly the spend worth cutting.
+/// `clank compact-at --clear` turns automatic compaction off entirely and
+/// leaves `/compact` as the only way in.
+pub const DEFAULT_COMPACT_AT: u64 = 60_000;
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Config {
     /// Legacy field: API keys used to be stored here in plaintext. Only
@@ -237,6 +248,24 @@ pub struct Config {
     pub base_url: String,
     #[serde(default = "default_model")]
     pub default_model: Option<String>,
+    /// The model that compacts a clanker's history — see [`crate::compact`].
+    /// Deliberately its own setting rather than the clanker's own model: the
+    /// job is summarizing a transcript, which a small cheap model does well,
+    /// and paying reasoning-model rates to save tokens would defeat the
+    /// point. `None` falls back to [`DEFAULT_MODEL`], the same way
+    /// `default_model` does.
+    ///
+    /// Global only for now. A per-clanker override belongs here eventually,
+    /// alongside the model and temperature ones, but a clanker has to be
+    /// able to say "the configured one" before that means anything.
+    #[serde(default = "default_compactor")]
+    pub compactor: Option<String>,
+    /// How large a request's prompt has to get before the next turn compacts
+    /// first, in tokens as the provider reported them. `None` means never
+    /// automatically — `/compact` still works, and is then the only thing
+    /// that compacts.
+    #[serde(default = "default_compact_at")]
+    pub compact_at: Option<u64>,
     /// Legacy: the three category gates, as configs written before tools had
     /// their own states hold them. Read so those keep meaning what they
     /// meant, never written again — it disappears from the file the next
@@ -359,6 +388,21 @@ pub fn default_model() -> Option<String> {
     Some(DEFAULT_MODEL.to_string())
 }
 
+/// Same deal as [`default_model`]: the compactor named in a config written
+/// from defaults, so the file says which model will do the summarizing
+/// rather than leaving `null` beside a literal.
+pub fn default_compactor() -> Option<String> {
+    Some(DEFAULT_MODEL.to_string())
+}
+
+/// The threshold seeded into a new config, and into one written before this
+/// existed. `Some` rather than `None`, so compaction is on out of the box —
+/// see [`DEFAULT_COMPACT_AT`] for why the number is as high as it is. Once
+/// cleared it stays cleared: this is never consulted again after that.
+pub fn default_compact_at() -> Option<u64> {
+    Some(DEFAULT_COMPACT_AT)
+}
+
 /// Same deal: the shape effort is serialized in when the config doesn't say.
 /// See [`DEFAULT_EFFORT_STYLE`].
 pub fn default_effort_style() -> Option<String> {
@@ -384,6 +428,8 @@ impl Default for Config {
             api_key: None,
             base_url: default_base_url(),
             default_model: default_model(),
+            compactor: default_compactor(),
+            compact_at: default_compact_at(),
             approval: ApprovalSettings::default(),
             // Explicitly the defaults, not `None`: `None` means "this config
             // predates tools having states" and derives from the three old

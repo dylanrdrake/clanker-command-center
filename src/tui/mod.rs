@@ -80,6 +80,12 @@ pub struct Context {
     pub selection: bool,
     /// The configured default for streaming replies, same deal.
     pub stream: bool,
+    /// The model that compacts a clanker's history, and the prompt size that
+    /// sets it going. Global-only settings — a clanker has no override to
+    /// take these as a starting value for, so unlike the ones above they
+    /// stay what the configuration says.
+    pub compactor: Option<String>,
+    pub compact_at: Option<u64>,
 }
 
 enum Screen {
@@ -317,6 +323,13 @@ fn start_chat(
     app.tool_access = session.tool_access().clone();
     app.sandbox = session.sandbox();
     app.stream = session.stream();
+    // Configuration rather than session state, so it comes from the context
+    // rather than off the session — see `App::compactor`.
+    app.compactor = context
+        .compactor
+        .clone()
+        .unwrap_or_else(|| crate::config::DEFAULT_MODEL.to_string());
+    app.compact_at = context.compact_at;
     app.working_dir = session.working_dir().map(str::to_string);
     app.title = session.title().to_string();
     seed_transcript(&mut app, &history);
@@ -328,6 +341,8 @@ fn start_chat(
         context.temperature,
         context.effort_level.clone(),
         context.tool_access.clone(),
+        context.compactor.clone(),
+        context.compact_at,
         claim,
     );
     Ok(Chat {
@@ -1017,6 +1032,8 @@ fn dispatch_submission(app: &mut App, text: &str, send: &mut impl FnMut(Command)
                         working_dir: app.working_dir.as_deref(),
                         tool_access: &tool_access,
                         total_tokens: app.total_tokens,
+                        compactor: &app.compactor,
+                        compact_at: app.compact_at,
                     });
                     app.transcript.push(TranscriptItem::SessionStatus(rows));
                 }
@@ -1095,7 +1112,8 @@ fn dispatch_submission(app: &mut App, text: &str, send: &mut impl FnMut(Command)
                 | app::Submission::ResetTemperature
                 | app::Submission::Shell(_)
                 | app::Submission::SetToolAccess { .. }
-                | app::Submission::ResetToolAccess => {
+                | app::Submission::ResetToolAccess
+                | app::Submission::Compact => {
                     unreachable!("command_for routes these to the worker")
                 }
             }
@@ -1251,6 +1269,8 @@ mod tests {
             highlight: true,
             selection: true,
             stream: true,
+            compactor: None,
+            compact_at: None,
         }
     }
 

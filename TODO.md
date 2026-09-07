@@ -16,6 +16,25 @@ Clanker re-design — API surface and theme, cheapest first
 * Skills? implement Agent Skill Standard: agentskills.io
 
 NEXT:
+* Per-clanker compactor, overriding the global one like every other
+  redundant global/per-clanker pair. The global settings and the machinery
+  are built (`clank compactor`, `clank compact-at`, `/compact`); what is
+  missing is the two columns on the session row, a `/compactor` and a
+  `/compact-at` to set them, their `clear`/`default` forms, and the rows on
+  the deployment form. `Worker` already snapshots both at open, which is
+  where the per-clanker value would be resolved instead.
+* Compaction: bound the kept tail by size, not only by turn count.
+  `KEEP_RECENT_TURNS = 2` in compact.rs keeps the last two *user* turns, on
+  the assumption that a turn is small. In an agentic run it isn't, and the
+  user messages are sparse: d6e42fbc reached 102 messages on 4 user messages
+  (seq 0, 67, 97, 100), 87% of its content tool results. That one compacted
+  well — the seam landed at 97 — but only because a third and fourth message
+  happened to exist. Had it run to 102 messages on three, the seam would have
+  been 67 and ~35 tool-heavy messages would have been unfoldable, with
+  nothing to be done about it until another message was typed.
+  Fix is a second bound: keep the last two user turns *or* the last ~15k
+  tokens, whichever is smaller. Trades fidelity for savings, so it wants a
+  deliberate choice rather than a quiet tightening.
 * Vim mode
 * $ command UI re-think
   What exists: a box above the prompt showing the command and, once it exits,

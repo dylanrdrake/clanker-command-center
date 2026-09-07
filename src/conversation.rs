@@ -97,6 +97,11 @@ pub enum Command {
     /// concrete value to the session now (`/temperature default`), distinct
     /// from [`Command::SetTemperature`]`(None)`.
     ResetTemperature,
+    /// Fold the older part of this clanker's history into a summary now,
+    /// whatever the threshold says — `/compact`. Runs the same compaction a
+    /// long history triggers on its own; what it skips is the check for
+    /// whether it was needed.
+    Compact,
 }
 
 /// What the conversation reports back. Agent progress is forwarded verbatim
@@ -197,6 +202,29 @@ pub enum Event {
     TokensUsed {
         total_tokens: i64,
     },
+    /// Compaction has begun, with the model doing it. Sent before the
+    /// request goes out: it is a round trip to another provider with nothing
+    /// streaming out of it, and a clanker that sits silent for ten seconds
+    /// before a turn starts owes the user an explanation.
+    Compacting {
+        model: String,
+    },
+    /// Compaction finished. `folded` is how many messages the summary now
+    /// stands in for in requests — all of them, not just the ones this pass
+    /// added, since that is what the next request actually leaves out.
+    ///
+    /// The model isn't repeated here: [`Event::Compacting`] named it a
+    /// moment ago, and the pair reads as one thing happening rather than as
+    /// two facts about the same model.
+    Compacted {
+        folded: usize,
+    },
+    /// Compaction was asked for and there was nothing to do — too little
+    /// history past the last seam to fold. Distinct from a failure: nothing
+    /// went wrong, and `/compact` still deserves an answer.
+    CompactionSkipped {
+        reason: String,
+    },
 }
 
 /// Handle to a running conversation worker.
@@ -215,6 +243,7 @@ pub enum Event {
 pub fn command_for(submission: &Submission) -> Option<Command> {
     match submission {
         Submission::Message(text) => Some(Command::Send(text.clone())),
+        Submission::Compact => Some(Command::Compact),
         Submission::SetModel(model) => Some(Command::SetModel(model.clone())),
         Submission::SetEffort(effort_level) => Some(Command::SetEffort(effort_level.clone())),
         Submission::ResetEffort => Some(Command::ResetEffort),
@@ -308,6 +337,8 @@ impl Conversation {
         temperature: Option<f32>,
         effort_level_default: Option<String>,
         tool_access_default: ToolAccessSettings,
+        compactor: Option<String>,
+        compact_at: Option<u64>,
         claim: crate::session::Heartbeat,
     ) -> Self {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
@@ -336,6 +367,8 @@ impl Conversation {
             temperature,
             effort_level_default,
             tool_access_default,
+            compactor,
+            compact_at,
             events: event_tx,
         };
         let task = tokio::spawn(worker.run(command_rx));
@@ -424,6 +457,16 @@ struct Worker {
     /// The configured default effort level this session started from — same
     /// deal as `temperature`; only consulted by `/effort default`.
     effort_level_default: Option<String>,
+    /// The model that compacts this clanker's history, and the prompt size
+    /// that sets it going — both from the configuration, read when the
+    /// clanker was opened.
+    ///
+    /// Snapshotted like every other default here rather than re-read per
+    /// turn. Global-only settings for now, so there is no per-clanker value
+    /// to override them; when there is, it lands beside `max_iterations`
+    /// and these become what `default` resolves to.
+    compactor: Option<String>,
+    compact_at: Option<u64>,
     /// What `clank tools` allows, which is what `/tools on` turns on. A
     /// clanker starts with no tools, so the configured access is a policy
     /// for when they are switched on rather than a state it is created in.
@@ -452,55 +495,47 @@ impl Worker {
 
         while let Some(command) = commands.recv().await {
             match command {
-                Command::Send(text) => {
-                    // Reaching here means no turn is running, so the queue is
-                    // empty; anything sent mid-turn is queued inside
-                    // `run_turn` instead. The queue can still grow while we
-                    // work, which is why this drains rather than runs once.
-                    queue.push_back(text);
-                    while let Some(text) = queue.pop_front() {
-                        // Nothing to announce: `run_turn` emits UserMessage
-                        // for the message it is starting, which is how a
-                        // front end knows it stopped waiting.
-                        match self.run_turn(text, &mut commands, &mut queue).await {
-                            TurnOutcome::Completed => {}
-                            TurnOutcome::Cancelled => {
-                                queue.clear();
-                                let _ = self.events.send(Event::Cancelled);
-                                break;
-                            }
-                            // The turn finished after the front end had
-                            // gone. Anything still queued was never sent to
-                            // the model and has nowhere to go now.
-                            TurnOutcome::Disconnected => {
-                                queue.clear();
-                                break;
-                            }
-                        }
+                // Not run here: a command can leave work waiting — the
+                // message it was, or one typed while it ran — and the drain
+                // below is the single place that takes it.
+                Command::Send(text) => queue.push_back(text),
+                // Awaited rather than spawned, unlike `$` and `/models`: it
+                // rewrites the history the next turn will be built from, so
+                // letting a message overtake it would send the very request
+                // it exists to shrink.
+                Command::Compact => match self.compact(&mut commands, &mut queue, true).await {
+                    CompactOutcome::Done => {}
+                    CompactOutcome::Cancelled => {
+                        queue.clear();
+                        let _ = self.events.send(Event::Cancelled);
+                    }
+                    CompactOutcome::Disconnected => {
+                        queue.clear();
+                        break;
+                    }
+                },
+                other => self.apply(other),
+            }
+
+            // Anything now waiting, in the order it was typed. Nothing to
+            // announce: `run_turn` emits UserMessage for the message it is
+            // starting, which is how a front end knows it stopped waiting.
+            while let Some(text) = queue.pop_front() {
+                match self.run_turn(text, &mut commands, &mut queue).await {
+                    TurnOutcome::Completed => {}
+                    TurnOutcome::Cancelled => {
+                        queue.clear();
+                        let _ = self.events.send(Event::Cancelled);
+                        break;
+                    }
+                    // The turn finished after the front end had gone.
+                    // Anything still queued was never sent to the model and
+                    // has nowhere to go now.
+                    TurnOutcome::Disconnected => {
+                        queue.clear();
+                        break;
                     }
                 }
-                Command::Shell(command) => self.run_shell(command),
-                Command::ListModels => self.list_models(),
-                Command::Include(text) => self.include(text),
-                Command::SetModel(model) => self.set_model(model),
-                Command::SetEffort(effort_level) => self.set_effort(effort_level),
-                Command::ResetEffort => self.reset_effort(),
-                Command::SetVerbose(verbose) => self.set_verbose(verbose),
-                Command::SetHighlight(highlight) => self.set_highlight(highlight),
-                Command::SetStream(stream) => self.set_stream(stream),
-                Command::SetTitle(title) => self.rename(title),
-                Command::SetSandbox(sandbox) => self.set_sandbox(sandbox),
-                Command::SetMaxIterations(max_iterations) => {
-                    self.set_max_iterations(max_iterations)
-                }
-                Command::ResetMaxIterations => self.reset_max_iterations(),
-                Command::SetToolAccess { target, access } => self.set_tool_access(&target, access),
-                Command::ResetToolAccess => self.reset_tool_access(),
-                Command::SetTemperature(temperature) => self.set_temperature(temperature),
-                Command::ResetTemperature => self.reset_temperature(),
-                // Only meaningful while a turn is running, where they're
-                // handled inline by `run_turn`.
-                Command::Approve(_) | Command::Cancel => {}
             }
         }
 
@@ -512,12 +547,61 @@ impl Worker {
         let _ = self.session.discard_if_unused();
     }
 
+    /// Applies a command that changes settings or kicks off something
+    /// detached — everything that neither runs a turn nor needs to be
+    /// selected against while it works.
+    ///
+    /// Shared between the idle loop and [`Worker::compact`], so a `/model`
+    /// typed while a summary is being written means the same thing as one
+    /// typed a second earlier.
+    fn apply(&mut self, command: Command) {
+        match command {
+            Command::Shell(command) => self.run_shell(command),
+            Command::ListModels => self.list_models(),
+            Command::Include(text) => self.include(text),
+            Command::SetModel(model) => self.set_model(model),
+            Command::SetEffort(effort_level) => self.set_effort(effort_level),
+            Command::ResetEffort => self.reset_effort(),
+            Command::SetVerbose(verbose) => self.set_verbose(verbose),
+            Command::SetHighlight(highlight) => self.set_highlight(highlight),
+            Command::SetStream(stream) => self.set_stream(stream),
+            Command::SetTitle(title) => self.rename(title),
+            Command::SetSandbox(sandbox) => self.set_sandbox(sandbox),
+            Command::SetMaxIterations(max_iterations) => self.set_max_iterations(max_iterations),
+            Command::ResetMaxIterations => self.reset_max_iterations(),
+            Command::SetToolAccess { target, access } => self.set_tool_access(&target, access),
+            Command::ResetToolAccess => self.reset_tool_access(),
+            Command::SetTemperature(temperature) => self.set_temperature(temperature),
+            Command::ResetTemperature => self.reset_temperature(),
+            // Handled by whoever is running one, and meaningless when
+            // nobody is: an approval with no question, a cancellation with
+            // nothing to cancel.
+            Command::Approve(_) | Command::Cancel => {}
+            // Both go somewhere that isn't here — a message starts a turn
+            // and a compaction needs a select loop — so neither reaches
+            // this, and both callers match them out first.
+            Command::Send(_) | Command::Compact => {}
+        }
+    }
+
     async fn run_turn(
         &mut self,
         text: String,
         commands: &mut mpsc::UnboundedReceiver<Command>,
         queue: &mut VecDeque<String>,
     ) -> TurnOutcome {
+        // Before the message is recorded, not after: a compaction that gets
+        // cancelled then leaves nothing half-started behind, and the message
+        // about to be sent is not part of what gets summarized — it is the
+        // thing the summary exists to make room for.
+        if self.compaction_due() {
+            match self.compact(commands, queue, false).await {
+                CompactOutcome::Done => {}
+                CompactOutcome::Cancelled => return TurnOutcome::Cancelled,
+                CompactOutcome::Disconnected => return TurnOutcome::Disconnected,
+            }
+        }
+
         self.session.push_user(text.clone());
         let _ = self.events.send(Event::UserMessage(text));
         let _ = self.events.send(Event::Busy(true));
@@ -533,7 +617,15 @@ impl Worker {
         };
 
         let client = Arc::clone(&self.client);
-        let mut messages = self.session.messages().to_vec();
+        // What the provider sees, which is not the whole history once this
+        // clanker has been compacted — see `ChatSession::request_messages`.
+        let mut messages = self.session.request_messages();
+        // How much of that array was already accounted for, so `absorb` can
+        // tell what the turn added. Taken from what is being sent rather
+        // than from the session's own length: those are the same number
+        // until a compaction makes them differ, and then only this one is
+        // right.
+        let sent = messages.len();
         let model = self.session.model().to_string();
         let effort_level = self.session.effort_level().map(|s| s.to_string());
         let max_iterations = self.session.max_iterations();
@@ -608,7 +700,7 @@ impl Worker {
                     match finished {
                         Ok((result, messages)) => {
                             failed = result.is_err();
-                            self.absorb(result, messages);
+                            self.absorb(result, messages, sent);
                             break TurnOutcome::Completed;
                         }
                         Err(e) if e.is_cancelled() => break TurnOutcome::Cancelled,
@@ -734,6 +826,17 @@ impl Worker {
                             self.set_temperature(temperature)
                         }
                         Some(Command::ResetTemperature) => self.reset_temperature(),
+                        // Refused rather than deferred. Compaction rewrites
+                        // the history this turn is running against, and a
+                        // turn that finishes into a different conversation
+                        // than it started in is worse than a command that
+                        // says "not now" and can be retyped.
+                        Some(Command::Compact) => {
+                            let _ = self.events.send(Event::CompactionSkipped {
+                                reason: "A turn is running — compact once it has finished"
+                                    .to_string(),
+                            });
+                        }
                     }
                 }
             }
@@ -758,6 +861,14 @@ impl Worker {
                 message: format!("Failed to save token usage: {e}"),
             }));
         }
+        // How big the last request was, which is what decides whether the
+        // next turn compacts first. Recorded on the same terms as the total:
+        // a turn that failed part-way still measured the requests it made.
+        if let Err(e) = self.session.set_prompt_tokens(usage.last_prompt()) {
+            let _ = self.events.send(Event::Agent(AgentEvent::Error {
+                message: format!("Failed to save the prompt size: {e}"),
+            }));
+        }
 
         self.persist();
         // Cleared on success: the stored messages already say what happened,
@@ -777,13 +888,20 @@ impl Worker {
     /// Folds a finished turn's messages back into the session and persists
     /// them. The agent loop works on a copy (it runs on another task), so the
     /// session only learns about assistant/tool turns here.
+    /// Takes the messages a turn produced back into the session.
+    ///
+    /// `sent` is how long the array was when it was handed to the turn;
+    /// everything past that is what the turn appended. The session's own
+    /// length would be the same number for an uncompacted clanker and wrong
+    /// for a compacted one, where the turn was given a summary and a tail
+    /// rather than the whole history.
     fn absorb(
         &mut self,
         result: Result<Option<String>>,
         messages: Vec<crate::client::ChatMessage>,
+        sent: usize,
     ) {
-        let already = self.session.messages().len();
-        for message in messages.into_iter().skip(already) {
+        for message in messages.into_iter().skip(sent) {
             self.session.push(message);
         }
 
@@ -792,6 +910,161 @@ impl Worker {
                 message: e.to_string(),
             }));
         }
+    }
+
+    /// Whether the last request grew past the configured threshold, so the
+    /// next turn should compact before running.
+    ///
+    /// `prompt_tokens` of `0` never qualifies: it means nothing has measured
+    /// the history yet — a clanker that has sent nothing, or a provider that
+    /// reports no breakdown — and compacting on the strength of a number
+    /// that was never taken would fold away a conversation two messages long.
+    fn compaction_due(&self) -> bool {
+        match self.compact_at {
+            Some(threshold) => self.session.prompt_tokens() >= threshold,
+            None => false,
+        }
+    }
+
+    /// Folds everything older than the last couple of turns into a summary,
+    /// and records where that summary now picks up from.
+    ///
+    /// `forced` is `/compact` rather than the threshold firing. It changes
+    /// one thing: a forced compaction says so when there is nothing to fold,
+    /// because it was asked for and silence would read as a broken command.
+    /// The automatic path stays quiet — a history that is one enormous
+    /// message meets the threshold on every turn and can't be compacted on
+    /// any of them, and saying so each time would be noise the user can do
+    /// nothing about.
+    ///
+    /// Run on its own task and selected against, like a turn: it is a round
+    /// trip to a provider that can be slow or hung, and the one thing a user
+    /// must always be able to do is get out of it.
+    async fn compact(
+        &mut self,
+        commands: &mut mpsc::UnboundedReceiver<Command>,
+        queue: &mut VecDeque<String>,
+        forced: bool,
+    ) -> CompactOutcome {
+        let from = self.session.compacted_seq();
+        let Some(cut) = crate::compact::seam(self.session.messages(), from) else {
+            if forced {
+                let _ = self.events.send(Event::CompactionSkipped {
+                    reason: "There isn't enough history past the last compaction to fold away yet"
+                        .to_string(),
+                });
+            }
+            return CompactOutcome::Done;
+        };
+
+        // `None` falls back the same way an unset default model does — see
+        // `Config::compactor`.
+        let model = self
+            .compactor
+            .clone()
+            .unwrap_or_else(|| crate::config::DEFAULT_MODEL.to_string());
+
+        let _ = self.events.send(Event::Compacting {
+            model: model.clone(),
+        });
+        self.session
+            .set_activity(Some(Activity::Working), Some("compacting"));
+
+        let client = Arc::clone(&self.client);
+        let span = self.session.messages()[from..cut].to_vec();
+        let previous = self.session.compaction_summary().map(str::to_string);
+        let mut task = tokio::spawn(async move {
+            crate::compact::compact(&client, &model, previous.as_deref(), &span).await
+        });
+
+        let outcome = loop {
+            tokio::select! {
+                biased;
+
+                finished = &mut task => {
+                    match finished {
+                        Ok(Ok(compacted)) => {
+                            // Spent on this clanker's behalf, so it counts
+                            // against this clanker — a compaction that is
+                            // not paid for looks free, and it isn't.
+                            if let Err(e) = self.session.add_tokens(compacted.tokens as i64) {
+                                let _ = self.events.send(Event::Agent(AgentEvent::Error {
+                                    message: format!("Failed to save token usage: {e}"),
+                                }));
+                            }
+                            match self.session.set_compaction(cut, compacted.summary) {
+                                Ok(()) => {
+                                    let _ = self.events.send(Event::Compacted { folded: cut });
+                                }
+                                // The summary exists but couldn't be saved.
+                                // Left unapplied rather than held in memory
+                                // only: a seam this process believes in and
+                                // the database doesn't is how a resumed
+                                // clanker loses the messages it stands for.
+                                Err(e) => {
+                                    let _ = self.events.send(Event::Agent(AgentEvent::Error {
+                                        message: format!(
+                                            "Compacted, but the summary could not be saved,                                              so nothing was folded away: {e}"
+                                        ),
+                                    }));
+                                }
+                            }
+                            let _ = self.events.send(Event::TokensUsed {
+                                total_tokens: self.session.total_tokens(),
+                            });
+                        }
+                        Ok(Err(e)) => {
+                            // Reported, not fatal. The turn behind this one
+                            // still runs: an oversized history is a worse
+                            // request, not an impossible one.
+                            let _ = self.events.send(Event::Agent(AgentEvent::Error {
+                                message: format!("Compaction failed: {e}"),
+                            }));
+                        }
+                        Err(e) if e.is_cancelled() => break CompactOutcome::Cancelled,
+                        Err(e) => {
+                            let _ = self.events.send(Event::Agent(AgentEvent::Error {
+                                message: format!("Compaction failed: {e}"),
+                            }));
+                        }
+                    }
+                    break CompactOutcome::Done;
+                }
+
+                command = commands.recv() => {
+                    match command {
+                        Some(Command::Cancel) => {
+                            task.abort();
+                            let _ = (&mut task).await;
+                            break CompactOutcome::Cancelled;
+                        }
+                        // A message typed while this runs waits for it.
+                        // There is no turn to steer into yet, and the whole
+                        // point of compacting first is that the next request
+                        // is built after the summary exists, not before.
+                        Some(Command::Send(text)) => {
+                            let _ = self.events.send(Event::Queued { text: text.clone() });
+                            queue.push_back(text);
+                        }
+                        // Already compacting. A second pass would fold the
+                        // same span the first one is halfway through.
+                        Some(Command::Compact) => {
+                            let _ = self.events.send(Event::CompactionSkipped {
+                                reason: "Already compacting".to_string(),
+                            });
+                        }
+                        Some(other) => self.apply(other),
+                        None => {
+                            task.abort();
+                            break CompactOutcome::Disconnected;
+                        }
+                    }
+                }
+            }
+        };
+
+        self.session.set_activity(None, None);
+        outcome
     }
 
     /// Runs a `$` command in the session's directory and reports the result.
@@ -1042,6 +1315,15 @@ impl Worker {
             total_tokens: self.session.total_tokens(),
         });
     }
+}
+
+/// How a compaction ended, in the same terms a turn ends in — the caller
+/// has the same three things to do about it.
+enum CompactOutcome {
+    Done,
+    Cancelled,
+    /// The command channel closed — the front end is gone.
+    Disconnected,
 }
 
 enum TurnOutcome {

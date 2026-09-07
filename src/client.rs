@@ -177,12 +177,21 @@ pub struct ReasoningEffort {
 /// that doesn't report usage, which is why every caller treats it as
 /// optional rather than assuming a count is always available.
 ///
-/// Only the total is kept: nothing here breaks it down into prompt versus
-/// completion tokens, so there's nothing else worth parsing out of it yet.
+/// Two of the three numbers a provider sends. `total_tokens` is what a
+/// clanker's running total is built from; `prompt_tokens` is what the
+/// compactor watches, because it alone says how big the history has grown —
+/// the total mixes in completion tokens, which say nothing about the size of
+/// the next request. Completion tokens are still not parsed: nothing needs
+/// them on their own.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Deserialize)]
 pub struct Usage {
     #[serde(default)]
     pub total_tokens: u64,
+    /// The size of the request that produced this reply. `0` from a provider
+    /// that reports a total but breaks nothing out of it — read as "unknown",
+    /// which is why nothing treats a zero as a measurement.
+    #[serde(default)]
+    pub prompt_tokens: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1523,8 +1532,10 @@ mod deser_tests {
         acc.push_payload(&content_chunk("hi")).unwrap();
         assert_eq!(acc.usage(), None, "no usage chunk has arrived yet");
 
-        acc.push_payload(r#"{"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}"#)
-            .unwrap();
+        acc.push_payload(
+            r#"{"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}"#,
+        )
+        .unwrap();
         let usage = acc.usage().expect("usage chunk was sent");
         assert_eq!(usage.total_tokens, 12);
     }
@@ -1535,7 +1546,8 @@ mod deser_tests {
         // per-chunk delta.
         let mut acc = StreamAccumulator::default();
         acc.push_payload(r#"{"usage":{"total_tokens":5}}"#).unwrap();
-        acc.push_payload(r#"{"usage":{"total_tokens":12}}"#).unwrap();
+        acc.push_payload(r#"{"usage":{"total_tokens":12}}"#)
+            .unwrap();
         assert_eq!(acc.usage().unwrap().total_tokens, 12);
     }
 

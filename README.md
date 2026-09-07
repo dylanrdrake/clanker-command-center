@@ -15,6 +15,7 @@ CCC is most stable on Linux at the moment!
 - **Agentic loops** — Multi-turn execution with tool calling
 - **Persistent clankers** — `clanker`/`tui` conversations are saved to SQLite and resumable across restarts
 - **Token counting** — every clanker keeps a running 🪙 total of what it has spent, in its title row, on the launch screen, and in `/status`
+- **Compaction** — a long clanker folds its older turns into a summary written by a model you pick, so a conversation stops resending everything it has ever said
 - **Secure credential storage** — API keys live in your OS keychain, not a plaintext file
 
 ## Manual Installation
@@ -101,6 +102,58 @@ than reverting. Each stored reply still records the model that produced it,
 even though the transcript itself — in `clanker`, `tui`, and `clankers show`
 alike — no longer prints a model label on every line; `/model` shows what the
 clanker is using *now*.
+
+#### `compactor [name]`
+View or set the model that summarizes a clanker's older turns. See [Compaction](#compaction).
+
+```bash
+# Show the current compactor
+clank compactor
+
+# Set it — a small, cheap model is the point
+clank compactor anthropic/claude-haiku-4.5
+
+# Clear it (falls back to openrouter/auto, like the default model)
+clank compactor --clear
+```
+
+Its own setting rather than the clanker's own model on purpose: the job is
+summarizing a transcript, which a small model does well, and paying
+reasoning-model rates to save tokens would defeat the exercise. Clearing it
+does *not* turn compaction off — that's `compact-at --clear`.
+
+Global only for now. A per-clanker override belongs beside `/model` and
+`/temperature` eventually, but it isn't built yet: every clanker compacts
+with whatever this says at the moment it was opened.
+
+#### `compact-at [value]`
+View or set how large a request's prompt has to get, in tokens, before the next turn compacts first.
+
+```bash
+# Show the current threshold
+clank compact-at
+
+# Compact once a request's prompt reaches 30k tokens
+clank compact-at 30000
+
+# Turn automatic compaction off — /compact then becomes the only way in
+clank compact-at --clear
+```
+
+Defaults to 60,000. Deliberately generous: most conversations never reach it,
+and the ones that do are the long tool-calling runs where a single file read
+sits in every request from then on. Lower it to save more and lose more
+fidelity; raise it if your models have room and you'd rather keep the whole
+history verbatim.
+
+The number is compared against what the provider reported for the *last*
+request, not an estimate — so a provider that reports no prompt size never
+triggers it, and `/compact` is the only way to compact there.
+
+Compacting resets that measurement, since it described a history that no
+longer exists. The turn after a compaction therefore never compacts again on
+the strength of the size that triggered the first one — it measures the new,
+smaller history and starts from there.
 
 #### `max-iterations [value]`
 View or set the persistent default for how many tool-calling iterations `agent` may run before giving up.
@@ -434,7 +487,8 @@ exactly:
 | `/tools` | List every tool and what it may do |
 | `/sandbox <on\|off>` | Confine the agent's file writes to the working directory, or allow them anywhere. Takes effect immediately, including partway through a running turn |
 | `/sandbox` | Show whether writes are currently confined |
-| `/status` | Show every setting this clanker is running with — model, effort, temperature, iteration cap, sandbox, verbose, highlighting, streaming, what each tool may do, the tokens it has spent, and the directory it runs in. The clanker-scoped counterpart to `clank status` |
+| `/compact` | Fold everything older than the last couple of turns into a summary now, instead of waiting for the conversation to grow past `clank compact-at`. Nothing is deleted — the transcript still scrolls back to the first word; what changes is what gets sent |
+| `/status` | Show every setting this clanker is running with — model, effort, temperature, iteration cap, sandbox, verbose, highlighting, streaming, what each tool may do, the tokens it has spent, its compactor, and the directory it runs in. The clanker-scoped counterpart to `clank status` |
 | `/highlight <on\|off>` | Band your own messages in the transcript, or don't. Bare `/highlight` shows the current setting |
 | `/clanker title <new title>` | Rename this clanker. Bare `/clanker` (or `/clanker title`) shows its current name |
 | `/send`, `/discard` | Answer the `$` command box — the same as `Ctrl-S` and `Ctrl-D`. Typed forms exist because terminals claim chords: Zed's takes `Ctrl-S` |
@@ -959,6 +1013,7 @@ order the model saw it. Past five waiting, the rest are summarised as
 | Scope | Changed by | Read |
 |---|---|---|
 | Global default | `clank <setting> <value>` | when a clanker is created |
+| Global only | `clank compactor`, `clank compact-at` | when a clanker is opened |
 | Clanker | `/model`, `/temperature`, … | stored on the clanker row |
 | Per-turn snapshot | — | once, when a turn starts |
 | Live gates | `/tools`, `/sandbox` | before every tool call |
@@ -1002,6 +1057,47 @@ recover what was spent before it was being counted.
 The count is per clanker and lives on its row in the database, so it
 survives exit, follows a resume, and is what the launch screen reads for
 clankers nobody is running.
+
+### Compaction
+
+Every request carries the whole conversation, so what a turn costs grows with
+the clanker rather than with the question you asked. A file read on turn three
+is paid for again on turns four through forty. Compaction folds that older
+stretch into a summary and sends the summary instead.
+
+**Nothing is deleted.** The messages stay in the database and in the
+transcript — a compacted clanker still scrolls back to its first word, and
+`clank clankers show` still prints every turn. What changes is only what goes
+to the provider: a summary of everything up to the seam, then every message
+after it, verbatim.
+
+Three things decide when it happens:
+
+- **`clank compactor <model>`** — who writes the summary. A separate model
+  from the clanker's own, because summarizing a transcript is cheap work.
+- **`clank compact-at <n>`** — how big a request's prompt has to get before
+  the next turn compacts first. Cleared, nothing compacts on its own.
+- **`/compact`** — do it now, whatever the threshold says.
+
+The seam always lands on one of your own messages, and never inside a
+tool-calling exchange: a tool result whose call was folded away would
+reference something the provider can no longer see, and the request would be
+rejected outright. The last couple of your turns are never folded — a summary
+is a poor substitute for what the model is in the middle of doing, and a fine
+one for what it finished an hour ago.
+
+Compaction runs *between* turns, never during one. Automatic compaction
+happens after you press Enter and before the request goes out, which is why a
+long clanker sometimes pauses to say what it is doing; `Ctrl-C` cancels it
+like anything else, and the message you typed stays where it is. A `/compact`
+typed while a turn is running is refused rather than queued — a turn that
+finished into a different conversation than it started in would be worse than
+a command you have to retype.
+
+The summary costs tokens too, and they are counted against the clanker like
+any other request. That is deliberate: the feature's claim is that it's
+cheaper *overall*, and a compaction that didn't show up in the total would
+make that claim unfalsifiable.
 
 ## Agentic Tools
 
@@ -1070,6 +1166,8 @@ is `never`, not that nothing was said about it:
   "temperature": 0.7,
   "effort_level": "high",
   "effort_style": "nested",
+  "compactor": "anthropic/claude-haiku-4.5",
+  "compact_at": 60000,
   "extra_headers": {},
   "sandbox": true,
   "verbose": false,
@@ -1092,6 +1190,8 @@ is `never`, not that nothing was said about it:
 - `selection` is managed via `clank selection` and controls the band on the launch screen's selected row. Global only — that screen belongs to no clanker, so there is no per-clanker counterpart and no slash command.
 - `effort_level` is managed via `clank effort-level` and is sent for `ask`, `clanker`, and `agent` when set, shaped according to `effort_style`.
 - `effort_style` is managed via `clank effort-style` and controls whether the effort level is sent flat, nested, or omitted (see [`effort-style`](#effort-style-value)).
+- `compactor` is managed via `clank compactor` and is the model that summarizes a clanker's older turns. `null` (after `clank compactor --clear`) falls back to `openrouter/auto`, the same way `default_model` does — it does not turn compaction off.
+- `compact_at` is managed via `clank compact-at` and is the prompt size, in tokens, that sets compaction going. `null` (after `clank compact-at --clear`) means nothing compacts on its own and `/compact` is the only way to compact at all. Both are global only: a clanker reads them when it is opened and has no override of its own yet.
 - `extra_headers` is managed via `clank headers` and is merged into every API request.
 
 ### Using other providers

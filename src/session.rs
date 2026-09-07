@@ -176,6 +176,21 @@ pub struct ChatSession {
     /// new session and for one written before this was tracked — see
     /// [`crate::store::SessionSummary::total_tokens`].
     total_tokens: i64,
+    /// How many of `messages` the compactor has folded into
+    /// `compaction_summary`. `0` until something is compacted, and only ever
+    /// grows — see [`ChatSession::request_messages`], which is the only
+    /// place either of these is read.
+    compacted_seq: usize,
+    /// The summary standing in for those messages in requests. `None`
+    /// alongside a `compacted_seq` of `0`, and `Some` otherwise; the two are
+    /// written together by [`ChatSession::set_compaction`].
+    compaction_summary: Option<String>,
+    /// The prompt size the provider reported for this session's last
+    /// request. `0` means unmeasured — nothing has been sent yet, the
+    /// provider breaks no numbers out of its total, or a compaction has just
+    /// invalidated the last measurement — and a caller comparing it against
+    /// a threshold gets "not yet" rather than a wrong answer.
+    prompt_tokens: u64,
     /// What each tool may do in this session, always concrete (unlike
     /// `effort_level`/`max_iterations`/`temperature` there's no "unset,
     /// defer to config" state once a turn actually needs to check them).
@@ -293,6 +308,9 @@ impl ChatSession {
             stream,
             working_dir,
             total_tokens: 0,
+            compacted_seq: 0,
+            compaction_summary: None,
+            prompt_tokens: 0,
             messages: Vec::new(),
             title_set: false,
             saved_len: 0,
@@ -350,6 +368,12 @@ impl ChatSession {
                 temperature: summary.temperature.map(|n| n as f32),
                 tool_access: summary.tool_access.clone(),
                 total_tokens: summary.total_tokens,
+                // A seam survives a reopen: a compacted session that came
+                // back uncompacted would resend everything it just paid to
+                // summarize.
+                compacted_seq: summary.compacted_seq.max(0) as usize,
+                compaction_summary: summary.compaction_summary.clone(),
+                prompt_tokens: summary.prompt_tokens.max(0) as u64,
                 messages,
                 title_set,
                 saved_len,
@@ -502,6 +526,117 @@ impl ChatSession {
         store::add_session_tokens(&self.conn, &self.id, tokens)?;
         self.total_tokens += tokens;
         Ok(())
+    }
+
+    /// The prompt size the provider reported for the last request this
+    /// session made. `0` when nothing has measured it yet.
+    pub fn prompt_tokens(&self) -> u64 {
+        self.prompt_tokens
+    }
+
+    /// Records the prompt size of the request just made, so the next turn
+    /// can decide whether to compact before running. Recorded immediately,
+    /// like `add_tokens`: a measurement of what already happened, not a
+    /// setting a turn starts with.
+    ///
+    /// A `0` is not recorded. Providers that report no breakdown send one
+    /// every time, and writing it would erase a real measurement from a
+    /// provider that does — leaving a long conversation looking empty and
+    /// never compacting.
+    pub fn set_prompt_tokens(&mut self, prompt_tokens: u64) -> Result<()> {
+        if prompt_tokens == 0 || prompt_tokens == self.prompt_tokens {
+            return Ok(());
+        }
+        store::set_session_prompt_tokens(&self.conn, &self.id, prompt_tokens as i64)?;
+        self.prompt_tokens = prompt_tokens;
+        Ok(())
+    }
+
+    /// How many leading messages the summary stands in for.
+    pub fn compacted_seq(&self) -> usize {
+        self.compacted_seq
+    }
+
+    /// The summary standing in for them, if this session has been compacted.
+    pub fn compaction_summary(&self) -> Option<&str> {
+        self.compaction_summary.as_deref()
+    }
+
+    /// Records a compaction: `compacted_seq` messages are now represented by
+    /// `summary` in every request from here on.
+    ///
+    /// Nothing is deleted. The messages stay in the database and in
+    /// `messages`, so the transcript still shows the whole conversation and
+    /// a later reader loses nothing — what changes is only what
+    /// [`ChatSession::request_messages`] hands a provider.
+    ///
+    /// The recorded prompt size goes back to unmeasured as part of the same
+    /// write, because it measured a history this replaces. `/compact` makes
+    /// no request of its own, so without this a hand-compacted clanker keeps
+    /// the number from before it — above the threshold, by definition, since
+    /// that is usually why it was compacted — and the next turn dutifully
+    /// compacts again, spending a compactor call to fold the handful of
+    /// messages in the tail. The turn after this one measures the real size
+    /// and the threshold starts meaning something again.
+    pub fn set_compaction(&mut self, compacted_seq: usize, summary: String) -> Result<()> {
+        store::set_session_compaction(&self.conn, &self.id, compacted_seq as i64, &summary)?;
+        self.compacted_seq = compacted_seq;
+        self.compaction_summary = Some(summary);
+        self.prompt_tokens = 0;
+        Ok(())
+    }
+
+    /// The history as a provider should see it: everything since the seam,
+    /// with the summary of what came before it carried in front.
+    ///
+    /// The same thing as [`ChatSession::messages`] for a session that has
+    /// never been compacted, which is what makes this safe to call
+    /// unconditionally.
+    ///
+    /// The summary is prefixed onto the first kept message rather than sent
+    /// as one of its own, and both halves of that matter. It can't be a
+    /// `system` message: a turn with tools already has the agent prompt
+    /// inserted at position 0 by `normalize_system_prompt`, and providers
+    /// that accept `system` only at the very start reject the second one
+    /// behind it. But it can't be an extra `user` message either — the seam
+    /// always lands on a user message, so that would put two in a row, which
+    /// providers requiring strict user/assistant alternation reject just as
+    /// firmly. Prefixing sidesteps both: no message is added at all, and the
+    /// summary reads as the preamble to the message it sits on.
+    ///
+    /// Only the copy is changed. What is stored still says exactly what was
+    /// typed, which is what lets a later compaction fold that same message
+    /// without a summary of the previous one baked into it.
+    pub fn request_messages(&self) -> Vec<ChatMessage> {
+        let Some(summary) = &self.compaction_summary else {
+            return self.messages.clone();
+        };
+
+        let mut messages: Vec<ChatMessage> = self
+            .messages
+            .iter()
+            .skip(self.compacted_seq)
+            .cloned()
+            .collect();
+
+        let preamble = crate::compact::summary_message(summary);
+        match messages.first_mut() {
+            Some(first) => {
+                let said = first.content.take().unwrap_or_default();
+                first.content = Some(format!("{preamble}\n\n{said}"));
+            }
+            // Nothing left past the seam. `compact::seam` never produces
+            // that — it keeps the last couple of turns — but a summary with
+            // nowhere to sit would otherwise be dropped silently, and a
+            // request with no history at all is worse than one carrying only
+            // what it remembers.
+            None => messages.push(ChatMessage {
+                role: "user".to_string(),
+                content: Some(preamble),
+                ..Default::default()
+            }),
+        }
+        messages
     }
 
     /// Binds this session's writes to a claim, so they stop if it is lost.
@@ -798,6 +933,9 @@ mod tests {
                 heartbeat          INTEGER,
                 claim_owner        TEXT,
                 total_tokens       INTEGER NOT NULL DEFAULT 0,
+                compacted_seq      INTEGER NOT NULL DEFAULT 0,
+                compaction_summary TEXT,
+                prompt_tokens      INTEGER NOT NULL DEFAULT 0,
                 created_at      INTEGER NOT NULL,
                 updated_at      INTEGER NOT NULL
             );
@@ -1053,6 +1191,109 @@ mod tests {
         let (resumed, _) =
             ChatSession::resume(session.conn, &summary, summary.model.clone()).unwrap();
         assert_eq!(resumed.total_tokens(), 150);
+    }
+
+    #[test]
+    fn an_uncompacted_session_sends_its_whole_history() {
+        let mut session = memory_session();
+        session.push_user("first".to_string());
+        session.push_assistant("reply".to_string());
+
+        let sent = session.request_messages();
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[0].content.as_deref(), Some("first"));
+    }
+
+    #[test]
+    fn a_compacted_session_sends_the_summary_and_what_follows_it() {
+        let mut session = memory_session();
+        session.push_user("one".to_string());
+        session.push_assistant("reply".to_string());
+        session.push_user("two".to_string());
+        session
+            .set_compaction(2, "they discussed one".to_string())
+            .unwrap();
+
+        let sent = session.request_messages();
+        assert_eq!(sent.len(), 1, "everything past the seam, and nothing added");
+        assert_eq!(sent[0].role, "user");
+        let carried = sent[0].content.as_deref().unwrap();
+        assert!(carried.contains("they discussed one"), "{carried}");
+        // Prefixed onto the message at the seam rather than sent as a second
+        // user message in front of it — two in a row is what providers
+        // requiring strict alternation reject.
+        assert!(carried.ends_with("two"), "{carried}");
+
+        // The transcript is untouched: compaction changes what is sent, not
+        // what was said.
+        assert_eq!(session.messages().len(), 3);
+    }
+
+    #[test]
+    fn compacting_puts_the_prompt_size_back_to_unmeasured() {
+        // The regression this exists for: `/compact` makes no request of its
+        // own, so the number from before it survived — above the threshold,
+        // which is usually why it was compacted — and the next turn compacted
+        // again to fold the few messages in the tail.
+        let mut session = memory_session();
+        session.push_user("one".to_string());
+        session.push_user("two".to_string());
+        session.set_prompt_tokens(76_641).unwrap();
+
+        session
+            .set_compaction(1, "the first message".to_string())
+            .unwrap();
+
+        assert_eq!(session.prompt_tokens(), 0, "it measured a history now gone");
+        let summary = store::find_session(&session.conn, session.id())
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.prompt_tokens, 0, "and the reset is what persists");
+        // The seam itself still landed.
+        assert_eq!(summary.compacted_seq, 1);
+    }
+
+    #[test]
+    fn a_seam_survives_a_resume() {
+        let mut session = memory_session();
+        session.push_user("one".to_string());
+        session.push_user("two".to_string());
+        session.persist_pending().unwrap();
+        session
+            .set_compaction(1, "the first message".to_string())
+            .unwrap();
+
+        let summary = store::find_session(&session.conn, session.id())
+            .unwrap()
+            .unwrap();
+        let (resumed, _) =
+            ChatSession::resume(session.conn, &summary, summary.model.clone()).unwrap();
+
+        assert_eq!(resumed.compacted_seq(), 1);
+        assert_eq!(resumed.compaction_summary(), Some("the first message"));
+        // Otherwise the first turn after a reopen resends everything the
+        // compaction just paid to summarize.
+        assert_eq!(resumed.request_messages().len(), 1);
+    }
+
+    #[test]
+    fn a_reported_prompt_size_persists_and_a_missing_one_leaves_it_alone() {
+        let mut session = memory_session();
+        assert_eq!(session.prompt_tokens(), 0);
+
+        session.set_prompt_tokens(4_000).unwrap();
+        assert_eq!(session.prompt_tokens(), 4_000);
+
+        // A provider that breaks nothing out of its total reports zero every
+        // time; taking it would erase the measurement above and stop this
+        // session ever reaching the compaction threshold.
+        session.set_prompt_tokens(0).unwrap();
+        assert_eq!(session.prompt_tokens(), 4_000);
+
+        let summary = store::find_session(&session.conn, session.id())
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.prompt_tokens, 4_000);
     }
 
     fn session_in(dir: Option<&str>) -> ChatSession {

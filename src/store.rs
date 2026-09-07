@@ -72,6 +72,21 @@ pub struct SessionSummary {
     /// made a request — there's no way to tell the two apart after the fact,
     /// and reading it as "none spent" is the safe default either way.
     pub total_tokens: i64,
+    /// How many of this session's leading messages `compaction_summary`
+    /// stands in for — see `ChatSession::request_messages`. `0` for a
+    /// session that has never been compacted, which is every session written
+    /// before this existed.
+    pub compacted_seq: i64,
+    /// The summary those folded messages were replaced by in requests, or
+    /// `None` when nothing has been compacted. Never `Some` alongside a
+    /// `compacted_seq` of `0`: the two are written together.
+    pub compaction_summary: Option<String>,
+    /// The prompt size the provider reported for this session's most recent
+    /// request, which is what the compactor's threshold is compared against.
+    /// `0` means unmeasured — a session that has made no request yet, one
+    /// written before this was tracked, or a provider that reports no
+    /// breakdown — and never triggers compaction on its own.
+    pub prompt_tokens: i64,
     /// What each tool may do in this session — a snapshot of the configured
     /// default taken when it was created, mutable from inside it with
     /// `/tools`.
@@ -197,6 +212,29 @@ pub fn open_db() -> Result<Connection> {
         &conn,
         "sessions",
         "total_tokens",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    // Where the compactor's summary picks up from: how many of the session's
+    // leading messages it stands in for, and the summary itself. Written
+    // together, absent on every row from before compaction existed, and read
+    // back as `0`/NULL there — a session that has never been compacted,
+    // which is exactly what it is.
+    ensure_column(
+        &conn,
+        "sessions",
+        "compacted_seq",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(&conn, "sessions", "compaction_summary", "TEXT")?;
+    // The prompt size the provider reported for the session's last request,
+    // which is what the compaction threshold is compared against. `0` on a
+    // row written before this existed, read as unmeasured rather than as a
+    // tiny prompt, so an old session compacts after its next turn rather
+    // than never or immediately.
+    ensure_column(
+        &conn,
+        "sessions",
+        "prompt_tokens",
         "INTEGER NOT NULL DEFAULT 0",
     )?;
     // Who holds the session, so a claim can only be renewed or released by
@@ -478,6 +516,47 @@ pub fn add_session_tokens(conn: &Connection, session_id: &str, tokens: i64) -> R
     conn.execute(
         "UPDATE sessions SET total_tokens = total_tokens + ?1 WHERE id = ?2",
         params![tokens, session_id],
+    )?;
+    Ok(())
+}
+
+/// Records how much of a session's history the compactor has folded away,
+/// and the summary that stands in for it. Written as a pair: a summary with
+/// no seq says nothing about which messages it covers, and a seq with no
+/// summary would drop those messages from every later request with nothing
+/// to replace them.
+pub fn set_session_compaction(
+    conn: &Connection,
+    session_id: &str,
+    compacted_seq: i64,
+    summary: &str,
+) -> Result<()> {
+    // Conversation content, encrypted at rest like the messages it was
+    // derived from — a summary of a private transcript is no less private
+    // than the transcript.
+    let summary = crypto::encrypt(summary)?;
+    // `prompt_tokens` goes with them, back to unmeasured. It described a
+    // history this write has just replaced, and leaving it would have the
+    // next turn test a threshold against the size of a conversation that no
+    // longer exists — see `ChatSession::set_prompt_tokens`.
+    conn.execute(
+        "UPDATE sessions SET compacted_seq = ?1, compaction_summary = ?2, prompt_tokens = 0 \
+         WHERE id = ?3",
+        params![compacted_seq, summary, session_id],
+    )?;
+    Ok(())
+}
+
+/// Records the prompt size of a session's most recent request, for the
+/// threshold the next turn checks.
+pub fn set_session_prompt_tokens(
+    conn: &Connection,
+    session_id: &str,
+    prompt_tokens: i64,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE sessions SET prompt_tokens = ?1 WHERE id = ?2",
+        params![prompt_tokens, session_id],
     )?;
     Ok(())
 }
@@ -878,7 +957,7 @@ fn message_preview(content: Option<&str>, tool_calls: Option<&str>) -> String {
 pub fn list_sessions(conn: &Connection) -> Result<Vec<SessionSummary>> {
     let mut stmt = conn.prepare(
         "SELECT id, title, model, kind, effort_level, verbose, max_iterations, temperature, \
-         approval_read, approval_write, approval_terminal, sandbox, stream, working_dir, activity, activity_detail, created_at, updated_at, highlight, heartbeat, tool_access, total_tokens \
+         approval_read, approval_write, approval_terminal, sandbox, stream, working_dir, activity, activity_detail, created_at, updated_at, highlight, heartbeat, tool_access, total_tokens, compacted_seq, compaction_summary, prompt_tokens \
          FROM sessions ORDER BY updated_at DESC",
     )?;
 
@@ -910,6 +989,9 @@ pub fn list_sessions(conn: &Connection) -> Result<Vec<SessionSummary>> {
             updated_at: row.get(17)?,
             highlight: row.get(18)?,
             total_tokens: row.get(21)?,
+            compacted_seq: row.get(22)?,
+            compaction_summary: row.get(23)?,
+            prompt_tokens: row.get(24)?,
         })
     })?;
 
@@ -918,6 +1000,10 @@ pub fn list_sessions(conn: &Connection) -> Result<Vec<SessionSummary>> {
         let mut session = row?;
         session.title = crypto::decrypt(&session.title)?;
         session.activity_detail = crypto::decrypt_opt(session.activity_detail.take())?;
+        // Nothing on the launch screen reads the summary, but a field that
+        // arrives decrypted from `load_summary` and encrypted from here is
+        // a trap for whatever reads it next.
+        session.compaction_summary = crypto::decrypt_opt(session.compaction_summary.take())?;
         sessions.push(session);
     }
     Ok(sessions)
@@ -973,7 +1059,7 @@ pub fn find_session(conn: &Connection, id_or_prefix: &str) -> Result<Option<Sess
 fn load_summary(conn: &Connection, id: &str) -> Result<Option<SessionSummary>> {
     let mut stmt = conn.prepare(
         "SELECT id, title, model, kind, effort_level, verbose, max_iterations, temperature, \
-         approval_read, approval_write, approval_terminal, sandbox, stream, working_dir, activity, activity_detail, created_at, updated_at, highlight, heartbeat, tool_access, total_tokens \
+         approval_read, approval_write, approval_terminal, sandbox, stream, working_dir, activity, activity_detail, created_at, updated_at, highlight, heartbeat, tool_access, total_tokens, compacted_seq, compaction_summary, prompt_tokens \
          FROM sessions WHERE id = ?1",
     )?;
 
@@ -1008,6 +1094,9 @@ fn load_summary(conn: &Connection, id: &str) -> Result<Option<SessionSummary>> {
             updated_at: row.get(17)?,
             highlight: row.get(18)?,
             total_tokens: row.get(21)?,
+            compacted_seq: row.get(22)?,
+            compaction_summary: crypto::decrypt_opt(row.get(23)?)?,
+            prompt_tokens: row.get(24)?,
         }))
     } else {
         Ok(None)
@@ -1238,6 +1327,9 @@ mod tests {
                 heartbeat          INTEGER,
                 claim_owner        TEXT,
                 total_tokens       INTEGER NOT NULL DEFAULT 0,
+                compacted_seq      INTEGER NOT NULL DEFAULT 0,
+                compaction_summary TEXT,
+                prompt_tokens      INTEGER NOT NULL DEFAULT 0,
                 created_at      INTEGER NOT NULL,
                 updated_at      INTEGER NOT NULL
             );
@@ -2118,10 +2210,7 @@ mod tests {
         // contributes to the running total rather than replacing it.
         add_session_tokens(&conn, &id, 120).unwrap();
         add_session_tokens(&conn, &id, 30).unwrap();
-        assert_eq!(
-            find_session(&conn, &id).unwrap().unwrap().total_tokens,
-            150
-        );
+        assert_eq!(find_session(&conn, &id).unwrap().unwrap().total_tokens, 150);
     }
 
     #[test]

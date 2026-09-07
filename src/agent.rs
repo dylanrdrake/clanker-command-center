@@ -1,4 +1,4 @@
-use crate::client::{ChatMessage, Client, StreamEvent};
+use crate::client::{ChatMessage, Client, StreamEvent, Usage};
 use crate::config::{SessionGates, ToolAccess, ToolAccessSettings};
 use crate::tools::{execute_tool, get_tool_definitions};
 use crate::ui::{AgentEvent, AgentUi, ApprovalRequest};
@@ -120,7 +120,7 @@ async fn request_turn(
                     usage: request_usage,
                 } => {
                     if let Some(request_usage) = request_usage {
-                        usage.add(request_usage.total_tokens);
+                        usage.add(request_usage);
                     }
                     assembled = Some(message);
                 }
@@ -139,7 +139,7 @@ async fn request_turn(
             )
             .await?;
         if let Some(request_usage) = response.usage {
-            usage.add(request_usage.total_tokens);
+            usage.add(request_usage);
         }
         response
             .choices
@@ -312,17 +312,42 @@ impl Steering {
 /// read from after handing the other one in.
 #[derive(Clone, Debug, Default)]
 pub struct UsageTracker {
-    total: Arc<Mutex<u64>>,
+    counts: Arc<Mutex<Counts>>,
+}
+
+/// The two numbers a turn's requests are worth keeping: what they cost in
+/// total, and how big the last of them was.
+#[derive(Debug, Default)]
+struct Counts {
+    total: u64,
+    /// The prompt size of the most recent request, not a sum — it is a
+    /// measurement of how large the history has grown, and adding successive
+    /// measurements of the same growing thing would say nothing. `0` while
+    /// no request has reported one.
+    last_prompt: u64,
 }
 
 impl UsageTracker {
-    fn add(&self, tokens: u64) {
-        *self.total.lock().expect("usage tracker poisoned") += tokens;
+    fn add(&self, usage: Usage) {
+        let mut counts = self.counts.lock().expect("usage tracker poisoned");
+        counts.total += usage.total_tokens;
+        if usage.prompt_tokens > 0 {
+            counts.last_prompt = usage.prompt_tokens;
+        }
     }
 
     /// Everything accumulated so far, in tokens.
     pub fn total(&self) -> u64 {
-        *self.total.lock().expect("usage tracker poisoned")
+        self.counts.lock().expect("usage tracker poisoned").total
+    }
+
+    /// How big the turn's last request was, as the provider reported it.
+    /// `0` when nothing reported a breakdown — see [`Usage::prompt_tokens`].
+    pub fn last_prompt(&self) -> u64 {
+        self.counts
+            .lock()
+            .expect("usage tracker poisoned")
+            .last_prompt
     }
 }
 
@@ -572,9 +597,36 @@ mod tests {
         // the caller reads the total back through the handle it kept.
         let caller = UsageTracker::default();
         let worker = caller.clone();
-        worker.add(10);
-        worker.add(5);
+        worker.add(Usage {
+            total_tokens: 10,
+            prompt_tokens: 8,
+        });
+        worker.add(Usage {
+            total_tokens: 5,
+            prompt_tokens: 12,
+        });
         assert_eq!(caller.total(), 15);
+        // Not a sum: it is how big the last request was, and the last one
+        // was 12.
+        assert_eq!(caller.last_prompt(), 12);
+    }
+
+    #[test]
+    fn a_provider_that_reports_no_prompt_size_leaves_the_last_one_standing() {
+        // A total with no breakdown is the common case on some endpoints.
+        // Overwriting a real measurement with its zero would make a long
+        // conversation look empty and stop it ever compacting.
+        let usage = UsageTracker::default();
+        usage.add(Usage {
+            total_tokens: 100,
+            prompt_tokens: 90,
+        });
+        usage.add(Usage {
+            total_tokens: 40,
+            prompt_tokens: 0,
+        });
+        assert_eq!(usage.total(), 140);
+        assert_eq!(usage.last_prompt(), 90);
     }
 
     #[test]
