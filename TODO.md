@@ -2,7 +2,6 @@
 **TODOs**
 * connect providers directly, like Anthropic, OpenAI, etc..
 
-Clanker re-design — API surface and theme, cheapest first
 * Tutorial option on the picker screen. Last only because it is undefined.
    A static screen of keys and concepts is the smallest thing on this list
    and belongs first; an interactive walkthrough — a scripted clanker that
@@ -76,22 +75,6 @@ NEXT:
   log — logging would become `> log 2>&1` and lose the separation again.
   Probably both. This is a precondition for anything like --headless coming
   back: safe to run unattended is not the same as usable as an API.
-* nothing bounds what gets sent to the model. Every turn ships the whole
-  history: `truncate_output` (conversation.rs) only clips shell output, and no
-  other trimming exists anywhere. Cost and latency grow with session length
-  until a long chat overruns the context window outright. Two answers to weigh:
-  a sliding window (drop or elide the oldest turns — cheap, predictable, loses
-  what it drops) or compaction (summarize older turns into one synthetic
-  message — keeps the gist, costs an extra call, and the summary can be wrong
-  in ways nothing catches). Probably both eventually, with a threshold that
-  picks. Two things have to land first: a token counter, since neither can be
-  triggered without knowing where you are (wanted in-session anyway — part of
-  verbose?), and a decision about `prompt caching` above, which this collides
-  with — a cache hit needs a stable prefix, and both windowing and compaction
-  rewrite the front of the history, so the two features have to be designed
-  against each other rather than one after the other. Storage is unaffected:
-  the DB keeps every message either way, this is only about what each request
-  carries. Not the same problem as the TUI render cost, which is local.
 * how to handle $'s that need an answer to std in
 * is it possible to create a session and not enter the terminal but keep the process open, or create/open a session and back out of the terminal but the process stays open so the agent can keep wokring?
 * what happens if you --resume an 'elsewhere' session then ctrl-c? Where does your terminal land to?
