@@ -483,6 +483,7 @@ dependencies = [
  "html2text",
  "keyring",
  "ratatui",
+ "regex",
  "reqwest",
  "rusqlite",
  "rustyline",
@@ -495,6 +496,7 @@ dependencies = [
  "tui-markdown",
  "unicode-width 0.2.2",
  "uuid",
+ "walkdir",
 ]
 
 [[package]]

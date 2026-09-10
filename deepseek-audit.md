@@ -17,11 +17,21 @@ Cheapest, highest-leverage change.
 
 ### 2. The agent has no search tool — the single biggest capability gap
 
+> **Done.** `search_files` exists: regex, line numbers, capped results, and
+> the read-only category so it can sit at `allow` while the shell stays
+> `never`. The audit's reasoning about the sandbox held up — it is bounded by
+> how many files it will walk past rather than by where it starts.
+
 The tool surface (`src/tools.rs`) is read/`list_files`/write/replace/fetch/shell. For an *agentic codebase* tool there's no way to `grep`. A model narrowing a bug must read whole files and reconstruct the workspace from a flat `list_files` of names.
 
 Add a bounded, read-only `search_files` tool: substring/regex match with line numbers + a few lines of context, capped at N results. It's read-only, so it fits the existing sandbox model trivially (reads are "never bounded"), and it slots into the same `TOOLS`/schema/`category_of` wiring with the existing drift-catching tests.
 
 ### 3. `read_file` returns an entire file with no bound
+
+> **Done.** `offset` and `limit` page through a file, defaulting to 2000
+> lines, with a 128KB ceiling behind that for the one-enormous-line case a
+> line count says nothing about. The result reports `total_lines`,
+> `last_line` and `truncated` so a cut is never silent.
 
 In `tools.rs`, `read_file` reads the whole file into `content` and hands it over — a multi-MB file (a lockfile, a generated bundle, `node_modules` output) goes to the model in one turn and sits in every request after via the message array. Nothing stops this except compaction downstream.
 

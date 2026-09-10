@@ -29,7 +29,7 @@ pub fn response_label(model: &str, effort_level: &Option<String>) -> String {
 pub fn primary_argument(arguments: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(arguments).ok()?;
     let object = value.as_object()?;
-    ["filepath", "command", "dirpath"]
+    ["filepath", "command", "dirpath", "pattern"]
         .iter()
         .find_map(|key| object.get(*key).and_then(|v| v.as_str()))
         .map(str::to_string)
@@ -81,11 +81,24 @@ pub fn json_fields(text: &str) -> Vec<(String, String)> {
 /// the notice at all.
 pub fn tool_call_fields(name: &str, arguments: &str) -> Vec<(String, String)> {
     let mut fields = json_fields(arguments);
-    if name == "run_terminal_command" && !fields.iter().any(|(key, _)| key == "working_dir") {
-        if let Ok(cwd) = std::env::current_dir() {
-            fields.push(("working_dir".to_string(), cwd.display().to_string()));
+
+    // Both of these default to the working directory when the argument is
+    // left off, and both are tools you are being asked to approve — "where"
+    // is half of that question, so the default is spelled out rather than
+    // left as a silence.
+    let implied_dir = match name {
+        "run_terminal_command" => Some("working_dir"),
+        "search_files" => Some("path"),
+        _ => None,
+    };
+    if let Some(key) = implied_dir {
+        if !fields.iter().any(|(field, _)| field == key) {
+            if let Ok(cwd) = std::env::current_dir() {
+                fields.push((key.to_string(), cwd.display().to_string()));
+            }
         }
     }
+
     fields
 }
 
@@ -1838,8 +1851,8 @@ mod tests {
         assert_eq!(value("Sandbox"), "on");
         assert_eq!(
             value("Each tool"),
-            "read_file ask · list_files ask · web_fetch allow · write_file ask \
-             · replace_in_file ask · run_terminal_command never"
+            "read_file ask · list_files ask · search_files ask · web_fetch allow \
+             · write_file ask · replace_in_file ask · run_terminal_command never"
         );
         assert_eq!(value("Directory"), "not recorded");
         assert_eq!(value("Tokens"), "🪙 0");
@@ -1883,8 +1896,8 @@ mod tests {
         // anyone is asking here.
         assert_eq!(
             value("Each tool"),
-            "read_file allow · list_files allow · web_fetch allow · write_file ask \
-             · replace_in_file ask · run_terminal_command never"
+            "read_file allow · list_files allow · search_files allow · web_fetch allow \
+             · write_file ask · replace_in_file ask · run_terminal_command never"
         );
         assert_eq!(value("Directory"), "/home/dev/project");
         assert_eq!(value("Tokens"), "🪙 12,345");
@@ -2136,6 +2149,27 @@ mod tests {
                 ("command".to_string(), "ls".to_string()),
                 ("working_dir".to_string(), "/tmp".to_string()),
             ]
+        );
+    }
+
+    #[test]
+    fn primary_argument_finds_a_search_pattern() {
+        // A gated search you approve without seeing what it looks for is an
+        // approval given blind.
+        assert_eq!(
+            primary_argument(r#"{"pattern":"fn main","glob":"*.rs"}"#),
+            Some("fn main".to_string())
+        );
+    }
+
+    #[test]
+    fn tool_call_fields_spells_out_where_a_search_defaults_to() {
+        let fields = tool_call_fields("search_files", r#"{"pattern":"needle"}"#);
+        let path = fields.iter().find(|(key, _)| key == "path");
+        assert!(path.is_some(), "{fields:?}");
+        assert_eq!(
+            path.unwrap().1,
+            std::env::current_dir().unwrap().display().to_string()
         );
     }
 

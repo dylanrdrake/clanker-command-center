@@ -9,7 +9,7 @@ CCC is most stable on Linux at the moment!
 - **Fast & lightweight** — Compiled Rust binary, single executable with no runtime dependencies
 - **One noun** — a clanker: a saved conversation with tools, without them, or with exactly the ones you allow. A one-off prompt, a line-based conversation, or the full-screen TUI, all over the same thing
 - **Streaming responses** — Replies appear as they're generated rather than all at once
-- **File operations** — LLM can read, write, and modify local files
+- **File operations** — LLM can read, search, write, and modify local files. Reads are bounded and pageable, so one large file can't swallow a conversation's context
 - **Per-tool permissions** — every tool asks, runs freely, or isn't offered at all, set globally or per clanker with `clank tools`
 - **Model selection** — Choose from configured provider's models
 - **Agentic loops** — Multi-turn execution with tool calling
@@ -337,6 +337,7 @@ lists every tool with its state:
 $ clank tools
   read_file              ask    read     · Read a file from disk
   list_files             ask    read     · List a directory
+  search_files           ask    read     · Search file contents for a pattern
   web_fetch              allow  web      · Fetch a web page as text
   write_file             ask    write    · Write or overwrite a file
   replace_in_file        ask    write    · Replace a string inside a file
@@ -1120,10 +1121,59 @@ A run with tools — `clank "..." --tools`, or a clanker that has them — gives
 Write or append content to a file.
 
 ### `read_file`
-Read the contents of a file.
+Read the contents of a file, or a range of its lines.
+
+Long files come back cut short rather than whole. A file is the sort of thing
+a conversation pays for once and then carries in every request after it, and
+the model usually wanted one function out of it, so a read stops at 2000 lines
+unless asked otherwise. The result says `total_lines`, `last_line` and
+`truncated`, and `offset` reads on from where the last one stopped:
+
+```
+read_file  filepath=src/store.rs                  → lines 1-2000 of 2325
+read_file  filepath=src/store.rs  offset=2001     → lines 2001-2325
+```
+
+A read is bounded in bytes as well, at 128KB, because a line count says
+nothing useful about a minified bundle or a one-line JSON blob — one line of
+several megabytes is under every line limit there is. Whole lines are kept for
+as long as they fit. A single line longer than the whole ceiling is cut
+mid-line instead, and `line_truncated` says so, because that is the one cut
+`offset` can't resume from.
+
+A file that fits under both bounds is returned exactly as it sits on disk, so
+reading one and writing it back can't quietly change its line endings or drop
+its trailing newline.
 
 ### `list_files`
 List files in a directory.
+
+### `search_files`
+Search file contents for a regular expression, returning the matching lines
+with their file and line number.
+
+This is the tool that stops a clanker reading whole files to find one symbol,
+which is the most expensive habit an agentic turn has. It is deliberately
+separate from `run_terminal_command`, which could run `grep` and much else
+besides: searching is a bounded read and can sit at `allow`, while the shell
+stays `never`.
+
+```bash
+search_files  pattern="fn seam" glob="*.rs"
+  src/compact.rs:124  pub fn seam(messages: &[ChatMessage], from: usize, ...
+```
+
+Bounded on every axis a search runs away on. It stops at 100 matches and says
+when there were more, shortens a long matching line, skips a file too large to
+be source, never descends into `.git`, `target`, `node_modules` and the rest of
+the directories nobody greps, and gives up after walking past 20,000 files.
+
+That last bound is there instead of a path bound. The sandbox confines writes,
+and could not confine reads while `read_file` names any path it likes, so
+fencing the search to the working directory would have blocked a search of a
+sibling project without putting anything out of reach. What actually goes
+wrong with a search pointed at a whole filesystem is that it never finishes,
+and the file ceiling ends that directly.
 
 ### `replace_in_file`
 Replace text in an existing file.
@@ -1330,7 +1380,7 @@ sudo dnf groupinstall "Development Tools"
 
 ## Security
 
-- The agent's file-writing tools (`write_file`, `replace_in_file`) are confined to your current working directory by default, checked against the path a write resolves to so `..` and symlinks can't step outside it. Turn it off per clanker with `/sandbox off` or globally with `clank sandbox off`. Reads and terminal commands are not bounded this way — a terminal command runs whatever you approve. This gates the agent's tools only; `clank` writes its own `~/.clank` state directly and is unaffected
+- The agent's file-writing tools (`write_file`, `replace_in_file`) are confined to your current working directory by default, checked against the path a write resolves to so `..` and symlinks can't step outside it. Turn it off per clanker with `/sandbox off` or globally with `clank sandbox off`. Reads and terminal commands are not bounded this way — a terminal command runs whatever you approve, and a read changes nothing, so confining it would only break ordinary work like reading a file under `/etc`. `search_files` follows the read rule and can walk outside the working directory too; what bounds it is the number of files it will walk past, not where it starts, since bounding the path could not put anything out of reach that `read_file` can already name. This gates the agent's tools only; `clank` writes its own `~/.clank` state directly and is unaffected
 - API keys are stored in your OS keychain (macOS Keychain, Windows Credential Manager, or the Linux Secret Service via `keyring`), not in a plaintext file. An older `~/.clank/config.json` with a plaintext `api_key` field is migrated into the keychain automatically the next time you run any `clank` command, and the field is stripped from the file afterward
 - `clanker`/`tui` history is stored in `~/.clank/chats.db` with message content, tool calls, reasoning, and titles encrypted at rest (AES-256-GCM, key held in your OS keychain under a separate `db_encryption_key` entry) — but the surrounding clanker metadata (roles, model names, effort levels, timestamps) is stored in the clear, and rows written before encryption existed stay plaintext until they're next written. The key lives in the same keychain `clank` already uses, so this protects the file at rest (backups, drive theft) rather than against someone who can run `clank` as you; avoid pasting secrets into a clanker if you plan to share the database file
 - The last 100 LLM API errors (a non-2xx response, a stalled/dropped connection, a malformed stream) are kept at `~/.clank/errors.log`, so a confusing one can be looked back at without having to catch and copy it in the moment — plain text, one line per entry, oldest dropped as new ones come in

@@ -269,13 +269,13 @@ Then the things that must not have broken:
 New: approvals are per tool, with three states, and `approval` is gone.
 
 ```
-clank tools                          six listed: web_fetch "allow",
+clank tools                          seven listed: web_fetch "allow",
                                      run_terminal_command "never",
                                      the rest "ask"
 clank tools never run_terminal_command
 clank tools                          it now reads "never"
 clank tools on                       back to defaults, web_fetch "allow" again
-clank tools allow read               both read tools, nothing else
+clank tools allow read               all three read tools, nothing else
 clank tools bogus off                refused, naming the word it did not know
 clank status                         the same listing at the bottom
 ```

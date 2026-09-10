@@ -22,7 +22,7 @@ pub struct ToolInfo {
 
 /// Every tool the agent has, in the order a listing should show them:
 /// the harmless first, the ones that change your machine last.
-pub const TOOLS: [ToolInfo; 6] = [
+pub const TOOLS: [ToolInfo; 7] = [
     ToolInfo {
         name: "read_file",
         category: "read",
@@ -32,6 +32,11 @@ pub const TOOLS: [ToolInfo; 6] = [
         name: "list_files",
         category: "read",
         summary: "List a directory",
+    },
+    ToolInfo {
+        name: "search_files",
+        category: "read",
+        summary: "Search file contents for a pattern",
     },
     ToolInfo {
         name: "web_fetch",
@@ -97,13 +102,27 @@ pub fn get_tool_definitions() -> Vec<serde_json::Value> {
             "type": "function",
             "function": {
                 "name": "read_file",
-                "description": "Read the contents of a local file",
+                "description": "Read the contents of a local file. Long files \
+                    come back cut short: check `truncated` and `total_lines` in \
+                    the result, and read the rest with `offset` rather than \
+                    assuming you have seen the whole file. A read is also \
+                    capped in bytes, so a file of very long lines can come \
+                    back with its last line cut mid-line — `line_truncated` \
+                    says when that happened.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "filepath": {
                             "type": "string",
                             "description": "Relative or absolute path to the file to read"
+                        },
+                        "offset": {
+                            "type": "integer",
+                            "description": "Line number to start at, counting from 1. Defaults to the first line."
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Most lines to return. Defaults to 2000."
                         }
                     },
                     "required": ["filepath"]
@@ -123,6 +142,39 @@ pub fn get_tool_definitions() -> Vec<serde_json::Value> {
                             "description": "Directory path (default: current directory)"
                         }
                     }
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "search_files",
+                "description": "Search file contents for a regular expression and \
+                    return the matching lines with their file and line number. \
+                    Prefer this over reading whole files to find something. \
+                    Results stop at `max_results`, and `truncated` says when \
+                    there were more; long matching lines are shortened.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "pattern": {
+                            "type": "string",
+                            "description": "Regular expression to search for"
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "File or directory to search (default: current directory)"
+                        },
+                        "glob": {
+                            "type": "string",
+                            "description": "Only search files whose name matches this, e.g. *.rs"
+                        },
+                        "max_results": {
+                            "type": "integer",
+                            "description": "Most matches to return. Defaults to 100."
+                        }
+                    },
+                    "required": ["pattern"]
                 }
             }
         }),
@@ -421,13 +473,35 @@ pub async fn execute_tool(
                 .get("filepath")
                 .and_then(|v| v.as_str())
                 .ok_or(anyhow!("Missing filepath"))?;
+            let offset = args
+                .get("offset")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize);
+            let limit = args
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize);
 
-            read_file(filepath)
+            read_file(filepath, offset, limit)
         }
         "list_files" => {
             let dirpath = args.get("dirpath").and_then(|v| v.as_str()).unwrap_or(".");
 
             list_files(dirpath)
+        }
+        "search_files" => {
+            let pattern = args
+                .get("pattern")
+                .and_then(|v| v.as_str())
+                .ok_or(anyhow!("Missing pattern"))?;
+            let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+            let glob = args.get("glob").and_then(|v| v.as_str());
+            let max_results = args
+                .get("max_results")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize);
+
+            search_files(pattern, path, glob, max_results)
         }
         "replace_in_file" => {
             let filepath = args
@@ -611,7 +685,50 @@ fn write_file(
     }))
 }
 
-fn read_file(filepath: &str) -> Result<serde_json::Value> {
+/// The most lines one read returns when the caller asks for no limit.
+///
+/// A whole file is the wrong default for a conversation that has to carry it
+/// afterwards: every request from here on pays for it again, and the model
+/// usually wanted one function out of it. Two thousand lines is far more
+/// than a targeted read needs and far less than a generated file, a lockfile
+/// or a log costs.
+const DEFAULT_READ_LIMIT: usize = 2_000;
+
+/// The most bytes one read returns, whatever the line limit would allow.
+///
+/// The line limit is the real bound for ordinary text, and this is the
+/// backstop for text that isn't: a minified bundle, a one-line JSON blob or a
+/// generated data file is a single line of several megabytes, and passes a
+/// limit of two thousand lines without being touched at all.
+///
+/// Sized against [`crate::config::DEFAULT_COMPACT_AT`] rather than picked for
+/// roundness — at the compactor's three bytes per token this is around 43k,
+/// comfortably under the default compaction threshold, so no single read can
+/// put a clanker over the line on its own. Two thousand lines of source sits
+/// well under it, so the ceiling stays out of the way of ordinary reads.
+const MAX_READ_BYTES: usize = 128 * 1024;
+
+/// Reads `filepath`, or the `limit` lines of it that start at line `offset`.
+///
+/// `offset` counts from 1, so it means what an editor, a stack trace and a
+/// compiler error all mean by a line number, and what the `offset` in this
+/// result can be fed back as directly.
+///
+/// Bounded twice over. `limit` bounds ordinary text, and
+/// [`MAX_READ_BYTES`] bounds the text a line count says nothing useful about
+/// — a minified bundle is one line of megabytes and is under every line limit
+/// there is.
+///
+/// A file that fits under both is returned exactly as it sits on disk,
+/// rather than split into lines and rejoined. Reading a file and writing it
+/// back is an ordinary thing for a turn to do, and rebuilding the text would
+/// quietly drop a trailing newline and rewrite CRLF endings as LF — so the
+/// rejoin is confined to the case that is already returning part of a file.
+fn read_file(
+    filepath: &str,
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> Result<serde_json::Value> {
     let path = std::path::Path::new(filepath);
 
     if !path.exists() {
@@ -621,14 +738,356 @@ fn read_file(filepath: &str) -> Result<serde_json::Value> {
         }));
     }
 
+    let offset = offset.unwrap_or(1);
+    let limit = limit.unwrap_or(DEFAULT_READ_LIMIT);
+    if offset == 0 || limit == 0 {
+        return Ok(json!({
+            "success": false,
+            "error": "Line numbers start at 1, so offset and limit must both be 1 or more"
+        }));
+    }
+
     let content = fs::read_to_string(path)?;
-    let lines = content.lines().count();
+    let total = content.lines().count();
+
+    // Byte for byte, for the reason in the doc comment above. Both bounds
+    // have to be clear before that is safe: a file of one enormous line is
+    // under any line limit at all, and is exactly what the byte ceiling is
+    // here to catch. An empty file comes through here too, which is why the
+    // offset check below can assume there is a line to be past.
+    if offset == 1 && total <= limit && content.len() <= MAX_READ_BYTES {
+        return Ok(json!({
+            "success": true,
+            "content": content,
+            "lines": total,
+            "total_lines": total,
+            "offset": 1,
+            "last_line": total,
+            "truncated": false,
+            "line_truncated": false
+        }));
+    }
+
+    if offset > total {
+        return Ok(json!({
+            "success": false,
+            "error": format!(
+                "Offset {offset} is past the end of {filepath}, which has {total} lines"
+            )
+        }));
+    }
+
+    let kept: Vec<&str> = content.lines().skip(offset - 1).take(limit).collect();
+
+    // Whole lines for as long as they fit, so `last_line` keeps meaning what
+    // it says and a follow-up read can carry on from it.
+    let mut fitted = 0;
+    let mut bytes = 0;
+    for line in &kept {
+        // Plus the newline `join` puts back between them.
+        let cost = line.len() + 1;
+        if fitted > 0 && bytes + cost > MAX_READ_BYTES {
+            break;
+        }
+        bytes += cost;
+        fitted += 1;
+    }
+
+    let mut text = kept[..fitted].join("\n");
+    // A single line longer than the entire ceiling is the case whole lines
+    // can't answer, and it is the common one here: keeping none of a minified
+    // bundle would return nothing at all. Cut the line itself instead, on a
+    // character boundary so the tail isn't left as invalid UTF-8.
+    let line_truncated = text.len() > MAX_READ_BYTES;
+    if line_truncated {
+        let mut end = MAX_READ_BYTES;
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+    }
+
+    let last = offset + fitted - 1;
 
     Ok(json!({
         "success": true,
-        "content": content,
-        "lines": lines
+        "content": text,
+        "lines": fitted,
+        "total_lines": total,
+        // Both ends of what came back, so a follow-up read can carry on from
+        // `last + 1` without the model counting lines to work out where it
+        // got to.
+        "offset": offset,
+        "last_line": last,
+        "truncated": last < total || line_truncated,
+        // Its own answer, because a cut line is the one case `last_line`
+        // can't be resumed from: reading on from the next line skips the rest
+        // of it, and there is no way to ask for the middle of a line.
+        "line_truncated": line_truncated
     }))
+}
+
+/// Where a search stops. Returning every match would be the mistake
+/// `read_file` used to make, in bulk: one search for a common word across a
+/// repository is thousands of lines, carried in every request afterwards.
+const MAX_SEARCH_RESULTS: usize = 100;
+
+/// The longest a matching line is reported at. A match is a pointer to a
+/// place in a file rather than the file itself, and one match inside a
+/// minified bundle would otherwise return the whole bundle as its "line".
+const MAX_MATCH_LINE: usize = 300;
+
+/// The largest file a search opens. Past this it isn't source that anyone
+/// greps, it's data, and reading it costs more than the match is worth.
+const MAX_SEARCHED_FILE: u64 = 4 * 1024 * 1024;
+
+/// The most files one search walks past before it gives up.
+///
+/// This is the bound that a path bound was the wrong instrument for. A search
+/// pointed at a whole filesystem is not a safety problem — `read_file` beside
+/// it names any path it likes, so nothing is being kept out of reach — but it
+/// is minutes of walking for an answer nobody is still waiting for. A project
+/// sits far below this once the skipped directories are out of the way, and a
+/// filesystem reaches it almost at once.
+const MAX_SEARCHED_FILES: usize = 20_000;
+
+/// Directories a search never descends into.
+///
+/// Deliberately a list rather than a gitignore reader: that is a parser, a
+/// per-directory rule stack and another dependency, and this is most of what
+/// it would spend its time concluding. A search returning nine parts
+/// `node_modules` is one the model has to page through to find the project
+/// in.
+const SKIPPED_DIRS: [&str; 9] = [
+    ".git",
+    ".hg",
+    ".svn",
+    "target",
+    "node_modules",
+    "__pycache__",
+    ".venv",
+    "dist",
+    "build",
+];
+
+/// Whether a walked entry is a directory a search should not enter.
+///
+/// Depth zero is the path the search was pointed at, and is never skipped:
+/// someone who asks to search `target` means it.
+fn skipped_dir(entry: &walkdir::DirEntry) -> bool {
+    entry.depth() > 0
+        && entry.file_type().is_dir()
+        && entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| SKIPPED_DIRS.contains(&name))
+}
+
+/// Matches a file name against a pattern where `*` stands for any run of
+/// characters, `?` for one, and everything else is literal.
+///
+/// Not a full glob, and not a dependency for one: `*.rs` is what this is for,
+/// and path-segment matching would be a second way of saying what `path`
+/// already says.
+fn wildcard_match(pattern: &str, name: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let name: Vec<char> = name.chars().collect();
+    let (mut p, mut n) = (0, 0);
+    // Where to resume from if a `*` turns out to have matched too little.
+    let (mut star, mut retry) = (None, 0);
+
+    while n < name.len() {
+        if p < pattern.len() && (pattern[p] == '?' || pattern[p] == name[n]) {
+            p += 1;
+            n += 1;
+        } else if p < pattern.len() && pattern[p] == '*' {
+            star = Some(p);
+            retry = n;
+            p += 1;
+        } else if let Some(at) = star {
+            // Give the last `*` one more character and try again.
+            p = at + 1;
+            retry += 1;
+            n = retry;
+        } else {
+            return false;
+        }
+    }
+
+    pattern[p..].iter().all(|c| *c == '*')
+}
+
+/// A matching line cut to a length worth carrying, on a character boundary.
+fn shorten_match(line: &str) -> String {
+    let line = line.trim_end();
+    if line.len() <= MAX_MATCH_LINE {
+        return line.to_string();
+    }
+    let mut end = MAX_MATCH_LINE;
+    while end > 0 && !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &line[..end])
+}
+
+/// A found path written relative to the working directory where it can be.
+///
+/// That is the form a follow-up `read_file` wants and the form a person
+/// reads; the walk itself works in canonical absolute paths because the
+/// sandbox bound does.
+fn display_path(path: &Path) -> String {
+    std::env::current_dir()
+        .ok()
+        .and_then(|cwd| cwd.canonicalize().ok())
+        .and_then(|cwd| path.strip_prefix(cwd).ok().map(Path::to_path_buf))
+        .unwrap_or_else(|| path.to_path_buf())
+        .to_string_lossy()
+        .to_string()
+}
+
+/// Searches file contents for `pattern`, returning the matching lines rather
+/// than the files that contain them.
+///
+/// This is the tool that stops a model reading whole files to find one
+/// symbol, which is the most expensive habit an agentic turn can have. It
+/// exists separately from `run_terminal_command` — which could run `grep` —
+/// so that searching can be allowed without also allowing arbitrary
+/// commands: one is a bounded read, the other is anything the user can do.
+///
+/// Bounded on every axis a search can run away on: the number of matches, the
+/// length of each one, the size of a file worth opening, the directories
+/// worth entering, and the number of files worth walking past.
+///
+/// Not bounded by the sandbox, deliberately, and in line with `read_file` and
+/// `list_files` beside it. The sandbox is a bound on writes — that is what it
+/// is named for, what `/sandbox` says it does, and what its refusal tells you
+/// how to lift — and it could not become a bound on reads while `read_file`
+/// names any path it likes. What a path bound was really guarding against was
+/// a walk that never ends, and [`MAX_SEARCHED_FILES`] guards that directly
+/// without blocking a search of a sibling project.
+fn search_files(
+    pattern: &str,
+    path: &str,
+    glob: Option<&str>,
+    max_results: Option<usize>,
+) -> Result<serde_json::Value> {
+    let max_results = max_results.unwrap_or(MAX_SEARCH_RESULTS);
+    if max_results == 0 {
+        return Ok(json!({
+            "success": false,
+            "error": "max_results must be 1 or more"
+        }));
+    }
+
+    // Handed back rather than raised: a bad pattern is the model's to fix,
+    // and the regex crate's own message says exactly what is wrong with it.
+    let regex = match regex::Regex::new(pattern) {
+        Ok(regex) => regex,
+        Err(e) => {
+            return Ok(json!({
+                "success": false,
+                "error": format!("Invalid pattern: {e}")
+            }))
+        }
+    };
+
+    let root = Path::new(path);
+    if !root.exists() {
+        return Ok(json!({
+            "success": false,
+            "error": format!("Path not found: {}", path)
+        }));
+    }
+
+    let found = search_tree(&regex, root, glob, max_results, MAX_SEARCHED_FILES);
+
+    Ok(json!({
+        "success": true,
+        "count": found.matches.len(),
+        "matches": found.matches,
+        "files_searched": found.files_searched,
+        "truncated": found.truncated
+    }))
+}
+
+/// What one walk turned up.
+struct Found {
+    matches: Vec<serde_json::Value>,
+    /// Files actually opened and scanned, which is fewer than were walked
+    /// past whenever a glob or a size skipped one.
+    files_searched: usize,
+    /// Whether either ceiling ended the search early, so the caller knows the
+    /// answer is a first page rather than the whole of it.
+    truncated: bool,
+}
+
+/// The walk itself, with both ceilings passed in rather than read from the
+/// constants — twenty thousand files is not a number a test can afford to
+/// create, and an untested ceiling is one that silently stops working.
+fn search_tree(
+    regex: &regex::Regex,
+    root: &Path,
+    glob: Option<&str>,
+    max_results: usize,
+    max_files: usize,
+) -> Found {
+    let mut matches = vec![];
+    let mut files_searched = 0;
+    let mut walked = 0;
+    let mut truncated = false;
+
+    let walk = walkdir::WalkDir::new(root)
+        // A cyclic symlink would otherwise turn a search into an endless one.
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| !skipped_dir(entry));
+
+    'walk: for entry in walk.filter_map(|entry| entry.ok()) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        walked += 1;
+        if walked > max_files {
+            truncated = true;
+            break;
+        }
+        if let Some(glob) = glob {
+            if !wildcard_match(glob, &entry.file_name().to_string_lossy()) {
+                continue;
+            }
+        }
+        // Unreadable metadata is treated as too big: a file that can't be
+        // measured is not one to read whole.
+        if entry.metadata().map(|m| m.len()).unwrap_or(u64::MAX) > MAX_SEARCHED_FILE {
+            continue;
+        }
+        // Not valid UTF-8 is not text, and not something to grep.
+        let Ok(content) = fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        files_searched += 1;
+
+        for (number, line) in content.lines().enumerate() {
+            if !regex.is_match(line) {
+                continue;
+            }
+            if matches.len() >= max_results {
+                truncated = true;
+                break 'walk;
+            }
+            matches.push(json!({
+                "filepath": display_path(entry.path()),
+                "line": number + 1,
+                "text": shorten_match(line)
+            }));
+        }
+    }
+
+    Found {
+        matches,
+        files_searched,
+        truncated,
+    }
 }
 
 fn list_files(dirpath: &str) -> Result<serde_json::Value> {
@@ -971,6 +1430,343 @@ mod tests {
     /// drive's root instead, outside both bounds everywhere.
     fn outside_the_sandbox() -> String {
         format!("/clank-sandbox-should-never-exist-{}/x", std::process::id())
+    }
+
+    /// A file in the working directory, named so two tests can't collide.
+    fn scratch(tag: &str, body: &str) -> String {
+        let name = format!("clank-read-test-{}-{tag}.txt", std::process::id());
+        fs::write(&name, body).unwrap();
+        name
+    }
+
+    #[test]
+    fn a_file_under_the_limit_comes_back_exactly_as_it_sits_on_disk() {
+        // The guard on the rejoin: a turn that reads a file and writes it
+        // back must not lose its trailing newline on the way through.
+        let name = scratch("whole", "one\ntwo\nthree\n");
+        let result = read_file(&name, None, None).unwrap();
+        fs::remove_file(&name).ok();
+
+        assert_eq!(result["success"], true, "{result}");
+        assert_eq!(result["content"], "one\ntwo\nthree\n");
+        assert_eq!(result["lines"], 3);
+        assert_eq!(result["total_lines"], 3);
+        assert_eq!(result["truncated"], false);
+        assert_eq!(result["line_truncated"], false);
+    }
+
+    #[test]
+    fn a_file_over_the_limit_is_cut_and_says_how_much_is_left() {
+        // The point of the limit: without this the whole file is carried in
+        // every request for the rest of the conversation.
+        let body: String = (1..=50).map(|n| format!("line {n}\n")).collect();
+        let name = scratch("cut", &body);
+        let result = read_file(&name, None, Some(10)).unwrap();
+        fs::remove_file(&name).ok();
+
+        assert_eq!(result["success"], true, "{result}");
+        assert_eq!(result["lines"], 10);
+        assert_eq!(result["total_lines"], 50);
+        assert_eq!(result["last_line"], 10);
+        assert_eq!(
+            result["truncated"], true,
+            "a cut the model can't see is a file it will think it has read"
+        );
+        assert!(result["content"].as_str().unwrap().starts_with("line 1\n"));
+        assert!(result["content"].as_str().unwrap().ends_with("line 10"));
+    }
+
+    #[test]
+    fn the_byte_ceiling_cuts_at_a_line_even_when_the_line_count_allows_more() {
+        // Two thousand lines is inside the line limit and far outside the
+        // byte one, which is the case the ceiling exists for.
+        let body: String = (0..2_000)
+            .map(|_| format!("{}\n", "a".repeat(199)))
+            .collect();
+        assert!(body.len() > MAX_READ_BYTES);
+        let name = scratch("bytes", &body);
+        let result = read_file(&name, None, None).unwrap();
+        fs::remove_file(&name).ok();
+
+        let content = result["content"].as_str().unwrap();
+        assert!(content.len() <= MAX_READ_BYTES, "{}", content.len());
+        assert_eq!(result["total_lines"], 2_000);
+        assert_eq!(result["truncated"], true);
+        assert_eq!(
+            result["line_truncated"], false,
+            "whole lines fit here, so none of them should have been split"
+        );
+        assert_eq!(
+            result["lines"], result["last_line"],
+            "a read starting at line 1 ends on the line it has returned"
+        );
+        assert!(
+            content.lines().all(|line| line.len() == 199),
+            "a line was cut when whole ones still fitted"
+        );
+    }
+
+    #[test]
+    fn one_enormous_line_is_cut_mid_line_rather_than_returned_whole() {
+        // The hole the line limit alone can't close: a minified bundle is a
+        // single line of megabytes, and is under every line limit there is.
+        let body = "a".repeat(300_000);
+        let name = scratch("minified", &body);
+        let result = read_file(&name, None, None).unwrap();
+        fs::remove_file(&name).ok();
+
+        assert_eq!(result["success"], true, "{result}");
+        assert_eq!(result["content"].as_str().unwrap().len(), MAX_READ_BYTES);
+        assert_eq!(result["total_lines"], 1);
+        assert_eq!(result["truncated"], true);
+        assert_eq!(
+            result["line_truncated"], true,
+            "reading on from the next line would skip the rest of this one"
+        );
+    }
+
+    #[test]
+    fn cutting_a_long_line_never_splits_a_character() {
+        // The leading ASCII byte puts every character boundary on an odd
+        // offset, so the ceiling lands mid-character and has to walk back.
+        let body = format!("x{}", "é".repeat(200_000));
+        let name = scratch("wide", &body);
+        let result = read_file(&name, None, None).unwrap();
+        fs::remove_file(&name).ok();
+
+        let content = result["content"].as_str().unwrap();
+        assert_eq!(result["line_truncated"], true);
+        assert!(content.len() <= MAX_READ_BYTES);
+        assert!(
+            content.starts_with('x') && content[1..].chars().all(|c| c == 'é'),
+            "the cut left a partial character behind"
+        );
+    }
+
+    #[test]
+    fn offset_carries_on_from_where_the_last_read_stopped() {
+        let body: String = (1..=50).map(|n| format!("line {n}\n")).collect();
+        let name = scratch("page", &body);
+        let first = read_file(&name, None, Some(10)).unwrap();
+        let last = first["last_line"].as_u64().unwrap() as usize;
+        let second = read_file(&name, Some(last + 1), Some(10)).unwrap();
+        fs::remove_file(&name).ok();
+
+        assert_eq!(second["offset"], 11);
+        assert_eq!(second["last_line"], 20);
+        assert!(second["content"].as_str().unwrap().starts_with("line 11\n"));
+        assert_eq!(second["truncated"], true);
+    }
+
+    #[test]
+    fn the_last_page_of_a_file_is_not_marked_truncated() {
+        let body: String = (1..=12).map(|n| format!("line {n}\n")).collect();
+        let name = scratch("tail", &body);
+        let result = read_file(&name, Some(11), Some(10)).unwrap();
+        fs::remove_file(&name).ok();
+
+        assert_eq!(result["lines"], 2);
+        assert_eq!(result["last_line"], 12);
+        assert_eq!(
+            result["truncated"], false,
+            "there is nothing after line 12 to go back for"
+        );
+    }
+
+    #[test]
+    fn an_offset_past_the_end_says_how_long_the_file_actually_is() {
+        // Refused rather than answered with nothing: an empty result reads
+        // as an empty file, and the model would move on believing it.
+        let name = scratch("past", "one\ntwo\n");
+        let result = read_file(&name, Some(99), None).unwrap();
+        fs::remove_file(&name).ok();
+
+        assert_eq!(result["success"], false, "{result}");
+        assert!(
+            result["error"].as_str().unwrap().contains("2 lines"),
+            "{result}"
+        );
+    }
+
+    #[test]
+    fn an_empty_file_reads_as_empty_rather_than_past_the_end() {
+        let name = scratch("empty", "");
+        let result = read_file(&name, None, None).unwrap();
+        fs::remove_file(&name).ok();
+
+        assert_eq!(result["success"], true, "{result}");
+        assert_eq!(result["content"], "");
+        assert_eq!(result["total_lines"], 0);
+    }
+
+    #[test]
+    fn line_numbers_start_at_one() {
+        // Zero is the off-by-one a model reaching for an array index makes,
+        // and answering it would silently hand back the wrong line.
+        let name = scratch("zero", "one\ntwo\n");
+        let result = read_file(&name, Some(0), None).unwrap();
+        fs::remove_file(&name).ok();
+
+        assert_eq!(result["success"], false, "{result}");
+    }
+
+    /// A directory tree under the working directory, unique to the test that
+    /// asked for it.
+    fn tree(tag: &str, files: &[(&str, &str)]) -> String {
+        let root = format!("clank-search-test-{}-{tag}", std::process::id());
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        for (relative, body) in files {
+            let path = Path::new(&root).join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, body).unwrap();
+        }
+        root
+    }
+
+    #[test]
+    fn a_search_returns_the_line_and_where_to_find_it() {
+        let root = tree("find", &[("src/main.rs", "fn main() {}\nlet x = 1;\n")]);
+        let result = search_files("fn main", &root, None, None).unwrap();
+        fs::remove_dir_all(&root).ok();
+
+        assert_eq!(result["success"], true, "{result}");
+        assert_eq!(result["count"], 1);
+        let found = &result["matches"][0];
+        assert_eq!(found["line"], 1);
+        assert_eq!(found["text"], "fn main() {}");
+        // Relative to the working directory, which is the form `read_file`
+        // wants back.
+        let path = found["filepath"].as_str().unwrap();
+        assert!(path.starts_with(&root), "{path}");
+        assert!(path.contains("main.rs"), "{path}");
+    }
+
+    #[test]
+    fn an_absolute_root_still_reports_paths_relative_to_the_working_directory() {
+        // The walk works in whatever it was handed; what comes back has to be
+        // the form `read_file` wants, whichever was used to get there.
+        let root = tree("absolute", &[("a.rs", "needle\n")]);
+        let absolute = std::env::current_dir().unwrap().join(&root);
+        let result = search_files("needle", &absolute.to_string_lossy(), None, None).unwrap();
+        fs::remove_dir_all(&root).ok();
+
+        let path = result["matches"][0]["filepath"].as_str().unwrap();
+        assert!(!Path::new(path).is_absolute(), "{path}");
+        assert!(path.starts_with(&root), "{path}");
+    }
+
+    #[test]
+    fn a_glob_narrows_the_search_to_the_files_it_names() {
+        let root = tree("glob", &[("a.rs", "needle\n"), ("b.txt", "needle\n")]);
+        let result = search_files("needle", &root, Some("*.rs"), None).unwrap();
+        fs::remove_dir_all(&root).ok();
+
+        assert_eq!(result["count"], 1, "{result}");
+        assert!(result["matches"][0]["filepath"]
+            .as_str()
+            .unwrap()
+            .contains("a.rs"));
+    }
+
+    #[test]
+    fn a_search_stops_at_max_results_and_says_there_were_more() {
+        let root = tree("cap", &[("a.txt", &"needle\n".repeat(10))]);
+        let result = search_files("needle", &root, None, Some(3)).unwrap();
+        fs::remove_dir_all(&root).ok();
+
+        assert_eq!(result["count"], 3, "{result}");
+        assert_eq!(
+            result["truncated"], true,
+            "a cut the model can't see is a search it will think was exhaustive"
+        );
+    }
+
+    #[test]
+    fn a_search_does_not_descend_into_the_directories_nobody_greps() {
+        let root = tree(
+            "skip",
+            &[
+                ("src/a.rs", "needle\n"),
+                ("node_modules/b.rs", "needle\n"),
+                ("target/c.rs", "needle\n"),
+                (".git/d.rs", "needle\n"),
+            ],
+        );
+        let result = search_files("needle", &root, None, None).unwrap();
+        fs::remove_dir_all(&root).ok();
+
+        assert_eq!(result["count"], 1, "{result}");
+        assert!(result["matches"][0]["filepath"]
+            .as_str()
+            .unwrap()
+            .contains("a.rs"));
+    }
+
+    #[test]
+    fn a_long_matching_line_is_shortened_rather_than_returned_whole() {
+        let body = format!("{}needle\n", "x".repeat(MAX_MATCH_LINE + 100));
+        let root = tree("long", &[("a.txt", &body)]);
+        let result = search_files("needle", &root, None, None).unwrap();
+        fs::remove_dir_all(&root).ok();
+
+        let text = result["matches"][0]["text"].as_str().unwrap();
+        assert!(text.len() <= MAX_MATCH_LINE + 3, "{}", text.len());
+        assert!(text.ends_with('…'), "{text}");
+    }
+
+    #[test]
+    fn a_search_gives_up_after_walking_too_many_files() {
+        // The ceiling that replaced a path bound: what makes an enormous
+        // search bad is the walking, not where it started.
+        let root = tree(
+            "walked",
+            &[
+                ("a.txt", "needle\n"),
+                ("b.txt", "needle\n"),
+                ("c.txt", "needle\n"),
+                ("d.txt", "needle\n"),
+            ],
+        );
+        let regex = regex::Regex::new("needle").unwrap();
+        let found = search_tree(&regex, Path::new(&root), None, 100, 2);
+        fs::remove_dir_all(&root).ok();
+
+        assert_eq!(found.files_searched, 2);
+        assert!(
+            found.truncated,
+            "a search that stopped early has to say so, or it reads as exhaustive"
+        );
+    }
+
+    #[test]
+    fn an_invalid_pattern_is_handed_back_rather_than_raised() {
+        // The model wrote it and the model can fix it, which it can only do
+        // if the refusal reaches it as a result instead of an error.
+        let result = search_files("(unclosed", ".", None, None).unwrap();
+
+        assert_eq!(result["success"], false, "{result}");
+        assert!(
+            result["error"]
+                .as_str()
+                .unwrap()
+                .contains("Invalid pattern"),
+            "{result}"
+        );
+    }
+
+    #[test]
+    fn wildcards_match_the_shapes_a_glob_is_asked_for() {
+        assert!(wildcard_match("*.rs", "main.rs"));
+        assert!(wildcard_match("*", "anything"));
+        assert!(wildcard_match("Cargo.*", "Cargo.toml"));
+        assert!(wildcard_match("*test*", "my_test_file.rs"));
+        assert!(wildcard_match("a?c", "abc"));
+
+        assert!(!wildcard_match("*.rs", "main.rst"));
+        assert!(!wildcard_match("*.rs", "rs"));
+        assert!(!wildcard_match("a?c", "ac"));
+        assert!(!wildcard_match("Cargo.*", "cargo.toml"));
     }
 
     #[test]
