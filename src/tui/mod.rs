@@ -415,6 +415,9 @@ fn enter() -> Result<Tui> {
     // Without this, a terminal delivers a paste as plain keystrokes, and
     // any embedded newline reads as a real Enter — submitting each pasted
     // line as its own message instead of landing in the input box as text.
+    // It only covers Unix: crossterm reads decoded console records on
+    // Windows and emits no paste event there, which is what
+    // `is_pasted_newline` is left to catch.
     // Mouse capture is what lets the scroll wheel move the transcript
     // instead of the terminal's own (unrelated) native scrollback.
     execute!(
@@ -550,6 +553,9 @@ async fn run_screens(
     // and the ticker below decides when to spend a frame. Keystrokes are not
     // coalesced: typing has to feel immediate.
     let mut stale = false;
+    // When the last keypress arrived, so a bare Enter can be told apart from
+    // a pasted newline — see `is_pasted_newline`.
+    let mut last_key_at: Option<std::time::Instant> = None;
 
     draw(terminal, screen, tick, context.selection)?;
 
@@ -563,7 +569,16 @@ async fn run_screens(
         let mut dirty = false;
         match wake {
             Wake::Key(TermEvent::Key(key)) if key.kind == KeyEventKind::Press => {
-                quit = handle_key(context, screen, parked, key).await?;
+                let now = std::time::Instant::now();
+                let since_previous = last_key_at.map(|previous| now - previous);
+                last_key_at = Some(now);
+
+                match screen {
+                    Screen::Chat(chat) if is_pasted_newline(&key, since_previous) => {
+                        chat.app.insert_char('\n');
+                    }
+                    _ => quit = handle_key(context, screen, parked, key).await?,
+                }
                 dirty = true;
             }
             Wake::Key(TermEvent::Paste(text)) => {
@@ -926,6 +941,32 @@ fn handle_mouse_scroll(app: &mut App, mouse: MouseEvent) {
 /// can be treated as "not typing".
 fn is_typed_char(key: &KeyEvent) -> bool {
     !key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
+/// How close together two keypresses have to arrive to count as one burst.
+/// Well under the gap between two keys a person typed, and well over the gap
+/// between two a terminal delivered from the same paste.
+const PASTE_BURST: Duration = Duration::from_millis(10);
+
+/// Whether a bare Enter is a newline inside a paste rather than someone
+/// asking to send.
+///
+/// Bracketed paste is what normally answers this — a paste arrives whole, as
+/// [`TermEvent::Paste`], and never reaches the key handler at all. But
+/// crossterm only parses the bracketing on Unix: its Windows event source
+/// reads decoded console records, and emits no `Paste` event whatever the
+/// terminal supports, so a paste there arrives as ordinary keystrokes with a
+/// real Enter at every line break. Timing is all that separates them, and a
+/// terminal delivers a whole paste in one burst: an Enter that lands within
+/// [`PASTE_BURST`] of the previous key was pasted, not pressed.
+///
+/// Alt-Enter and Shift-Enter already mean "newline" and are left alone.
+fn is_pasted_newline(key: &KeyEvent, since_previous: Option<Duration>) -> bool {
+    key.code == KeyCode::Enter
+        && !key
+            .modifiers
+            .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT)
+        && since_previous.is_some_and(|gap| gap < PASTE_BURST)
 }
 
 /// Answers a pending approval. Shared by the chord and by `/allow`, `/deny` —
@@ -1421,6 +1462,52 @@ mod tests {
             KeyCode::Char('v'),
             KeyModifiers::CONTROL
         )));
+    }
+
+    #[test]
+    fn an_enter_in_a_burst_is_a_pasted_newline() {
+        // Windows has no bracketed paste to lean on, so a pasted line break
+        // arrives as a real Enter right behind the character before it.
+        assert!(is_pasted_newline(
+            &key(KeyCode::Enter, KeyModifiers::empty()),
+            Some(Duration::from_micros(200))
+        ));
+    }
+
+    #[test]
+    fn an_enter_after_a_pause_still_sends() {
+        // Nobody types a character and an Enter a tenth of a second apart by
+        // accident, and this is the case that must keep working: the message
+        // has to go when it is asked to.
+        assert!(!is_pasted_newline(
+            &key(KeyCode::Enter, KeyModifiers::empty()),
+            Some(Duration::from_millis(100))
+        ));
+        // The very first keypress of a session has nothing to compare to.
+        assert!(!is_pasted_newline(
+            &key(KeyCode::Enter, KeyModifiers::empty()),
+            None
+        ));
+    }
+
+    #[test]
+    fn a_newline_chord_in_a_burst_is_left_to_its_own_handler() {
+        // Alt-Enter and Shift-Enter already insert a newline, so they must
+        // not be diverted — they would insert the same character twice.
+        for modifier in [KeyModifiers::ALT, KeyModifiers::SHIFT] {
+            assert!(!is_pasted_newline(
+                &key(KeyCode::Enter, modifier),
+                Some(Duration::from_micros(200))
+            ));
+        }
+    }
+
+    #[test]
+    fn a_typed_character_in_a_burst_is_not_a_newline() {
+        assert!(!is_pasted_newline(
+            &key(KeyCode::Char('a'), KeyModifiers::empty()),
+            Some(Duration::from_micros(200))
+        ));
     }
 
     #[test]

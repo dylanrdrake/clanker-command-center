@@ -867,6 +867,9 @@ impl App {
     /// per-character delivery is what let a pasted newline be read as a
     /// real Enter and submit each line as its own message; bracketed paste
     /// (enabled around the event loop) is what routes it here instead.
+    /// Windows has no bracketed paste to route with, so a paste still
+    /// arrives as keystrokes there and the event loop spots its newlines by
+    /// how fast they land.
     pub fn paste(&mut self, text: &str) {
         let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
         self.input.insert_str(self.cursor, &normalized);
