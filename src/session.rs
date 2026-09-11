@@ -622,8 +622,14 @@ impl ChatSession {
         // Computed from the folded-away messages rather than stored beside
         // the summary: they are still here, since nothing is ever deleted,
         // and deriving it keeps one source of truth for what got carried.
-        let folded = &self.messages[..self.compacted_seq.min(self.messages.len())];
-        let preamble = crate::compact::summary_message(summary, &crate::compact::carried(folded));
+        // The whole history, with the seam alongside it: only what is before
+        // the seam gets carried, but a write anywhere can invalidate a read
+        // that is — including one in the tail this is about to send.
+        let seam = self.compacted_seq.min(self.messages.len());
+        let preamble = crate::compact::summary_message(
+            summary,
+            &crate::compact::carried(&self.messages, seam),
+        );
         match messages.first_mut() {
             Some(first) => {
                 let said = first.content.take().unwrap_or_default();
@@ -1256,6 +1262,64 @@ mod tests {
             "the code was summarized away: {body}"
         );
         assert!(body.ends_with("what now"), "{body}");
+    }
+
+    #[test]
+    fn a_carried_read_goes_stale_when_the_write_is_in_the_kept_tail() {
+        let mut session = memory_session();
+        // The hole this closes: the staleness check only saw the folded
+        // span, so a file read before the seam and edited after it was still
+        // carried verbatim — a copy the file no longer agrees with, which an
+        // edit would then be made against.
+        session.push_user("read it".to_string());
+        session.push(crate::client::ChatMessage {
+            role: "assistant".to_string(),
+            tool_calls: Some(vec![crate::client::ToolCall {
+                id: "c1".to_string(),
+                call_type: "function".to_string(),
+                function: crate::client::FunctionCall {
+                    name: "read_file".to_string(),
+                    arguments: serde_json::json!({"filepath": "src/parser.rs"}).to_string(),
+                },
+            }]),
+            ..Default::default()
+        });
+        session.push(crate::client::ChatMessage {
+            role: "tool".to_string(),
+            content: Some(
+                serde_json::json!({
+                    "success": true, "content": "STALE TEXT", "lines": 1,
+                    "total_lines": 1, "offset": 1, "last_line": 1, "truncated": false
+                })
+                .to_string(),
+            ),
+            tool_call_id: Some("c1".to_string()),
+            ..Default::default()
+        });
+        session.push_user("now change it".to_string());
+        session
+            .set_compaction(4, "they read the parser".to_string())
+            .unwrap();
+
+        // The write lands AFTER the seam, in the kept tail.
+        session.push(crate::client::ChatMessage {
+            role: "assistant".to_string(),
+            tool_calls: Some(vec![crate::client::ToolCall {
+                id: "c2".to_string(),
+                call_type: "function".to_string(),
+                function: crate::client::FunctionCall {
+                    name: "replace_in_file".to_string(),
+                    arguments: serde_json::json!({"filepath": "src/parser.rs"}).to_string(),
+                },
+            }]),
+            ..Default::default()
+        });
+
+        let body = session.request_messages()[0].content.clone().unwrap();
+        assert!(
+            !body.contains("STALE TEXT"),
+            "a read folded away, then written to in the kept tail, is still carried verbatim"
+        );
     }
 
     #[test]

@@ -102,6 +102,9 @@ pub struct Carried {
     /// Where in the folded span it came from, so the carried items stay in
     /// the order the conversation put them in.
     at: usize,
+    /// The file this came from, for a read. `None` for a block someone
+    /// wrote, which belongs to no file.
+    path: Option<String>,
     /// What to say about it before reproducing it, for a file read. `None`
     /// for a block someone wrote, which speaks for itself.
     label: Option<String>,
@@ -184,25 +187,18 @@ fn read_result(result: &str) -> Option<(String, Option<String>)> {
 /// carried message is carried in every request from here on and exemption
 /// without a ceiling would reintroduce exactly the growth compaction exists
 /// to stop. What does not fit is named rather than paraphrased.
-pub fn carried(folded: &[ChatMessage]) -> Vec<Carried> {
-    let calls = calls_by_id(folded);
+pub fn carried(messages: &[ChatMessage], seam: usize) -> Vec<Carried> {
+    let calls = calls_by_id(messages);
     let mut found: Vec<Carried> = Vec::new();
     // The most recent read of each path, and the most recent write to it.
     let mut reads: HashMap<String, usize> = HashMap::new();
     let mut writes: HashMap<String, usize> = HashMap::new();
 
-    for (at, message) in folded.iter().enumerate() {
-        if is_pasted_code(message) {
-            if let Some(body) = message.content.clone() {
-                found.push(Carried {
-                    at,
-                    label: None,
-                    body,
-                });
-            }
-            continue;
-        }
-
+    for (at, message) in messages.iter().enumerate() {
+        // Writes are collected from the whole history, not just the folded
+        // part. A file read before the seam and written to after it is
+        // precisely the stale copy this has to catch, and the write that
+        // invalidates it is not in the folded span at all.
         if let Some(calls) = &message.tool_calls {
             for call in calls {
                 if matches!(
@@ -214,6 +210,36 @@ pub fn carried(folded: &[ChatMessage]) -> Vec<Carried> {
                     }
                 }
             }
+        }
+
+        // Only the folded part is carried. Anything past the seam is already
+        // in the request as itself, and carrying it would send it twice —
+        // but a read out there still has to be noticed, because it
+        // supersedes an older carried copy of the same file.
+        if at >= seam {
+            if let Some(call) = message
+                .tool_call_id
+                .as_deref()
+                .and_then(|id| calls.get(id))
+                .filter(|call| call.function.name == "read_file")
+            {
+                if let Some(path) = called_path(call) {
+                    reads.insert(path, at);
+                }
+            }
+            continue;
+        }
+
+        if is_pasted_code(message) {
+            if let Some(body) = message.content.clone() {
+                found.push(Carried {
+                    at,
+                    path: None,
+                    label: None,
+                    body,
+                });
+            }
+            continue;
         }
 
         if message.role != "tool" {
@@ -233,28 +259,41 @@ pub fn carried(folded: &[ChatMessage]) -> Vec<Carried> {
         let Some((body, range)) = read_result(result) else {
             continue;
         };
+        reads.insert(path.clone(), at);
 
-        // Supersedes any earlier read of the same file.
-        if let Some(previous) = reads.insert(path.clone(), at) {
-            found.retain(|carried| carried.at != previous);
-        }
         let label = match &range {
             Some(range) => format!("{path}, {range}, as read earlier"),
             None => format!("{path}, as read earlier"),
         };
         found.push(Carried {
             at,
+            path: Some(path),
             label: Some(label),
             body,
         });
     }
 
-    // A read the file no longer agrees with becomes a pointer to the file.
+    // Two ways a carried read stops being worth carrying, and they want
+    // different answers.
+    //
+    // A newer read of the same file makes this one simply redundant: that
+    // read is either carried in its place or sitting in the kept tail, and
+    // either way the request already holds a better copy. Drop it.
+    //
+    // A write with no read after it means the copy is one the file no longer
+    // agrees with, and there is nothing better in the request to replace it.
+    // That one is worse than nothing — an edit made against it lands on code
+    // that is no longer there — so it becomes a pointer saying to look again.
+    found.retain(|carried| {
+        let Some(path) = &carried.path else {
+            return true;
+        };
+        !reads.get(path).is_some_and(|read| *read > carried.at)
+    });
     for carried in &mut found {
-        let Some(label) = &carried.label else {
+        let Some(path) = carried.path.clone() else {
             continue;
         };
-        let path = label.split(',').next().unwrap_or_default().to_string();
         if writes
             .get(&path)
             .is_some_and(|written| *written > carried.at)
@@ -772,7 +811,7 @@ mod tests {
         ];
 
         assert_eq!(
-            bodies(&carried(&folded)),
+            bodies(&carried(&folded, folded.len())),
             vec!["here is the failing bit:\n```rs\nfn f() {}\n```"],
             "a pasted block has no file behind it — summarize it and it is gone"
         );
@@ -789,9 +828,9 @@ mod tests {
         ];
 
         assert!(
-            carried(&folded).is_empty(),
+            carried(&folded, folded.len()).is_empty(),
             "{:?}",
-            bodies(&carried(&folded))
+            bodies(&carried(&folded, folded.len()))
         );
     }
 
@@ -802,7 +841,7 @@ mod tests {
             read_back("c1", "fn parse() { todo!() }"),
         ];
 
-        let kept = carried(&folded);
+        let kept = carried(&folded, folded.len());
         assert_eq!(bodies(&kept), vec!["fn parse() { todo!() }"]);
         assert!(
             kept[0].label.as_ref().unwrap().contains("src/parser.rs"),
@@ -823,7 +862,10 @@ mod tests {
             read_back("c2", "the new text"),
         ];
 
-        assert_eq!(bodies(&carried(&folded)), vec!["the new text"]);
+        assert_eq!(
+            bodies(&carried(&folded, folded.len())),
+            vec!["the new text"]
+        );
     }
 
     #[test]
@@ -836,9 +878,61 @@ mod tests {
         ];
 
         assert_eq!(
-            bodies(&carried(&folded)),
+            bodies(&carried(&folded, folded.len())),
             vec!["parser text", "lexer text"],
             "carried in the order the conversation put them in"
+        );
+    }
+
+    #[test]
+    fn a_read_past_the_seam_supersedes_the_carried_copy_of_the_same_file() {
+        // The newer read is in the kept tail, so the request already holds a
+        // better copy. Carrying the older one sends the file twice and sends
+        // the worse one first.
+        let messages = [
+            tool_call("c1", "read_file", "src/parser.rs"),
+            read_back("c1", "the old text"),
+            message("user", "and again"),
+            tool_call("c2", "read_file", "src/parser.rs"),
+            read_back("c2", "the new text"),
+        ];
+
+        assert!(
+            carried(&messages, 3).is_empty(),
+            "{:?}",
+            bodies(&carried(&messages, 3))
+        );
+    }
+
+    #[test]
+    fn a_write_past_the_seam_turns_a_carried_read_into_a_pointer() {
+        let messages = [
+            tool_call("c1", "read_file", "src/parser.rs"),
+            read_back("c1", "the text before the edit"),
+            message("user", "change it"),
+            tool_call("c2", "replace_in_file", "src/parser.rs"),
+        ];
+
+        let kept = carried(&messages, 3);
+        assert_eq!(kept.len(), 1);
+        assert!(
+            !kept[0].body.contains("before the edit"),
+            "{}",
+            kept[0].body
+        );
+        assert!(kept[0].body.contains("Read it again"), "{}", kept[0].body);
+    }
+
+    #[test]
+    fn nothing_past_the_seam_is_carried_since_it_is_already_being_sent() {
+        let messages = [
+            message("user", "before"),
+            message("user", "after:\n```rs\nfn f() {}\n```"),
+        ];
+
+        assert!(
+            carried(&messages, 1).is_empty(),
+            "a block in the kept tail would be sent twice"
         );
     }
 
@@ -853,7 +947,7 @@ mod tests {
             message("tool", "File updated"),
         ];
 
-        let kept = carried(&folded);
+        let kept = carried(&folded, folded.len());
         assert_eq!(kept.len(), 1);
         assert!(
             !kept[0].body.contains("the text before the edit"),
@@ -874,7 +968,10 @@ mod tests {
             read_back("c2", "the text after the edit"),
         ];
 
-        assert_eq!(bodies(&carried(&folded)), vec!["the text after the edit"]);
+        assert_eq!(
+            bodies(&carried(&folded, folded.len())),
+            vec!["the text after the edit"]
+        );
     }
 
     #[test]
@@ -883,7 +980,7 @@ mod tests {
         failed.content = Some(r#"{"success":false,"error":"File not found: x"}"#.to_string());
         let folded = [tool_call("c1", "read_file", "nowhere.rs"), failed];
 
-        assert!(carried(&folded).is_empty());
+        assert!(carried(&folded, folded.len()).is_empty());
     }
 
     #[test]
@@ -896,7 +993,7 @@ mod tests {
             .map(|n| message("user", &format!("{n}\n{block}")))
             .collect();
 
-        let kept = carried(&folded);
+        let kept = carried(&folded, folded.len());
         let bytes: usize = kept.iter().map(|item| item.body.len()).sum();
 
         assert!(bytes <= EXEMPT_BUDGET, "{bytes} bytes carried");
@@ -934,6 +1031,7 @@ mod tests {
     fn the_preamble_reproduces_what_it_carried() {
         let block = Carried {
             at: 0,
+            path: None,
             label: None,
             body: "```rs\nfn f() {}\n```".to_string(),
         };
