@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A newer push to the same branch makes the run already in flight pointless.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: Format and lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: lint
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      # Denied rather than reported: a warning nobody is blocked by is a
+      # warning that accumulates.
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    name: Test (${{ matrix.os }})
+    strategy:
+      # One platform failing should still report the others, since which of
+      # them broke is most of the diagnosis.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}
+
+      # The whole point of the matrix. Linux is what development already
+      # covers; macOS and Windows are the platforms this ships binaries for
+      # and cannot otherwise be tested on until release day. Note that the
+      # shell tests pass on Windows because the runner image carries Git for
+      # Windows' utilities on PATH, so `cmd` finds `cat` and `sleep` — a bare
+      # Windows box without them would fail those, and that is a property of
+      # the environment rather than of the code.
+      - name: Run tests
+        run: cargo test
