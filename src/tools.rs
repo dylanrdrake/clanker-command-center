@@ -964,13 +964,25 @@ fn shorten_match(line: &str) -> String {
 /// reads; the walk itself works in canonical absolute paths because the
 /// sandbox bound does.
 fn display_path(path: &Path) -> String {
-    std::env::current_dir()
-        .ok()
-        .and_then(|cwd| cwd.canonicalize().ok())
-        .and_then(|cwd| path.strip_prefix(cwd).ok().map(Path::to_path_buf))
-        .unwrap_or_else(|| path.to_path_buf())
-        .to_string_lossy()
-        .to_string()
+    let Ok(cwd) = std::env::current_dir() else {
+        return path.to_string_lossy().to_string();
+    };
+
+    // Both shapes of the working directory, because on Windows they differ:
+    // `canonicalize` returns an extended-length path (`\\?\C:\project`)
+    // while `current_dir` returns a plain one (`C:\project`), and the walk
+    // hands back whichever shape it was pointed at. Stripping only the
+    // canonical form left every Windows path absolute while every other
+    // platform got a relative one. `sandbox_bound` documents hitting exactly
+    // this; this repeated it.
+    let canonical = cwd.canonicalize().unwrap_or_else(|_| cwd.clone());
+    for base in [&cwd, &canonical] {
+        if let Ok(relative) = path.strip_prefix(base) {
+            return relative.to_string_lossy().to_string();
+        }
+    }
+
+    path.to_string_lossy().to_string()
 }
 
 /// Searches file contents for `pattern`, returning the matching lines rather
