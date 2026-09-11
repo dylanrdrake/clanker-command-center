@@ -619,7 +619,11 @@ impl ChatSession {
             .cloned()
             .collect();
 
-        let preamble = crate::compact::summary_message(summary);
+        // Computed from the folded-away messages rather than stored beside
+        // the summary: they are still here, since nothing is ever deleted,
+        // and deriving it keeps one source of truth for what got carried.
+        let folded = &self.messages[..self.compacted_seq.min(self.messages.len())];
+        let preamble = crate::compact::summary_message(summary, &crate::compact::carried(folded));
         match messages.first_mut() {
             Some(first) => {
                 let said = first.content.take().unwrap_or_default();
@@ -1227,6 +1231,31 @@ mod tests {
         // The transcript is untouched: compaction changes what is sent, not
         // what was said.
         assert_eq!(session.messages().len(), 3);
+    }
+
+    #[test]
+    fn code_folded_away_is_still_sent_verbatim() {
+        // The guarantee: a block someone pasted has no file behind it, so a
+        // summary of it is a loss with no way back. It survives the seam
+        // whole rather than being described.
+        let mut session = memory_session();
+        session.push_user("look at this:\n```rs\nfn broken() { todo!() }\n```".to_string());
+        session.push_assistant("I see it".to_string());
+        session.push_user("what now".to_string());
+        session
+            .set_compaction(2, "they looked at a broken function".to_string())
+            .unwrap();
+
+        let sent = session.request_messages();
+        assert_eq!(sent.len(), 1, "still one message, so alternation holds");
+        let body = sent[0].content.as_deref().unwrap();
+
+        assert!(body.contains("they looked at a broken function"), "{body}");
+        assert!(
+            body.contains("fn broken() { todo!() }"),
+            "the code was summarized away: {body}"
+        );
+        assert!(body.ends_with("what now"), "{body}");
     }
 
     #[test]

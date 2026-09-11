@@ -1100,6 +1100,29 @@ little headroom that the prompt crossed the threshold again almost
 immediately. The turn in progress is never folded either way, however large
 it grows.
 
+Code is not summarized. A summary of a function is not a function, and a
+paraphrased identifier is useless, so code comes through a compaction
+verbatim or not at all. Two kinds, carried on different terms.
+
+A fenced code block in something you or the model wrote into the conversation
+is carried because nothing else holds it.
+
+A file read is carried because a coding conversation is mostly file reads,
+and a compacted clanker left with prose descriptions of the code it was
+working on is a worse assistant than one left with the code. Two rules keep
+that affordable and honest. Only the **most recent read of each file** is
+kept — a conversation that opens the same file six times needs the sixth, and
+dropping the earlier five is deduplication rather than judgement. And a read
+is dropped when a **write to the same file came after it**, leaving a line
+saying so in its place, because that is a copy the file no longer agrees
+with. The order of the conversation answers staleness without going and
+looking at the disk.
+
+What is carried is bounded like everything else here, at a sixth of the
+threshold, with the most recent kept first. Code that doesn't fit is named
+rather than paraphrased. The one gap is code pasted without fences, which
+nothing can tell apart from prose.
+
 Compaction runs *between* turns, never during one. Automatic compaction
 happens after you press Enter and before the request goes out, which is why a
 long clanker sometimes pauses to say what it is doing; `Ctrl-C` cancels it

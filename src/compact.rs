@@ -15,8 +15,10 @@
 //! further up, not a hole.
 
 use anyhow::Result;
+use std::collections::HashMap;
+use std::path::Path;
 
-use crate::client::{ChatMessage, Client};
+use crate::client::{ChatMessage, Client, ToolCall};
 
 /// How many of the most recent user turns are never folded away.
 ///
@@ -60,6 +62,227 @@ const TAIL_FRACTION: u64 = 4;
 /// most of the budget once the threshold is lowered.
 const SUMMARY_FRACTION: u64 = 8;
 
+/// The most verbatim content a compacted request may carry past the seam.
+///
+/// A fixed size rather than a fraction of the threshold, unlike the two
+/// budgets above, because this one is applied by
+/// [`crate::session::ChatSession::request_messages`] — which is asked what
+/// the history looks like, not what it may cost, and has no threshold in
+/// hand. Sized as a sixth of the default threshold at [`BYTES_PER_TOKEN`],
+/// so a clanker on default settings spends a little over half the threshold
+/// on the summary, the kept tail and this together, and still has room to
+/// grow before it meets the line again.
+///
+/// The number here most worth revisiting. File reads are the bulk of a
+/// coding conversation rather than an occasional pasted block, so this
+/// decides how much of the code a compacted clanker was working on it still
+/// has in front of it, and only real use will say whether a sixth is right.
+const EXEMPT_BUDGET: usize = (crate::config::DEFAULT_COMPACT_AT / 6) as usize * BYTES_PER_TOKEN;
+
+/// Whether a message is a fenced code block someone wrote into the
+/// conversation, as opposed to one a tool went and fetched.
+///
+/// The two are carried on different terms. This kind has no other copy
+/// anywhere, so it is carried whole and shown to the compactor whole. A file
+/// read is carried too, but by [`carried`] and under rules of its own, since
+/// the file behind it can change and the read can be superseded.
+///
+/// The gap this leaves is code pasted without fences, which nothing here can
+/// tell apart from prose.
+fn is_pasted_code(message: &ChatMessage) -> bool {
+    matches!(message.role.as_str(), "user" | "assistant")
+        && message
+            .content
+            .as_deref()
+            .is_some_and(|content| content.contains("```"))
+}
+
+/// One thing carried past the seam verbatim rather than summarized.
+pub struct Carried {
+    /// Where in the folded span it came from, so the carried items stay in
+    /// the order the conversation put them in.
+    at: usize,
+    /// What to say about it before reproducing it, for a file read. `None`
+    /// for a block someone wrote, which speaks for itself.
+    label: Option<String>,
+    body: String,
+}
+
+/// Every tool call in the span, keyed by the id its result will carry.
+fn calls_by_id(folded: &[ChatMessage]) -> HashMap<&str, &ToolCall> {
+    folded
+        .iter()
+        .filter_map(|message| message.tool_calls.as_ref())
+        .flatten()
+        .map(|call| (call.id.as_str(), call))
+        .collect()
+}
+
+/// A path in the one form two mentions of the same file can be compared in.
+///
+/// Lexical only. Canonicalizing would need the file to still exist, and this
+/// runs over a history that may name files since deleted — so a read spelled
+/// through a symlink and a write spelled directly still miss each other, and
+/// a read that should have been dropped as stale gets carried.
+fn same_file(path: &str) -> String {
+    let raw = Path::new(path);
+    if raw.is_absolute() {
+        return raw.to_string_lossy().to_string();
+    }
+    std::env::current_dir()
+        .map(|cwd| cwd.join(raw).to_string_lossy().to_string())
+        .unwrap_or_else(|_| path.to_string())
+}
+
+/// The `filepath` a tool call was given, if it named one.
+fn called_path(call: &ToolCall) -> Option<String> {
+    let arguments: serde_json::Value = serde_json::from_str(&call.function.arguments).ok()?;
+    Some(same_file(arguments.get("filepath")?.as_str()?))
+}
+
+/// What a `read_file` result is worth carrying: the text it returned, and
+/// how much of the file that was when it wasn't all of it.
+fn read_result(result: &str) -> Option<(String, Option<String>)> {
+    let value: serde_json::Value = serde_json::from_str(result).ok()?;
+    if !value.get("success")?.as_bool()? {
+        return None;
+    }
+    let content = value.get("content")?.as_str()?.to_string();
+
+    let number = |key: &str| value.get(key).and_then(serde_json::Value::as_u64);
+    let range = match (number("offset"), number("last_line"), number("total_lines")) {
+        (Some(first), Some(last), Some(total)) if first > 1 || last < total => {
+            Some(format!("lines {first}-{last} of {total}"))
+        }
+        _ => None,
+    };
+
+    Some((content, range))
+}
+
+/// Which of the folded-away messages are carried verbatim instead, in the
+/// order the conversation put them in.
+///
+/// Two kinds, on different terms.
+///
+/// A fenced block someone wrote into the conversation is carried because
+/// nothing else holds it. A summary of a function is not a function, and a
+/// paraphrased identifier is useless.
+///
+/// A file read is carried because a coding conversation is mostly file
+/// reads, and a compacted clanker left with prose descriptions of the code
+/// it was working on is a worse assistant than one left with the code. Two
+/// rules keep that affordable and honest. Only the most recent read of each
+/// path is kept, since a conversation that opens the same file six times
+/// needs the sixth — dropping the earlier five is deduplication rather than
+/// judgment, and it removes most of the volume. And a read is dropped when a
+/// write to the same path comes after it, leaving a pointer in its place,
+/// because that is a copy the file no longer agrees with. Ordering in the
+/// history answers staleness without a single filesystem call.
+///
+/// Bounded by [`EXEMPT_BUDGET`] with the newest kept first, because a
+/// carried message is carried in every request from here on and exemption
+/// without a ceiling would reintroduce exactly the growth compaction exists
+/// to stop. What does not fit is named rather than paraphrased.
+pub fn carried(folded: &[ChatMessage]) -> Vec<Carried> {
+    let calls = calls_by_id(folded);
+    let mut found: Vec<Carried> = Vec::new();
+    // The most recent read of each path, and the most recent write to it.
+    let mut reads: HashMap<String, usize> = HashMap::new();
+    let mut writes: HashMap<String, usize> = HashMap::new();
+
+    for (at, message) in folded.iter().enumerate() {
+        if is_pasted_code(message) {
+            if let Some(body) = message.content.clone() {
+                found.push(Carried {
+                    at,
+                    label: None,
+                    body,
+                });
+            }
+            continue;
+        }
+
+        if let Some(calls) = &message.tool_calls {
+            for call in calls {
+                if matches!(
+                    call.function.name.as_str(),
+                    "write_file" | "replace_in_file"
+                ) {
+                    if let Some(path) = called_path(call) {
+                        writes.insert(path, at);
+                    }
+                }
+            }
+        }
+
+        if message.role != "tool" {
+            continue;
+        }
+        let Some(call) = message
+            .tool_call_id
+            .as_deref()
+            .and_then(|id| calls.get(id))
+            .filter(|call| call.function.name == "read_file")
+        else {
+            continue;
+        };
+        let (Some(path), Some(result)) = (called_path(call), message.content.as_deref()) else {
+            continue;
+        };
+        let Some((body, range)) = read_result(result) else {
+            continue;
+        };
+
+        // Supersedes any earlier read of the same file.
+        if let Some(previous) = reads.insert(path.clone(), at) {
+            found.retain(|carried| carried.at != previous);
+        }
+        let label = match &range {
+            Some(range) => format!("{path}, {range}, as read earlier"),
+            None => format!("{path}, as read earlier"),
+        };
+        found.push(Carried {
+            at,
+            label: Some(label),
+            body,
+        });
+    }
+
+    // A read the file no longer agrees with becomes a pointer to the file.
+    for carried in &mut found {
+        let Some(label) = &carried.label else {
+            continue;
+        };
+        let path = label.split(',').next().unwrap_or_default().to_string();
+        if writes
+            .get(&path)
+            .is_some_and(|written| *written > carried.at)
+        {
+            carried.label = None;
+            carried.body = format!(
+                "[{path} was read earlier and written to since, so what it said then is \
+                 not what it says now. Read it again if you need it.]"
+            );
+        }
+    }
+
+    // Newest first while the budget lasts, then back into conversation order.
+    found.sort_by_key(|carried| std::cmp::Reverse(carried.at));
+    let mut bytes = 0;
+    found.retain(|carried| {
+        let cost = carried.body.len() + carried.label.as_ref().map_or(0, String::len);
+        if bytes + cost > EXEMPT_BUDGET {
+            return false;
+        }
+        bytes += cost;
+        true
+    });
+    found.sort_by_key(|carried| carried.at);
+
+    found
+}
+
 /// Bytes per token, for judging a span without a tokenizer.
 ///
 /// Deliberately low. Tool-call JSON and file dumps tokenize far worse than
@@ -100,9 +323,11 @@ tried and abandoned.
 steps.
 
 Leave out pleasantries, restated instructions, and the full text of anything \
-already captured by its result. Do not answer the conversation, continue it, \
-or address the user: produce only the summary. Do not invent anything that is \
-not in the transcript.";
+already captured by its result. Code blocks and recent file reads are carried \
+alongside your summary verbatim, so refer to them rather than reproducing \
+them — a second, paraphrased copy is worse than none. Do not answer the \
+conversation, continue it, or address the user: produce only the summary. Do \
+not invent anything that is not in the transcript.";
 
 /// How a summary is framed when it goes back out as part of a request.
 ///
@@ -112,14 +337,34 @@ not in the transcript.";
 /// reasons documented there. The framing matters either way: without it the
 /// model reads a summary of its own conversation as something the user just
 /// wrote to it.
-pub fn summary_message(summary: &str) -> String {
-    format!(
+pub fn summary_message(summary: &str, carried: &[Carried]) -> String {
+    let mut out = format!(
         "[The earlier part of this conversation has been compacted to save \
          context. What follows is a summary of it, standing in for the \
          messages themselves; the conversation then continues verbatim from \
-         after that point.]\n\n{summary}\n\n[End of summary. The conversation \
-         resumes here.]"
-    )
+         after that point.]\n\n{summary}"
+    );
+
+    // Inside the preamble rather than as messages of their own, for the same
+    // reason the summary is: the seam lands on a user message, so anything
+    // added in front of it would put two user messages in a row and a
+    // provider requiring strict alternation would reject the request.
+    if !carried.is_empty() {
+        out.push_str(
+            "\n\n[These earlier messages are reproduced verbatim rather than \
+             summarized, because nothing else holds what they contain:]",
+        );
+        for item in carried {
+            out.push_str("\n\n");
+            if let Some(label) = &item.label {
+                out.push_str(&format!("[{label}:]\n"));
+            }
+            out.push_str(&item.body);
+        }
+    }
+
+    out.push_str("\n\n[End of summary. The conversation resumes here.]");
+    out
 }
 
 /// Where the history can be cut, given that `from` messages are already
@@ -265,7 +510,16 @@ fn render(message: &ChatMessage) -> String {
 
     if let Some(content) = message.content.as_deref() {
         if !content.trim().is_empty() {
-            out.push_str(&truncate(content));
+            // A message that will be carried verbatim is shown to the
+            // compactor whole. Handing it the head and tail of a code block
+            // with the middle cut out, and asking it to summarize the
+            // discussion around that, is how the discussion gets summarized
+            // wrongly.
+            if is_pasted_code(message) {
+                out.push_str(content);
+            } else {
+                out.push_str(&truncate(content));
+            }
             out.push('\n');
         }
     }
@@ -438,6 +692,47 @@ mod tests {
         }
     }
 
+    /// An assistant turn calling one file tool, as the model would make it.
+    fn tool_call(id: &str, name: &str, path: &str) -> ChatMessage {
+        ChatMessage {
+            role: "assistant".to_string(),
+            tool_calls: Some(vec![ToolCall {
+                id: id.to_string(),
+                call_type: "function".to_string(),
+                function: crate::client::FunctionCall {
+                    name: name.to_string(),
+                    arguments: serde_json::json!({ "filepath": path }).to_string(),
+                },
+            }]),
+            ..Default::default()
+        }
+    }
+
+    /// The result `read_file` hands back for a whole small file.
+    fn read_back(id: &str, content: &str) -> ChatMessage {
+        ChatMessage {
+            role: "tool".to_string(),
+            content: Some(
+                serde_json::json!({
+                    "success": true,
+                    "content": content,
+                    "lines": 1,
+                    "total_lines": 1,
+                    "offset": 1,
+                    "last_line": 1,
+                    "truncated": false,
+                })
+                .to_string(),
+            ),
+            tool_call_id: Some(id.to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn bodies(carried: &[Carried]) -> Vec<&str> {
+        carried.iter().map(|item| item.body.as_str()).collect()
+    }
+
     #[test]
     fn the_tail_estimate_counts_reasoning_that_goes_back_on_the_wire() {
         let plain = [message("assistant", "done")];
@@ -467,6 +762,198 @@ mod tests {
             "the plain-text reasoning is display only and is never sent, so \
              counting it would move the seam for tokens nobody pays for"
         );
+    }
+
+    #[test]
+    fn a_fenced_block_is_carried_rather_than_summarized() {
+        let folded = [
+            message("user", "here is the failing bit:\n```rs\nfn f() {}\n```"),
+            message("assistant", "I see it"),
+        ];
+
+        assert_eq!(
+            bodies(&carried(&folded)),
+            vec!["here is the failing bit:\n```rs\nfn f() {}\n```"],
+            "a pasted block has no file behind it — summarize it and it is gone"
+        );
+    }
+
+    #[test]
+    fn prose_and_tool_results_are_not_carried() {
+        let folded = [
+            message("user", "what does this do?"),
+            message("assistant", "it parses the header"),
+            // However much code a read returns, the file is still on disk.
+            // A stale copy of it is worse than the path it came from.
+            message("tool", "```rs\nfn parse() {}\n```"),
+        ];
+
+        assert!(
+            carried(&folded).is_empty(),
+            "{:?}",
+            bodies(&carried(&folded))
+        );
+    }
+
+    #[test]
+    fn a_file_read_is_carried_with_the_path_it_came_from() {
+        let folded = [
+            tool_call("c1", "read_file", "src/parser.rs"),
+            read_back("c1", "fn parse() { todo!() }"),
+        ];
+
+        let kept = carried(&folded);
+        assert_eq!(bodies(&kept), vec!["fn parse() { todo!() }"]);
+        assert!(
+            kept[0].label.as_ref().unwrap().contains("src/parser.rs"),
+            "the code is useless without knowing which file it is: {:?}",
+            kept[0].label
+        );
+    }
+
+    #[test]
+    fn only_the_latest_read_of_a_file_is_carried() {
+        // A conversation that opens the same file six times needs the sixth.
+        // Dropping the earlier ones is deduplication, not judgement.
+        let folded = [
+            tool_call("c1", "read_file", "src/parser.rs"),
+            read_back("c1", "the old text"),
+            message("user", "change it"),
+            tool_call("c2", "read_file", "src/parser.rs"),
+            read_back("c2", "the new text"),
+        ];
+
+        assert_eq!(bodies(&carried(&folded)), vec!["the new text"]);
+    }
+
+    #[test]
+    fn two_different_files_are_both_carried() {
+        let folded = [
+            tool_call("c1", "read_file", "src/parser.rs"),
+            read_back("c1", "parser text"),
+            tool_call("c2", "read_file", "src/lexer.rs"),
+            read_back("c2", "lexer text"),
+        ];
+
+        assert_eq!(
+            bodies(&carried(&folded)),
+            vec!["parser text", "lexer text"],
+            "carried in the order the conversation put them in"
+        );
+    }
+
+    #[test]
+    fn a_read_becomes_a_pointer_once_the_file_is_written_to() {
+        // The staleness case, answered by the order of the history rather
+        // than by going and looking at the disk.
+        let folded = [
+            tool_call("c1", "read_file", "src/parser.rs"),
+            read_back("c1", "the text before the edit"),
+            tool_call("c2", "replace_in_file", "src/parser.rs"),
+            message("tool", "File updated"),
+        ];
+
+        let kept = carried(&folded);
+        assert_eq!(kept.len(), 1);
+        assert!(
+            !kept[0].body.contains("the text before the edit"),
+            "a copy the file no longer agrees with was carried: {}",
+            kept[0].body
+        );
+        assert!(kept[0].body.contains("src/parser.rs"), "{}", kept[0].body);
+        assert!(kept[0].body.contains("Read it again"), "{}", kept[0].body);
+    }
+
+    #[test]
+    fn a_read_after_a_write_is_carried_as_it_stands() {
+        // The write came first, so the read already reflects it.
+        let folded = [
+            tool_call("c1", "replace_in_file", "src/parser.rs"),
+            message("tool", "File updated"),
+            tool_call("c2", "read_file", "src/parser.rs"),
+            read_back("c2", "the text after the edit"),
+        ];
+
+        assert_eq!(bodies(&carried(&folded)), vec!["the text after the edit"]);
+    }
+
+    #[test]
+    fn a_read_that_failed_is_not_carried() {
+        let mut failed = read_back("c1", "");
+        failed.content = Some(r#"{"success":false,"error":"File not found: x"}"#.to_string());
+        let folded = [tool_call("c1", "read_file", "nowhere.rs"), failed];
+
+        assert!(carried(&folded).is_empty());
+    }
+
+    #[test]
+    fn carrying_is_bounded_so_exemption_cannot_undo_compaction() {
+        // A carried message is carried in every request from here on, so
+        // without a ceiling this would reintroduce the growth compaction
+        // exists to stop.
+        let block = format!("```\n{}\n```", "x".repeat(5_000));
+        let folded: Vec<ChatMessage> = (0..20)
+            .map(|n| message("user", &format!("{n}\n{block}")))
+            .collect();
+
+        let kept = carried(&folded);
+        let bytes: usize = kept.iter().map(|item| item.body.len()).sum();
+
+        assert!(bytes <= EXEMPT_BUDGET, "{bytes} bytes carried");
+        assert!(kept.len() < folded.len(), "something had to be dropped");
+        assert!(
+            kept.last().unwrap().body.starts_with("19"),
+            "the newest blocks are the ones worth keeping"
+        );
+    }
+
+    #[test]
+    fn the_compactor_is_shown_a_carried_message_whole() {
+        // The render ceiling exists so a file dump can't blow the
+        // compactor's own context. It must not apply to a block that is
+        // being kept verbatim anyway: summarizing the discussion around a
+        // code block with its middle cut out is how that discussion gets
+        // summarized wrongly.
+        let block = format!("```\n{}\n```", "x".repeat(MAX_RENDERED * 2));
+        let rendered = render(&message("user", &block));
+
+        assert!(rendered.contains(&block), "the block was cut");
+        assert!(
+            !rendered.contains("bytes omitted"),
+            "the ceiling still applied"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_message_is_still_cut_at_the_render_ceiling() {
+        let rendered = render(&message("user", &"x".repeat(MAX_RENDERED * 2)));
+        assert!(rendered.contains("bytes omitted"), "{rendered:.120}");
+    }
+
+    #[test]
+    fn the_preamble_reproduces_what_it_carried() {
+        let block = Carried {
+            at: 0,
+            label: None,
+            body: "```rs\nfn f() {}\n```".to_string(),
+        };
+        let preamble = summary_message("They fixed the build.", &[block]);
+
+        assert!(preamble.contains("They fixed the build."));
+        assert!(preamble.contains("fn f() {}"), "{preamble}");
+        assert!(
+            preamble.contains("verbatim rather than"),
+            "the model has to be told which part is not a summary"
+        );
+        // Still one message. The seam lands on a user message, so anything
+        // added in front of it would put two in a row.
+        assert!(preamble.ends_with("[End of summary. The conversation resumes here.]"));
+    }
+
+    #[test]
+    fn a_preamble_with_nothing_to_carry_is_unchanged() {
+        let preamble = summary_message("They fixed the build.", &[]);
+        assert!(!preamble.contains("verbatim rather than"), "{preamble}");
     }
 
     #[test]
