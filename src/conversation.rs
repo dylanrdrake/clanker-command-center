@@ -296,24 +296,6 @@ pub fn command_for(submission: &Submission) -> Option<Command> {
 /// doesn't name one.
 const SHELL_TIMEOUT: u64 = 30;
 
-/// How much of a command's output is worth keeping. A test run that scrolls
-/// for a thousand lines shouldn't become permanent context — the same reason
-/// `web_fetch` caps a page.
-const MAX_SHELL_OUTPUT: usize = 32 * 1024;
-
-/// Cuts output to `MAX_SHELL_OUTPUT`, keeping the *end* — a failing build
-/// says what went wrong on its last lines, not its first.
-fn truncate_output(output: &str) -> String {
-    if output.len() <= MAX_SHELL_OUTPUT {
-        return output.to_string();
-    }
-    let mut start = output.len() - MAX_SHELL_OUTPUT;
-    while start < output.len() && !output.is_char_boundary(start) {
-        start += 1;
-    }
-    format!("[earlier output truncated]\n{}", &output[start..])
-}
-
 /// How long [`Conversation::leave`] waits for a worker to finish before
 /// deciding it has a turn to run and leaving it to it. Long enough for the
 /// handful of writes a worker with nothing to do makes on its way out,
@@ -1105,7 +1087,7 @@ impl Worker {
             };
             let _ = events.send(Event::ShellFinished {
                 command,
-                output: truncate_output(&output),
+                output: crate::tools::truncate_output(&output),
                 exit_code,
             });
         });
@@ -1369,28 +1351,6 @@ impl AgentUi for ChannelUi {
 #[cfg(test)]
 mod tests {
 
-    #[test]
-    fn truncating_output_keeps_the_end() {
-        // A failing build says what went wrong on its last lines.
-        let short = "all good";
-        assert_eq!(truncate_output(short), short);
-
-        let long = format!(
-            "{}error[E0308]: mismatched types",
-            "x".repeat(MAX_SHELL_OUTPUT)
-        );
-        let cut = truncate_output(&long);
-        assert!(cut.len() <= MAX_SHELL_OUTPUT + 40, "{}", cut.len());
-        assert!(cut.contains("E0308"), "the end survived");
-        assert!(cut.starts_with("[earlier output truncated]"));
-    }
-
-    #[test]
-    fn truncating_never_splits_a_character() {
-        let body = "é".repeat(MAX_SHELL_OUTPUT);
-        let cut = truncate_output(&body);
-        assert!(cut.contains('é'));
-    }
     use super::*;
 
     /// Every submission that changes session state, paired with the command

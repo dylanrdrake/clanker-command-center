@@ -397,6 +397,34 @@ fn to_readable_text(body: &str) -> String {
 }
 
 /// Runs a command the way `$` does: the same execution, timeout and killing
+/// How much of a command's output is worth keeping. A test run that scrolls
+/// for a thousand lines shouldn't become permanent context — the same reason
+/// `web_fetch` caps a page and `read_file` caps a read.
+///
+/// Applied per stream, so a command that fills both gets twice this at
+/// worst. That is the right way round: `stderr` is usually where the answer
+/// is, and spending a budget on `stdout` first would cut it off.
+pub const MAX_SHELL_OUTPUT: usize = 32 * 1024;
+
+/// Cuts output to [`MAX_SHELL_OUTPUT`], keeping the *end* — a failing build
+/// says what went wrong on its last lines, not its first. That is the
+/// opposite of what `read_file` does, and deliberately so: a file is read
+/// from the top, while a command is read from the bottom.
+///
+/// Public because the `$` command in the TUI truncates the joined streams
+/// again for its own box, having already been handed two that are each
+/// bounded.
+pub fn truncate_output(output: &str) -> String {
+    if output.len() <= MAX_SHELL_OUTPUT {
+        return output.to_string();
+    }
+    let mut start = output.len() - MAX_SHELL_OUTPUT;
+    while start < output.len() && !output.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("[earlier output truncated]\n{}", &output[start..])
+}
+
 /// as the agent's own tool, but handed back as text rather than as a tool
 /// result.
 ///
@@ -1277,11 +1305,15 @@ async fn run_terminal_command(
     let stderr = stderr_task.await.unwrap_or_default();
     let exit_code = status.code().unwrap_or(-1);
 
+    // Bounded here rather than at either caller. The `$` command in the TUI
+    // used to be the only path that capped anything, which left the agent's
+    // own tool call — the one whose result is carried in every request after
+    // it — handing back a whole `cargo build` unbounded.
     Ok(json!({
         "success": status.success(),
         "exit_code": exit_code,
-        "stdout": String::from_utf8_lossy(&stdout).to_string(),
-        "stderr": String::from_utf8_lossy(&stderr).to_string()
+        "stdout": truncate_output(&String::from_utf8_lossy(&stdout)),
+        "stderr": truncate_output(&String::from_utf8_lossy(&stderr))
     }))
 }
 
@@ -1878,6 +1910,51 @@ mod tests {
         );
         let result = write_file(&escape, "x", "write", true).unwrap();
         assert_eq!(result["success"], false, "{result}");
+    }
+
+    #[test]
+    fn truncating_output_keeps_the_end() {
+        // A failing build says what went wrong on its last lines.
+        let short = "all good";
+        assert_eq!(truncate_output(short), short);
+
+        let long = format!(
+            "{}error[E0308]: mismatched types",
+            "x".repeat(MAX_SHELL_OUTPUT)
+        );
+        let cut = truncate_output(&long);
+        assert!(cut.len() <= MAX_SHELL_OUTPUT + 40, "{}", cut.len());
+        assert!(cut.contains("E0308"), "the end survived");
+        assert!(cut.starts_with("[earlier output truncated]"));
+    }
+
+    #[test]
+    fn truncating_output_never_splits_a_character() {
+        let body = "é".repeat(MAX_SHELL_OUTPUT);
+        let cut = truncate_output(&body);
+        assert!(cut.contains('é'));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_tool_call_is_bounded_the_same_way_the_shell_box_is() {
+        // The gap this closes: the `$` command truncated its own output and
+        // the agent's tool call did not, so the one result that gets carried
+        // in every later request was the unbounded one.
+        let result = run_terminal_command("yes x | head -n 20000", None, 30)
+            .await
+            .unwrap();
+
+        let stdout = result["stdout"].as_str().unwrap();
+        assert!(
+            stdout.len() <= MAX_SHELL_OUTPUT + 40,
+            "{} bytes came back",
+            stdout.len()
+        );
+        assert!(
+            stdout.starts_with("[earlier output truncated]"),
+            "{stdout:.80}"
+        );
     }
 
     #[tokio::test]
