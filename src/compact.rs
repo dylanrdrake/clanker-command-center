@@ -45,6 +45,21 @@ const KEEP_RECENT_TURNS: usize = 2;
 /// below it.
 const TAIL_FRACTION: u64 = 4;
 
+/// What fraction of the compaction threshold a summary may occupy.
+///
+/// Nothing used to bound this at all, and a summary is the one part of a
+/// compacted request that compounds: each one is fed back in whole to write
+/// the next, so a compactor inclined to write at length raises the floor a
+/// little on every folding. The tail budget can't see it happen, because the
+/// summary is deliberately left out of [`estimated_tokens`] — it isn't
+/// written yet when the seam is chosen.
+///
+/// An eighth, so the summary and the kept tail together take under half the
+/// threshold and a compacted clanker has somewhere to grow. Taken as a
+/// fraction for the same reason [`TAIL_FRACTION`] is: a fixed size would be
+/// most of the budget once the threshold is lowered.
+const SUMMARY_FRACTION: u64 = 8;
+
 /// Bytes per token, for judging a span without a tokenizer.
 ///
 /// Deliberately low. Tool-call JSON and file dumps tokenize far worse than
@@ -160,6 +175,40 @@ fn tail_budget(compact_at: Option<u64>) -> u64 {
     compact_at.unwrap_or(crate::config::DEFAULT_COMPACT_AT) / TAIL_FRACTION
 }
 
+/// How many tokens a summary may occupy, from the same threshold, falling
+/// back the same way.
+fn summary_budget(compact_at: Option<u64>) -> u64 {
+    compact_at.unwrap_or(crate::config::DEFAULT_COMPACT_AT) / SUMMARY_FRACTION
+}
+
+/// Cuts a summary that overran its budget, keeping the start.
+///
+/// The backstop, not the mechanism: what is supposed to keep a summary short
+/// is asking for it short, and this is what happens when that is ignored. The
+/// start is kept because a summary is written to be read from the top, and
+/// because the alternative — refusing it — throws away the compaction and
+/// leaves the clanker to meet the threshold again on its next turn with
+/// nothing to show for the call.
+///
+/// Said out loud in the text, because a summary that stops mid-sentence with
+/// no explanation reads as a summary of a conversation that stopped there.
+fn truncate_summary(summary: String, budget: u64) -> String {
+    let cap = budget as usize * BYTES_PER_TOKEN;
+    if summary.len() <= cap {
+        return summary;
+    }
+
+    let mut end = cap;
+    while end > 0 && !summary.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}\n\n[The summary ran past what a compacted request can carry and \
+         was cut here.]",
+        &summary[..end]
+    )
+}
+
 /// Roughly what a span costs, for choosing between candidate seams.
 ///
 /// An estimate is enough here and a tokenizer would not be worth carrying:
@@ -167,6 +216,14 @@ fn tail_budget(compact_at: Option<u64>) -> u64 {
 /// out moves it by at most one turn. The summary that will sit in front of
 /// the tail isn't counted — it isn't written yet when this runs — which is
 /// part of why [`BYTES_PER_TOKEN`] errs on the small side.
+///
+/// Everything counted here is something that goes back on the wire, which is
+/// why `reasoning_details` is in and `reasoning` is out: the details carry
+/// the signature a provider needs echoed back and are serialized into every
+/// follow-up request, while the plain-text reasoning beside them is display
+/// only and never sent. Leaving the details out undercounted the tail of
+/// exactly the clankers that grow fastest — a reasoning model working
+/// through a long run of tool calls.
 fn estimated_tokens(messages: &[ChatMessage]) -> u64 {
     let bytes: usize = messages
         .iter()
@@ -177,6 +234,9 @@ fn estimated_tokens(messages: &[ChatMessage]) -> u64 {
                         .iter()
                         .map(|call| call.function.name.len() + call.function.arguments.len())
                         .sum::<usize>()
+                })
+                + message.reasoning_details.as_ref().map_or(0, |blocks| {
+                    blocks.iter().map(|block| block.to_string().len()).sum()
                 })
         })
         .sum();
@@ -313,11 +373,25 @@ pub async fn compact(
     model: &str,
     previous: Option<&str>,
     span: &[ChatMessage],
+    compact_at: Option<u64>,
 ) -> Result<Compacted> {
+    let budget = summary_budget(compact_at);
+    // Asked for, then enforced. The asking is what usually works and what
+    // keeps the summary coherent; `truncate_summary` below is only there for
+    // a compactor that ignores it. Words rather than tokens because that is
+    // the unit a model can actually aim at, at roughly three quarters of one
+    // per token.
+    let instruction = format!(
+        "{COMPACTION_PROMPT}\n\nKeep the summary under about {} words. It is \
+         carried in every request from here on, and folded into the next \
+         summary after this one, so length here is paid for repeatedly.",
+        budget * 3 / 4
+    );
+
     let messages = vec![
         ChatMessage {
             role: "system".to_string(),
-            content: Some(COMPACTION_PROMPT.to_string()),
+            content: Some(instruction),
             ..Default::default()
         },
         ChatMessage {
@@ -346,7 +420,10 @@ pub async fn compact(
         anyhow::bail!("The compactor returned an empty summary, so nothing was compacted");
     }
 
-    Ok(Compacted { summary, tokens })
+    Ok(Compacted {
+        summary: truncate_summary(summary, budget),
+        tokens,
+    })
 }
 
 #[cfg(test)]
@@ -359,6 +436,80 @@ mod tests {
             content: Some(content.to_string()),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn the_tail_estimate_counts_reasoning_that_goes_back_on_the_wire() {
+        let plain = [message("assistant", "done")];
+
+        let mut with_details = message("assistant", "done");
+        with_details.reasoning_details = Some(vec![
+            serde_json::json!({"type": "thinking", "text": "x".repeat(3_000)}),
+        ]);
+
+        assert!(
+            estimated_tokens(&[with_details]) > estimated_tokens(&plain) + 900,
+            "reasoning_details is serialized into every follow-up request, so a \
+             tail full of it is not the size this used to report"
+        );
+    }
+
+    #[test]
+    fn the_tail_estimate_ignores_reasoning_that_never_leaves_the_process() {
+        let plain = [message("assistant", "done")];
+
+        let mut with_prose = message("assistant", "done");
+        with_prose.reasoning = Some("x".repeat(3_000));
+
+        assert_eq!(
+            estimated_tokens(&[with_prose]),
+            estimated_tokens(&plain),
+            "the plain-text reasoning is display only and is never sent, so \
+             counting it would move the seam for tokens nobody pays for"
+        );
+    }
+
+    #[test]
+    fn a_summary_within_its_budget_is_left_alone() {
+        let summary = "They fixed the build.".to_string();
+        assert_eq!(truncate_summary(summary.clone(), 1_000), summary);
+    }
+
+    #[test]
+    fn a_summary_over_its_budget_is_cut_and_says_that_it_was() {
+        // A summary that stops mid-sentence with no explanation reads as a
+        // summary of a conversation that stopped there.
+        let budget = 100;
+        let long = "word ".repeat(1_000);
+        let cut = truncate_summary(long, budget);
+
+        assert!(cut.starts_with("word word"), "the start survived");
+        assert!(cut.contains("was cut here"), "{cut:.200}");
+        assert!(
+            cut.len() < budget as usize * BYTES_PER_TOKEN + 100,
+            "{} bytes",
+            cut.len()
+        );
+    }
+
+    #[test]
+    fn cutting_a_summary_never_splits_a_character() {
+        let cut = truncate_summary("é".repeat(1_000), 10);
+        let body = cut.split("\n\n").next().unwrap();
+        assert!(body.chars().all(|c| c == 'é'), "{body:?}");
+    }
+
+    #[test]
+    fn both_budgets_follow_the_threshold_rather_than_a_fixed_number() {
+        // A threshold lowered to 10k has to lower what sits under it, or
+        // there is no configuration of this that ever gets below the line.
+        assert!(summary_budget(Some(10_000)) < summary_budget(Some(60_000)));
+        assert!(summary_budget(Some(60_000)) < tail_budget(Some(60_000)));
+        assert_eq!(
+            summary_budget(None),
+            summary_budget(Some(crate::config::DEFAULT_COMPACT_AT)),
+            "a clanker with automatic compaction off still reaches this by /compact"
+        );
     }
 
     #[test]
@@ -596,7 +747,7 @@ mod tests {
         .await;
 
         let span = [message("user", "the build is broken")];
-        let compacted = compact(&client_for(base_url), "small/model", None, &span)
+        let compacted = compact(&client_for(base_url), "small/model", None, &span, None)
             .await
             .unwrap();
 
@@ -607,6 +758,12 @@ mod tests {
         let request = served.await.unwrap();
         assert!(request.contains("small/model"), "sent to the compactor");
         assert!(request.contains("the build is broken"), "carries the span");
+        // Asking is what keeps a summary short and coherent; the truncation
+        // is only the backstop for a compactor that ignores the ask.
+        assert!(
+            request.contains("words"),
+            "the request has to say how long the summary may be"
+        );
     }
 
     #[tokio::test]
@@ -620,7 +777,7 @@ mod tests {
         .await;
 
         let span = [message("user", "something")];
-        let error = compact(&client_for(base_url), "small/model", None, &span)
+        let error = compact(&client_for(base_url), "small/model", None, &span, None)
             .await
             .expect_err("an empty summary is not a compaction");
         assert!(error.to_string().contains("empty summary"), "{error}");

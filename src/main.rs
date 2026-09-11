@@ -1645,7 +1645,7 @@ async fn compact_cli(
     println!("{}", ui::compacting_notice(model).blue());
     let span = session.messages()[from..cut].to_vec();
     let previous = session.compaction_summary().map(str::to_string);
-    let compacted = compact::compact(client, model, previous.as_deref(), &span).await?;
+    let compacted = compact::compact(client, model, previous.as_deref(), &span, compact_at).await?;
 
     // Spent on this clanker's behalf, so it counts against this clanker.
     if let Err(e) = session.add_tokens(compacted.tokens as i64) {

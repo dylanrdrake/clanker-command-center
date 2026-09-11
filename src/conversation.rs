@@ -955,8 +955,11 @@ impl Worker {
         let client = Arc::clone(&self.client);
         let span = self.session.messages()[from..cut].to_vec();
         let previous = self.session.compaction_summary().map(str::to_string);
+        // The same threshold the seam was chosen against, so the summary is
+        // sized against the number it will be measured beside.
+        let compact_at = self.compact_at;
         let mut task = tokio::spawn(async move {
-            crate::compact::compact(&client, &model, previous.as_deref(), &span).await
+            crate::compact::compact(&client, &model, previous.as_deref(), &span, compact_at).await
         });
 
         let outcome = loop {

@@ -1108,6 +1108,14 @@ typed while a turn is running is refused rather than queued — a turn that
 finished into a different conversation than it started in would be worse than
 a command you have to retype.
 
+The summary is bounded too, at an eighth of the threshold. It is the one part
+of a compacted request that compounds, because each summary is fed back in
+whole to write the next, so a compactor inclined to write at length would
+raise the floor a little on every folding — and the bound on the kept tail
+can't see that happen, since the summary isn't written yet when the cut is
+chosen. The compactor is told how long it may be, and a summary that overruns
+anyway is cut short and says so.
+
 The summary costs tokens too, and they are counted against the clanker like
 any other request. That is deliberate: the feature's claim is that it's
 cheaper *overall*, and a compaction that didn't show up in the total would
