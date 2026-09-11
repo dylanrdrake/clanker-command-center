@@ -1368,6 +1368,15 @@ fn draw_settings(frame: &mut Frame, area: Rect, app: &App, tick: usize) {
         // launch screen puts on the row, so the two agree on what waiting
         // looks like.
         spans.push(Span::styled(" ? waiting ", Style::new().yellow().bold()));
+    } else if app.compacting {
+        // Checked before `busy` because it is never true at the same time —
+        // compaction runs before the turn starts — and because saying
+        // "working" through it would name the wrong wait. Blue, matching the
+        // notice the transcript shows beside it.
+        spans.push(Span::styled(
+            format!(" {} compacting ", busy_frame(tick)),
+            Style::new().blue(),
+        ));
     } else if app.busy {
         spans.push(Span::styled(
             format!(" {} working ", busy_frame(tick)),
@@ -2353,9 +2362,26 @@ mod tests {
 
     /// Renders through a caller-owned cache, so a second call exercises the
     /// warm path that `render_to_string` never reaches.
+    /// Renders at a chosen tick, for the animated parts of the screen.
+    fn render_to_string_at(app: &App, width: u16, height: u16, tick: usize) -> String {
+        render_with_tick(app, &mut TranscriptCache::default(), width, height, tick)
+    }
+
     fn render_with(app: &App, cache: &mut TranscriptCache, width: u16, height: u16) -> String {
+        render_with_tick(app, cache, width, height, 0)
+    }
+
+    fn render_with_tick(
+        app: &App,
+        cache: &mut TranscriptCache,
+        width: u16,
+        height: u16,
+        tick: usize,
+    ) -> String {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        terminal.draw(|frame| draw(frame, app, cache, 0)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, app, cache, tick))
+            .unwrap();
         let buffer = terminal.backend().buffer().clone();
         (0..buffer.area.height)
             .map(|y| {
@@ -2942,6 +2968,26 @@ mod tests {
         app.effort_level = Some("high".to_string());
         let out = render_to_string(&app, 80, 20);
         assert!(out.contains("high"), "{out}");
+    }
+
+    #[test]
+    fn the_status_row_says_compacting_and_animates_while_it_runs() {
+        let mut app = sample_app();
+        app.compacting = true;
+
+        let out = render_to_string(&app, 80, 20);
+        assert!(out.contains("compacting"), "{out}");
+        assert!(
+            !out.contains("ready"),
+            "a clanker mid-compaction is not ready: {out}"
+        );
+
+        // The frame is a function of the tick, so two ticks apart draw
+        // differently — which is what makes it read as movement rather than
+        // as a stuck screen.
+        let first = render_to_string_at(&app, 80, 20, 0);
+        let later = render_to_string_at(&app, 80, 20, 7);
+        assert_ne!(first, later, "the indicator never moved");
     }
 
     #[test]

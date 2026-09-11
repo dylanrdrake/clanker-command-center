@@ -166,6 +166,11 @@ pub struct App {
     /// Byte index of the cursor within `input`. Kept on a char boundary.
     pub cursor: usize,
     pub busy: bool,
+    /// Whether a compaction is in flight. Separate from [`Self::busy`], which
+    /// means a turn: compaction happens *before* the turn it makes room for,
+    /// so nothing is busy while it runs and without this the screen sits
+    /// still through the one pause that has nothing streaming out of it.
+    pub compacting: bool,
     /// Messages typed while a turn was running, in the order they will be
     /// taken. Held as the text rather than a count so the box above the
     /// prompt can show what is waiting; the count is just its length.
@@ -305,6 +310,7 @@ impl App {
             input: String::new(),
             cursor: 0,
             busy: false,
+            compacting: false,
             pending: VecDeque::new(),
             pending_approval: None,
             pending_shell: None,
@@ -372,6 +378,9 @@ impl App {
             }
             Event::Busy(busy) => {
                 self.busy = busy;
+                // The turn a compaction made room for has started, so the
+                // compaction is over whatever else was or wasn't announced.
+                self.compacting = false;
                 if !busy {
                     // A turn can end mid-stream (cancelled, or a failure
                     // after partial text); make sure nothing is left marked
@@ -402,6 +411,7 @@ impl App {
                 });
             }
             Event::Cancelled => {
+                self.compacting = false;
                 self.finish_streaming();
                 self.pending.clear();
                 self.pending_approval = None;
@@ -526,14 +536,19 @@ impl App {
             // Compaction is a pause with nothing streaming out of it, so it
             // announces itself and then says how it went — the same shape as
             // any other notice, rather than a status line of its own.
-            Event::Compacting { model } => self
-                .transcript
-                .push(TranscriptItem::Notice(crate::ui::compacting_notice(&model))),
-            Event::Compacted { folded } => self
-                .transcript
-                .push(TranscriptItem::Notice(crate::ui::compacted_notice(folded))),
+            Event::Compacting { model } => {
+                self.compacting = true;
+                self.transcript
+                    .push(TranscriptItem::Notice(crate::ui::compacting_notice(&model)));
+            }
+            Event::Compacted { folded } => {
+                self.compacting = false;
+                self.transcript
+                    .push(TranscriptItem::Notice(crate::ui::compacted_notice(folded)));
+            }
             Event::CompactionSkipped { reason } => {
-                self.transcript.push(TranscriptItem::Notice(reason))
+                self.compacting = false;
+                self.transcript.push(TranscriptItem::Notice(reason));
             }
             Event::Agent(event) => self.apply_agent(event),
         }
@@ -582,6 +597,9 @@ impl App {
                 self.pending_approval = None;
             }
             AgentEvent::Error { message } => {
+                // A compaction that failed reports the failure and nothing
+                // else, so this is the only thing that ends it.
+                self.compacting = false;
                 self.finish_streaming();
                 self.transcript.push(TranscriptItem::Error(message));
             }
@@ -1480,6 +1498,53 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn compacting_is_marked_so_the_screen_can_animate_through_it() {
+        // The pause compaction makes is the one with nothing streaming out
+        // of it, and it happens before the turn starts — so `busy` is false
+        // and without this the screen sits still through it.
+        let mut a = App::new("m".to_string(), None, "id".to_string());
+        assert!(!a.compacting);
+
+        a.apply(Event::Compacting {
+            model: "small/model".into(),
+        });
+        assert!(a.compacting);
+        assert!(!a.busy, "compaction runs before the turn it makes room for");
+
+        a.apply(Event::Compacted { folded: 4 });
+        assert!(!a.compacting);
+    }
+
+    #[test]
+    fn every_way_a_compaction_ends_stops_the_animation() {
+        // Each of these is the only thing a given path emits, so missing one
+        // leaves the status line animating forever.
+        let ends: Vec<Event> = vec![
+            Event::Compacted { folded: 2 },
+            Event::CompactionSkipped {
+                reason: "nothing to fold".into(),
+            },
+            Event::Cancelled,
+            Event::Busy(true),
+            Event::Agent(AgentEvent::Error {
+                message: "Compaction failed: 500".into(),
+            }),
+        ];
+
+        for end in ends {
+            let mut a = App::new("m".to_string(), None, "id".to_string());
+            a.apply(Event::Compacting {
+                model: "small/model".into(),
+            });
+            assert!(a.compacting);
+
+            let label = format!("{end:?}");
+            a.apply(end);
+            assert!(!a.compacting, "{label} left it compacting");
+        }
     }
 
     #[test]

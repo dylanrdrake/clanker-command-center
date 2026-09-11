@@ -1125,7 +1125,9 @@ nothing can tell apart from prose.
 
 Compaction runs *between* turns, never during one. Automatic compaction
 happens after you press Enter and before the request goes out, which is why a
-long clanker sometimes pauses to say what it is doing; `Ctrl-C` cancels it
+long clanker sometimes pauses to say what it is doing. The status row says
+`compacting` and animates while it runs, so the pause reads as work rather
+than as a frozen screen; `Ctrl-C` cancels it
 like anything else, and the message you typed stays where it is. A `/compact`
 typed while a turn is running is refused rather than queued — a turn that
 finished into a different conversation than it started in would be worse than

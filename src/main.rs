@@ -1645,7 +1645,13 @@ async fn compact_cli(
     println!("{}", ui::compacting_notice(model).blue());
     let span = session.messages()[from..cut].to_vec();
     let previous = session.compaction_summary().map(str::to_string);
-    let compacted = compact::compact(client, model, previous.as_deref(), &span, compact_at).await?;
+    // A compaction is a full round trip with the whole folded span in it, so
+    // on a long history it is the longest silence `clank` ever produces. The
+    // same spinner a turn gets, for the same reason.
+    let spinner = Spinner::start("Compacting...");
+    let compacted = compact::compact(client, model, previous.as_deref(), &span, compact_at).await;
+    spinner.stop().await;
+    let compacted = compacted?;
 
     // Spent on this clanker's behalf, so it counts against this clanker.
     if let Err(e) = session.add_tokens(compacted.tokens as i64) {

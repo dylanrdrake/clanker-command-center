@@ -612,7 +612,7 @@ async fn run_screens(
                 // A `$` command run outside a turn leaves `busy` false, so
                 // without the second half its spinner sits on one frame.
                 if matches!(screen, Screen::Chat(chat)
-                    if chat.app.busy || chat.app.pending_shell.is_some())
+                    if chat.app.busy || chat.app.compacting || chat.app.pending_shell.is_some())
                 {
                     tick = tick.wrapping_add(1);
                     dirty = true;

@@ -396,6 +396,13 @@ resending them.
   compactor model, then one saying how many messages are now sent as a
   summary. **The transcript must be unchanged** — scroll up and every
   original message is still there, word for word.
+- While that runs, the status row reads `compacting` and the braille cells
+  move. It must not read `ready`, and it must not sit on one frame: the
+  compaction happens before the turn starts, so nothing else is animating it.
+  It must also go back to `ready` afterwards — including when the compaction
+  fails, is cancelled with `Ctrl-C`, or finds nothing to fold.
+- A message typed during a compaction is queued and says so, and settings
+  commands like `/model` still apply while it runs.
 - Send a message after that → the reply should show the model still knows
   what was discussed before the seam. The 🪙 total should have gone up by the
   compaction's own cost as well as the turn's.
