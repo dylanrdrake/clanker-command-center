@@ -183,6 +183,30 @@ pub fn open_db() -> Result<Connection> {
         );
 
         CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, seq);
+
+        -- One row per request a session made, which is the only place the
+        -- shape of its growth is recorded. `sessions.prompt_tokens` holds
+        -- the last measurement and is overwritten every turn, so from that
+        -- column alone a compacted history and a short one look identical.
+        -- Here they don't: ordered by `id`, these rows are the curve, and
+        -- the drop where a compaction landed is visible in it.
+        --
+        -- Not on `messages`: a turn makes as many requests as it takes tool
+        -- calls, so there is no message to hang most of these on, and a
+        -- cancelled turn still made requests worth counting.
+        CREATE TABLE IF NOT EXISTS request_usage (
+            id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id         TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+            prompt_tokens      INTEGER NOT NULL DEFAULT 0,
+            cached_tokens      INTEGER NOT NULL DEFAULT 0,
+            cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+            total_tokens       INTEGER NOT NULL DEFAULT 0,
+            cost               REAL NOT NULL DEFAULT 0,
+            created_at         TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_request_usage_session
+            ON request_usage(session_id, id);
         ",
     )?;
 
@@ -226,6 +250,13 @@ pub fn open_db() -> Result<Connection> {
         "INTEGER NOT NULL DEFAULT 0",
     )?;
     ensure_column(&conn, "sessions", "compaction_summary", "TEXT")?;
+    // What a request actually cost, as the provider priced it. Added after
+    // `request_usage` itself, so a row written before this existed reads
+    // back as `0` — indistinguishable from a genuinely free request, which
+    // is why nothing reasons from it. It is here to check the token counts
+    // against: those only become money by way of rates read somewhere else,
+    // and this is the figure that says whether those rates were right.
+    ensure_column(&conn, "request_usage", "cost", "REAL NOT NULL DEFAULT 0")?;
     // The prompt size the provider reported for the session's last request,
     // which is what the compaction threshold is compared against. `0` on a
     // row written before this existed, read as unmeasured rather than as a
@@ -558,6 +589,41 @@ pub fn set_session_prompt_tokens(
         "UPDATE sessions SET prompt_tokens = ?1 WHERE id = ?2",
         params![prompt_tokens, session_id],
     )?;
+    Ok(())
+}
+
+/// Appends one row per request a turn made, in the order they were made.
+///
+/// Append-only and never read by anything that runs a turn — this is the
+/// record that makes a claim about caching or compaction checkable after the
+/// fact, not an input to either. A turn whose requests all reported nothing
+/// writes nothing.
+pub fn append_request_usage(
+    conn: &Connection,
+    session_id: &str,
+    requests: &[crate::client::Usage],
+) -> Result<()> {
+    if requests.is_empty() {
+        return Ok(());
+    }
+    let ts = now();
+    let mut statement = conn.prepare(
+        "INSERT INTO request_usage \
+         (session_id, prompt_tokens, cached_tokens, cache_write_tokens, total_tokens, \
+          cost, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+    )?;
+    for usage in requests {
+        statement.execute(params![
+            session_id,
+            usage.prompt_tokens as i64,
+            usage.cached_tokens() as i64,
+            usage.cache_write_tokens() as i64,
+            usage.total_tokens as i64,
+            usage.cost.unwrap_or(0.0),
+            ts,
+        ])?;
+    }
     Ok(())
 }
 

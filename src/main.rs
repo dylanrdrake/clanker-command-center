@@ -1964,6 +1964,9 @@ async fn cmd_clanker(
                 if let Err(e) = session.set_prompt_tokens(usage.last_prompt()) {
                     eprintln!("{} Failed to save the prompt size: {}", "✗".red(), e);
                 }
+                if let Err(e) = session.record_request_usage(&usage.requests()) {
+                    eprintln!("{} Failed to save per-request usage: {}", "✗".red(), e);
+                }
 
                 if let Err(e) = session.persist_pending() {
                     eprintln!("{} Failed to save message: {}", "✗".red(), e);
@@ -2177,6 +2180,9 @@ async fn cmd_agent(
     session.set_activity(failed.then_some(store::Activity::Failed), None);
     if let Err(e) = session.add_tokens(usage.total() as i64) {
         eprintln!("{} Failed to save token usage: {}", "✗".red(), e);
+    }
+    if let Err(e) = session.record_request_usage(&usage.requests()) {
+        eprintln!("{} Failed to save per-request usage: {}", "✗".red(), e);
     }
 
     // Persisted before the error is returned: the turn's messages are worth

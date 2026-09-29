@@ -16,6 +16,7 @@ CCC is most stable on Linux at the moment!
 - **Persistent clankers** — `clanker`/`tui` conversations are saved to SQLite and resumable across restarts
 - **Token counting** — every clanker keeps a running 🪙 total of what it has spent, in its title row, on the launch screen, and in `/status`
 - **Compaction** — a long clanker folds its older turns into a summary written by a model you pick, so a conversation stops resending everything it has ever said
+- **Prompt caching** — the part of the history that hasn't changed is reused by the provider instead of reprocessed, so a long conversation stops paying full price for what it already said
 - **Secure credential storage** — API keys live in your OS keychain, not a plaintext file
 
 ## Manual Installation
@@ -154,6 +155,79 @@ Compacting resets that measurement, since it described a history that no
 longer exists. The turn after a compaction therefore never compacts again on
 the strength of the size that triggered the first one — it measures the new,
 smaller history and starts from there.
+
+### Prompt caching
+
+Every request carries the whole history, and most of that history is
+byte-for-byte what the last request already sent. Prompt caching asks the
+provider to keep the work it did on that unchanged part and reuse it, instead
+of processing the same tokens again — reads bill at a fraction of the normal
+input rate, and storing a prefix costs a premium once, so it pays for itself
+on the second request of any conversation.
+
+It does **not** make requests smaller. The same tokens go over the wire; they
+just cost less. Compaction is the lever that makes a request smaller, and the
+two work on different axes.
+
+On by default. Set `"cache": false` in `~/.clank/config.json` to turn it off,
+which restores the exact request shape CCC sent before caching existed — worth
+knowing about if `base_url` points at something other than OpenRouter, since a
+marked message's `content` goes out as a block array rather than a string.
+
+Two breakpoints are placed per request: one on the last system message, which
+covers the agent prompt and the tool schemas rendered ahead of it, and one at
+the end of the history, which is what makes the *next* request cheap.
+
+Size is not consulted, which is worth saying because checking it is the obvious
+instinct. Providers each have a minimum prefix they will cache — 512 to 4096
+tokens across current Anthropic models, and not in tier order, so Haiku 4.5 is
+at the top of that range — and below it a breakpoint is ignored. It is ignored
+for free: the same 311-token prefix sent marked and unmarked came back with
+`cache_write_tokens: 0` and cost $0.000652 both times, to the last digit. So
+there is nothing to guard against, and a size floor would only have withheld
+caching on the models whose minimum is *lower* than whatever number got picked.
+
+What does cost something is a marked prefix that nothing ever reads back — that
+pays the ~25% write premium for an entry with no second request to use it. In a
+clanker or a tool loop there is always a next request, so this doesn't arise;
+a genuine one-shot with a large prompt is the case that would want a gate, and
+there isn't one.
+
+Compaction and caching pull against each other, and it's worth knowing which
+way. A cache only ever matches a prefix, and compaction rewrites the front of
+the request — so the turn after a compaction pays full price for everything,
+and only earns the difference back over the turns that follow. Nothing in CCC
+currently schedules around that; see `request_usage` below for how to measure
+it before changing anything.
+
+### Measuring it
+
+Every request a clanker makes writes a row to the `request_usage` table, which
+is the only place the shape of a conversation's growth is recorded —
+`sessions.prompt_tokens` holds just the latest measurement and is overwritten
+each turn.
+
+```bash
+sqlite3 ~/.clank/chats.db \
+  "select prompt_tokens, cached_tokens, cache_write_tokens, cost
+     from request_usage where session_id like 'a29e%' order by id;"
+```
+
+Read down the `prompt_tokens` column to see the history grow and drop where a
+compaction landed. `cost` beside them is what the provider actually charged,
+and it is the only column that isn't a token count needing rates from
+elsewhere to mean anything — the figure to check the others against. Measured
+on two requests sending a byte-identical 1,331-token prompt, one writing the
+prefix and one reading it back, OpenRouter billed $0.003354 and $0.0003088:
+the read cost 91% less. Expect nearer 80% on a real turn, where the reply is
+long enough that output tokens — which caching does nothing for — make up more
+of the bill.
+
+`cached_tokens` is counted *inside* `prompt_tokens`, not
+alongside it, so it says directly what fraction of a request was reused. A run
+of requests with an identical prefix and a `cached_tokens` of zero means
+something upstream is rewriting the prefix — that's the signal to look at,
+since caching fails silently and the only symptom is a larger bill.
 
 #### `max-iterations [value]`
 View or set the persistent default for how many tool-calling iterations `agent` may run before giving up.

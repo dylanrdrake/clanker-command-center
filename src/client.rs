@@ -160,6 +160,17 @@ pub struct ChatRequest {
     /// meaningful alongside `stream`, so it's built and omitted the same way.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream_options: Option<StreamOptions>,
+    /// Which messages carry a prompt-caching breakpoint, as indices into
+    /// `messages`.
+    ///
+    /// Not a field on the wire — `cache_control` has to sit *inside* a
+    /// content block, and `ChatMessage::content` is a plain string that
+    /// nineteen other places read as one. So the marks travel here and
+    /// [`wire_body`] rewrites just those messages' content into block form
+    /// on the way out, which keeps the breakpoint out of the domain type
+    /// entirely. Empty means the body serializes exactly as it always did.
+    #[serde(skip)]
+    pub cache_at: Vec<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -192,6 +203,56 @@ pub struct Usage {
     /// which is why nothing treats a zero as a measurement.
     #[serde(default)]
     pub prompt_tokens: u64,
+    /// How `prompt_tokens` split between what was served from cache and what
+    /// was processed fresh. `None` from a provider that reports no breakdown,
+    /// which is not the same as a breakdown of zeros: the first says nothing
+    /// is known about caching, the second says caching was possible and
+    /// nothing hit.
+    #[serde(default)]
+    pub prompt_tokens_details: Option<PromptTokensDetails>,
+    /// What this request actually cost, as the provider reports it, in the
+    /// account's own currency. `None` from a provider that prices nothing in
+    /// its response.
+    ///
+    /// The one number here that isn't inferred. Everything else is a token
+    /// count that has to be multiplied by rates read somewhere else to mean
+    /// anything, and this is the figure those calculations can be checked
+    /// against — which is the only reason it is worth storing.
+    #[serde(default)]
+    pub cost: Option<f64>,
+}
+
+/// The cache half of a provider's `prompt_tokens` breakdown.
+///
+/// Both numbers are counted *inside* `prompt_tokens`, not alongside it: a
+/// request reporting 40,000 prompt tokens and 38,000 cached did not send
+/// 78,000. This is the field that says whether caching is working at all,
+/// and a run of requests with an identical prefix and `cached_tokens` of
+/// zero means something upstream is rewriting the prefix.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Deserialize)]
+pub struct PromptTokensDetails {
+    /// Served from cache, billed at a fraction of the fresh rate.
+    #[serde(default)]
+    pub cached_tokens: u64,
+    /// Written to cache, billed at a premium over the fresh rate. Small in a
+    /// healthy loop — roughly whatever the last turn appended.
+    #[serde(default)]
+    pub cache_write_tokens: u64,
+}
+
+impl Usage {
+    /// Prompt tokens served from cache, or `0` when the provider said
+    /// nothing about caching.
+    pub fn cached_tokens(&self) -> u64 {
+        self.prompt_tokens_details
+            .map_or(0, |details| details.cached_tokens)
+    }
+
+    /// Prompt tokens written to cache, on the same terms.
+    pub fn cache_write_tokens(&self) -> u64 {
+        self.prompt_tokens_details
+            .map_or(0, |details| details.cache_write_tokens)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -560,13 +621,139 @@ fn request_skeleton(request: &ChatRequest) -> String {
     )
 }
 
+/// Where to put prompt-caching breakpoints for one request.
+///
+/// Two, at the two places a conversation stops changing. The last `system`
+/// message covers the agent prompt and — because a provider renders `tools`
+/// ahead of `system` — the tool schemas with it, which is the fixed
+/// per-request overhead every turn pays. The end of the history covers
+/// everything said so far, so the next turn reads the whole conversation
+/// back instead of reprocessing it.
+///
+/// Both are prefix marks: what gets reused is everything *before* them, and
+/// a mark on the final message is what makes the following request cheap,
+/// not this one. Providers cap breakpoints (Anthropic at four), so two
+/// leaves room.
+///
+/// Size is deliberately not consulted, though it is the obvious thing to
+/// check. Every provider has a minimum prefix it will cache — 512 to 4096
+/// tokens across current Anthropic models, and not in tier order, so Haiku
+/// 4.5 sits at the top of that range — and below it a breakpoint is ignored.
+/// It is ignored *for free*, which is the part worth knowing: measured on one
+/// 311-token prefix sent twice, marked and unmarked, the provider reported
+/// `cache_write_tokens: 0` and charged $0.000652 either way, to the last
+/// digit. A mark under the line writes nothing and costs nothing, so it does
+/// not need guarding against — and a floor drawn here would instead withhold
+/// caching on the models whose minimum is *lower* than whatever number was
+/// picked.
+///
+/// What does cost something is a mark above a provider's minimum that
+/// nothing ever reads back: that pays the write premium — about 25% on the
+/// prefix — for an entry with no second request to use it. Size cannot see
+/// that; only knowing whether the request belongs to a conversation can, and
+/// in a clanker or a tool loop it always does. A genuine one-shot is the case
+/// that would want a gate, and there is no gate here for it.
+///
+/// A message with no text is passed over, since there is nothing to attach a
+/// block to.
+///
+/// One thing to watch when reading real numbers: a single turn that appends
+/// a long run of tool calls can push the previous entry past the provider's
+/// lookback window, which shows up as a full-size write on every request
+/// with byte-identical payloads. That is a symptom of turn shape, not of a
+/// broken prefix.
+fn cache_breakpoints(messages: &[ChatMessage]) -> Vec<usize> {
+    let has_text = |message: &ChatMessage| {
+        message
+            .content
+            .as_deref()
+            .is_some_and(|text| !text.is_empty())
+    };
+
+    let mut marks = Vec::new();
+
+    // The static prefix: everything up to and including the agent prompt.
+    if let Some(at) = messages
+        .iter()
+        .rposition(|message| message.role == "system" && has_text(message))
+    {
+        marks.push(at);
+    }
+
+    // The end of the history, which is a different position every turn — the
+    // mark moves forward with the conversation and each request reads what
+    // the one before it wrote.
+    if let Some(at) = messages.iter().rposition(has_text) {
+        if !marks.contains(&at) {
+            marks.push(at);
+        }
+    }
+
+    marks
+}
+
+/// The request as JSON, with a `cache_control` breakpoint spliced into each
+/// message named by [`ChatRequest::cache_at`].
+///
+/// A breakpoint asks the provider to store its computed state as of that
+/// point in the prompt; a later request whose prompt begins with the same
+/// bytes is served from that state instead of recomputing it. It only ever
+/// matches a *prefix* — so the marks go on the last system message (freezing
+/// the agent prompt and the tool schemas together) and on the end of the
+/// history, and everything before a mark is what gets reused.
+///
+/// The rewrite is deliberately narrow: a message that is not marked
+/// serializes byte for byte as it did before any of this existed, because
+/// changing those bytes would itself invalidate the cache this is trying to
+/// build. Providers accept either a string or a block array for `content`,
+/// and the two are not interchangeable as cache keys.
+///
+/// A message with no text is skipped rather than given an empty block — a
+/// tool-calls-only turn has nothing to attach a breakpoint to, and an empty
+/// `text` block is not valid content everywhere.
+fn wire_body(request: &ChatRequest) -> Result<serde_json::Value> {
+    let mut body = serde_json::to_value(request)?;
+    if request.cache_at.is_empty() {
+        return Ok(body);
+    }
+
+    let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else {
+        return Ok(body);
+    };
+
+    for &at in &request.cache_at {
+        let Some(message) = messages.get_mut(at) else {
+            continue;
+        };
+        let Some(text) = message.get("content").and_then(|c| c.as_str()) else {
+            continue;
+        };
+        if text.is_empty() {
+            continue;
+        }
+        let blocks = serde_json::json!([{
+            "type": "text",
+            "text": text,
+            "cache_control": { "type": "ephemeral" },
+        }]);
+        message["content"] = blocks;
+    }
+
+    Ok(body)
+}
+
 /// Serializes the outgoing body, but only when raw capture is switched on
 /// — the body is the whole conversation, so it is never built speculatively.
 fn capture_body(request: &ChatRequest) -> Option<String> {
     if !crate::error_log::request_dumps_enabled() {
         return None;
     }
-    serde_json::to_string_pretty(request).ok()
+    // The wire form, not the struct: a dump exists to be diffed against what
+    // the provider actually saw, and the breakpoints are part of that.
+    wire_body(request)
+        .ok()
+        .as_ref()
+        .and_then(|body| serde_json::to_string_pretty(body).ok())
 }
 
 /// Writes a captured body out and returns the ` | body: <path>` fragment
@@ -698,9 +885,16 @@ impl Client {
             _ => (None, None),
         };
 
+        let cache_at = if self.config.cache.unwrap_or(crate::config::DEFAULT_CACHE) {
+            cache_breakpoints(&messages)
+        } else {
+            Vec::new()
+        };
+
         ChatRequest {
             model,
             messages,
+            cache_at,
             tools: tools.clone(),
             temperature,
             tool_choice: if tools.is_some() {
@@ -747,12 +941,13 @@ impl Client {
     }
 
     async fn send_chat(&self, request: ChatRequest) -> Result<ChatResponse> {
+        let body = wire_body(&request)?;
         let req = self
             .http_client
             .post(format!("{}/chat/completions", self.config.base_url));
         let response = self
             .apply_headers(req)
-            .json(&request)
+            .json(&body)
             .timeout(Duration::from_secs(self.config.request_timeout))
             .send()
             .await?;
@@ -803,13 +998,14 @@ impl Client {
         let url = format!("{}/chat/completions", self.config.base_url);
 
         try_stream! {
+            let body = wire_body(&request)?;
             let req = self.http_client.post(url);
             // Not `.timeout()` on the request itself — that would also
             // bound the total time spent reading a long-but-still-arriving
             // stream below, which is exactly what the idle timeout further
             // down is meant to allow. This only bounds how long a first
             // response takes to start showing up at all.
-            let response = match tokio::time::timeout(self.stream_idle(), self.apply_headers(req).json(&request).send()).await {
+            let response = match tokio::time::timeout(self.stream_idle(), self.apply_headers(req).json(&body).send()).await {
                 Ok(response) => response?,
                 Err(_) => {
                     Err(anyhow!(
@@ -1288,6 +1484,7 @@ mod deser_tests {
             reasoning: None,
             stream: Some(true),
             stream_options: None,
+            cache_at: Vec::new(),
         };
 
         let skeleton = request_skeleton(&request);
@@ -1318,6 +1515,220 @@ mod deser_tests {
             false,
         );
         serde_json::to_value(&request).unwrap()
+    }
+
+    /// A message with enough text in it to be recognisable in a rendered
+    /// body. Size carries no meaning for placement — see
+    /// [`cache_breakpoints`] — so this is only about having something to
+    /// look at.
+    const BULK: usize = 3072;
+    fn bulky(role: &str) -> ChatMessage {
+        ChatMessage {
+            role: role.to_string(),
+            content: Some("x".repeat(BULK)),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn an_unmarked_message_reaches_the_wire_byte_for_byte_unchanged() {
+        // The invariant the whole caching scheme rests on. A cache is a
+        // prefix match over exact bytes, so a request that reshapes messages
+        // it isn't marking would invalidate the very prefix it is trying to
+        // reuse — and the same reshaping would change what every provider
+        // sees, caching or not.
+        let messages = vec![
+            ChatMessage {
+                role: "user".to_string(),
+                content: Some("hello".to_string()),
+                ..Default::default()
+            },
+            ChatMessage {
+                role: "assistant".to_string(),
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_1".to_string(),
+                    call_type: function_call_type(),
+                    function: FunctionCall {
+                        name: "read_file".to_string(),
+                        arguments: r#"{"filepath":"a.rs"}"#.to_string(),
+                    },
+                }]),
+                reasoning_details: Some(vec![serde_json::json!({"signature": "sig"})]),
+                ..Default::default()
+            },
+        ];
+
+        let mut request = Client::for_test(Config::default()).build_request(
+            "m".to_string(),
+            messages,
+            None,
+            None,
+            None,
+            false,
+        );
+        // Nothing here is big enough to mark, so this is already empty —
+        // cleared explicitly so the assertion is about the rewrite and not
+        // about the placement rules.
+        request.cache_at.clear();
+
+        assert_eq!(
+            wire_body(&request).unwrap(),
+            serde_json::to_value(&request).unwrap(),
+            "an unmarked request must serialize exactly as the struct does"
+        );
+    }
+
+    #[test]
+    fn a_breakpoint_becomes_a_content_block_on_that_message_alone() {
+        let mut request = Client::for_test(Config::default()).build_request(
+            "m".to_string(),
+            vec![bulky("system"), bulky("user")],
+            None,
+            None,
+            None,
+            false,
+        );
+        request.cache_at = vec![1];
+
+        let body = wire_body(&request).unwrap();
+        let messages = body["messages"].as_array().unwrap();
+
+        // The marked one carries the breakpoint inside a text block, which
+        // is the only place `cache_control` is allowed to sit.
+        assert_eq!(messages[1]["content"][0]["type"], "text");
+        assert_eq!(
+            messages[1]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+        assert_eq!(
+            messages[1]["content"][0]["text"].as_str().unwrap().len(),
+            BULK
+        );
+
+        // The unmarked one is untouched — still a bare string.
+        assert!(
+            messages[0]["content"].is_string(),
+            "an unmarked message must keep its string content, got {}",
+            messages[0]["content"]
+        );
+    }
+
+    #[test]
+    fn breakpoints_go_on_the_system_prefix_and_the_end_of_the_history() {
+        // The two places a conversation stops changing: the agent prompt
+        // (with the tool schemas rendered ahead of it) and everything said
+        // so far. The second moves forward every turn, which is what makes
+        // the *next* request cheap.
+        let marks = cache_breakpoints(&[bulky("system"), bulky("user"), bulky("assistant")]);
+        assert_eq!(marks, vec![0, 2]);
+    }
+
+    #[test]
+    fn a_short_prefix_is_still_marked() {
+        // There used to be a size floor here, on the theory that a prefix
+        // under a provider's minimum would be charged the write premium for
+        // an entry it was too small to create. Measured against the
+        // provider, it isn't: the same 311-token prefix marked and unmarked
+        // both reported `cache_write_tokens: 0` and both cost $0.000652.
+        // A mark below the line is ignored for free, so withholding it only
+        // gave up the caching that *would* have worked on models whose
+        // minimum is lower than the floor.
+        let tiny = ChatMessage {
+            role: "user".to_string(),
+            content: Some("hi".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(cache_breakpoints(&[tiny]), vec![0]);
+    }
+
+    #[test]
+    fn a_message_with_no_text_is_never_marked() {
+        // A tool-calls-only turn has nothing to hang a text block on, and an
+        // empty one is not valid content everywhere.
+        let calls_only = ChatMessage {
+            role: "assistant".to_string(),
+            tool_calls: Some(vec![ToolCall {
+                id: "call_1".to_string(),
+                call_type: function_call_type(),
+                function: FunctionCall {
+                    name: "read_file".to_string(),
+                    arguments: "{}".to_string(),
+                },
+            }]),
+            ..Default::default()
+        };
+        let marks = cache_breakpoints(&[bulky("user"), calls_only]);
+        assert_eq!(marks, vec![0], "the mark must fall back to the last text");
+    }
+
+    #[test]
+    fn caching_can_be_switched_off_entirely() {
+        // What `cache: false` promises: the request CCC sent before any of
+        // this existed, for a provider behind an arbitrary `base_url` that
+        // may not accept block-shaped content at all.
+        let config = Config {
+            cache: Some(false),
+            ..Config::default()
+        };
+        let request = Client::for_test(config).build_request(
+            "m".to_string(),
+            vec![bulky("system"), bulky("user")],
+            None,
+            None,
+            None,
+            false,
+        );
+        assert!(request.cache_at.is_empty());
+        assert!(wire_body(&request).unwrap()["messages"][0]["content"].is_string());
+    }
+
+    #[test]
+    fn usage_reads_the_cache_breakdown_a_provider_reports() {
+        // Copied from a real OpenRouter response rather than written from
+        // the docs, which is how `cache_discount` — a field the API does not
+        // actually return — got believed in once already. Fields beyond
+        // these are present and deliberately ignored; what matters is that
+        // an unknown one never breaks the parse.
+        let usage: Usage = serde_json::from_str(
+            r#"{"prompt_tokens":1331,"completion_tokens":3,"total_tokens":1334,
+                "cost":0.0003088,"is_byok":false,
+                "prompt_tokens_details":{"cached_tokens":1324,"cache_write_tokens":0,
+                                         "audio_tokens":0,"video_tokens":0},
+                "cost_details":{"upstream_inference_cost":0.0003088},
+                "completion_tokens_details":{"reasoning_tokens":0}}"#,
+        )
+        .unwrap();
+        assert_eq!(usage.prompt_tokens, 1_331);
+        // Counted *inside* `prompt_tokens`, not alongside it: this request
+        // sent 1,331 tokens, of which 1,324 were served from cache.
+        assert_eq!(usage.cached_tokens(), 1_324);
+        assert_eq!(usage.cache_write_tokens(), 0);
+        assert_eq!(usage.cost, Some(0.0003088));
+
+        // A provider that breaks out nothing reads as "nothing known about
+        // caching" rather than as a confident zero.
+        let bare: Usage = serde_json::from_str(r#"{"total_tokens":10,"prompt_tokens":5}"#).unwrap();
+        assert!(bare.prompt_tokens_details.is_none());
+        assert_eq!(bare.cached_tokens(), 0);
+        assert!(bare.cost.is_none());
+    }
+
+    #[test]
+    fn the_write_premium_and_read_discount_are_what_the_provider_bills() {
+        // Both halves measured against real OpenRouter responses for the
+        // same 1,331-token prompt, one writing the prefix and one reading it
+        // back. The rates aren't CCC's to choose, but every claim about what
+        // caching saves is a multiplication by them, so they are worth
+        // pinning: a change here means the arithmetic in the README is
+        // wrong.
+        const IN: f64 = 2.0 / 1e6; // Sonnet 5 input, $/token
+        let predicted =
+            |cached: f64, wrote: f64, fresh: f64| (cached * 0.1 + wrote * 1.25 + fresh) * IN;
+
+        // Reported `upstream_inference_prompt_cost` for the read: 0.0002788.
+        assert!((predicted(1324.0, 0.0, 7.0) - 0.0002788).abs() < 1e-9);
+        // And for the write: 0.003324.
+        assert!((predicted(0.0, 1324.0, 7.0) - 0.003324).abs() < 1e-9);
     }
 
     #[test]

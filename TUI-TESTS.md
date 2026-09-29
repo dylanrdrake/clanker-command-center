@@ -377,6 +377,40 @@ New: every clanker keeps a running total of what it has spent.
 - Against a provider that reports no usage at all, the total should simply
   stay where it was rather than resetting or showing something odd.
 
+## Prompt caching
+
+Nothing about caching is visible in the UI — it is checked in the database.
+After a few turns:
+
+```bash
+sqlite3 ~/.clank/chats.db \
+  "select prompt_tokens, cached_tokens, cache_write_tokens, cost
+     from request_usage order by id;"
+```
+
+- One row per request, in order — a turn with three tool calls writes three.
+- The first request writes (`cache_write_tokens` large, `cached_tokens` 0);
+  every request after it reads (`cached_tokens` covering the prior prefix,
+  `cache_write_tokens` down to just what the last turn appended). That
+  crossover is the whole feature working.
+- `cached_tokens` stuck at 0 across requests that share a prefix means
+  something upstream is rewriting the prefix. It fails silently and the only
+  symptom is a bigger bill, so this is the check worth repeating after any
+  change to how requests are built.
+- `cache_write_tokens` near the full conversation size on *every* request is
+  the other failure: either the prefix is being rebuilt, or one turn appended
+  enough tool calls to push the previous entry out of the provider's lookback
+  window.
+- Right after a `/compact`, expect one expensive request — the summary is
+  prefixed onto the front of the history, so the cached prefix is gone and
+  that turn pays full price before the next one starts reading again.
+- `"cache": false` in `~/.clank/config.json`, then send a message → the
+  request goes out with plain string `content` and no `cache_control`
+  anywhere. Worth checking against a non-OpenRouter `base_url`, which is what
+  the switch exists for.
+- Against a provider that reports no cache breakdown, the columns stay 0 and
+  nothing else misbehaves.
+
 ## Known, not worth reporting
 
 - `clank model --clear extra-arg` exits 0 and silently ignores the name.

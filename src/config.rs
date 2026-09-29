@@ -266,6 +266,17 @@ pub struct Config {
     /// that compacts.
     #[serde(default = "default_compact_at")]
     pub compact_at: Option<u64>,
+    /// Whether requests carry prompt-caching breakpoints, so a provider
+    /// reuses its work on the part of the history that hasn't changed
+    /// instead of reprocessing it. `None` falls back to [`DEFAULT_CACHE`].
+    ///
+    /// Worth a switch because it changes the shape of what goes on the wire:
+    /// a marked message's `content` becomes a block array instead of a
+    /// string, and while that is the documented form for OpenRouter and the
+    /// providers behind it, `base_url` can point anywhere. Turning this off
+    /// restores the byte-for-byte request CCC sent before caching existed.
+    #[serde(default = "default_cache")]
+    pub cache: Option<bool>,
     /// Legacy: the three category gates, as configs written before tools had
     /// their own states hold them. Read so those keep meaning what they
     /// meant, never written again — it disappears from the file the next
@@ -403,6 +414,23 @@ pub fn default_compact_at() -> Option<u64> {
     Some(DEFAULT_COMPACT_AT)
 }
 
+/// Whether prompt caching is on when the config doesn't say.
+///
+/// On. Every request a clanker makes carries the whole history it has
+/// already sent, so the second request in any conversation is where caching
+/// starts paying — and a provider that stores a prefix charges a premium
+/// once to store it and a fraction of the rate to read it back, which breaks
+/// even at two requests. A clanker that sends one request and stops is the
+/// only case this costs anything, and it costs the write premium on one
+/// prefix.
+pub const DEFAULT_CACHE: bool = true;
+
+/// The switch seeded into a new config, so the file says caching is on
+/// rather than leaving `null` beside a literal.
+pub fn default_cache() -> Option<bool> {
+    Some(DEFAULT_CACHE)
+}
+
 /// Same deal: the shape effort is serialized in when the config doesn't say.
 /// See [`DEFAULT_EFFORT_STYLE`].
 pub fn default_effort_style() -> Option<String> {
@@ -430,6 +458,7 @@ impl Default for Config {
             default_model: default_model(),
             compactor: default_compactor(),
             compact_at: default_compact_at(),
+            cache: default_cache(),
             approval: ApprovalSettings::default(),
             // Explicitly the defaults, not `None`: `None` means "this config
             // predates tools having states" and derives from the three old

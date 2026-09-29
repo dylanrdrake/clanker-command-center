@@ -325,6 +325,10 @@ struct Counts {
     /// measurements of the same growing thing would say nothing. `0` while
     /// no request has reported one.
     last_prompt: u64,
+    /// Every request's usage, kept so the growth of a history and the share
+    /// of it served from cache can be read back per request rather than
+    /// inferred from a turn's total.
+    requests: Vec<Usage>,
 }
 
 impl UsageTracker {
@@ -334,11 +338,29 @@ impl UsageTracker {
         if usage.prompt_tokens > 0 {
             counts.last_prompt = usage.prompt_tokens;
         }
+        // Kept individually as well as summed, because the sum cannot answer
+        // the question caching raises. A turn's requests each measure the
+        // same history at a different size, and whether the prefix was
+        // reused is a per-request fact — averaged across a turn it says
+        // nothing, and the one number that would prove caching works is
+        // exactly the one a total destroys.
+        if usage.prompt_tokens > 0 || usage.total_tokens > 0 {
+            counts.requests.push(usage);
+        }
     }
 
     /// Everything accumulated so far, in tokens.
     pub fn total(&self) -> u64 {
         self.counts.lock().expect("usage tracker poisoned").total
+    }
+
+    /// Each request this turn made, in the order they were made.
+    pub fn requests(&self) -> Vec<Usage> {
+        self.counts
+            .lock()
+            .expect("usage tracker poisoned")
+            .requests
+            .clone()
     }
 
     /// How big the turn's last request was, as the provider reported it.
@@ -600,10 +622,12 @@ mod tests {
         worker.add(Usage {
             total_tokens: 10,
             prompt_tokens: 8,
+            ..Default::default()
         });
         worker.add(Usage {
             total_tokens: 5,
             prompt_tokens: 12,
+            ..Default::default()
         });
         assert_eq!(caller.total(), 15);
         // Not a sum: it is how big the last request was, and the last one
@@ -620,10 +644,12 @@ mod tests {
         usage.add(Usage {
             total_tokens: 100,
             prompt_tokens: 90,
+            ..Default::default()
         });
         usage.add(Usage {
             total_tokens: 40,
             prompt_tokens: 0,
+            ..Default::default()
         });
         assert_eq!(usage.total(), 140);
         assert_eq!(usage.last_prompt(), 90);

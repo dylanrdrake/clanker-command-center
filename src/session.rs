@@ -528,6 +528,18 @@ impl ChatSession {
         Ok(())
     }
 
+    /// Files a turn's per-request usage away, so how this session's requests
+    /// grew — and how much of each was served from cache — can be read back
+    /// later.
+    ///
+    /// Purely a record. Nothing consults it to decide anything, which is why
+    /// a failure here is worth reporting but not worth failing a turn over:
+    /// the turn already happened, and the numbers describing it are the
+    /// least important thing about it.
+    pub fn record_request_usage(&self, requests: &[crate::client::Usage]) -> Result<()> {
+        store::append_request_usage(&self.conn, &self.id, requests)
+    }
+
     /// The prompt size the provider reported for the last request this
     /// session made. `0` when nothing has measured it yet.
     pub fn prompt_tokens(&self) -> u64 {

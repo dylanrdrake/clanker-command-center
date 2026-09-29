@@ -851,6 +851,15 @@ impl Worker {
                 message: format!("Failed to save the prompt size: {e}"),
             }));
         }
+        // Each request individually, which is what the two numbers above
+        // can't say: the total mixes requests together and the prompt size
+        // is overwritten every turn, so neither shows a history growing or a
+        // compaction cutting it back.
+        if let Err(e) = self.session.record_request_usage(&usage.requests()) {
+            let _ = self.events.send(Event::Agent(AgentEvent::Error {
+                message: format!("Failed to save per-request usage: {e}"),
+            }));
+        }
 
         self.persist();
         // Cleared on success: the stored messages already say what happened,
