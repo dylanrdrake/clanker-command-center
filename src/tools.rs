@@ -1,7 +1,9 @@
 use anyhow::{anyhow, Result};
 use serde_json::json;
+use std::borrow::Cow;
 use std::fs;
 use std::path::Path;
+use std::sync::RwLock;
 
 /// One tool, as everything that isn't the model needs to see it: what it is
 /// called, which bucket it falls in for bulk settings, and a line a person
@@ -11,59 +13,223 @@ use std::path::Path;
 /// on a terminal row; this is the same set said briefly. A test holds the
 /// two together, so a tool added to one and forgotten in the other fails
 /// rather than quietly becoming ungovernable.
+///
+/// `name` and `summary` are [`Cow`]s because not every tool is compiled in
+/// any more — see [`set_registered`]. A built-in costs nothing for the
+/// borrow; one that arrived at runtime owns its strings. `category` stays
+/// `&'static str` on purpose: the buckets are CCC's own closed vocabulary
+/// that `clank tools allow <category>` targets, so a tool from anywhere has
+/// to land in one of [`CATEGORIES`] or it cannot be governed in bulk.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolInfo {
-    pub name: &'static str,
+    pub name: Cow<'static, str>,
     /// `read`, `write` or `terminal` — the bulk targets `tools allow read`
     /// and friends act on. `web` is its own bucket precisely because it is
     /// the one tool that touches nothing local.
     pub category: &'static str,
-    pub summary: &'static str,
+    pub summary: Cow<'static, str>,
 }
 
-/// Every tool the agent has, in the order a listing should show them:
-/// the harmless first, the ones that change your machine last.
-pub const TOOLS: [ToolInfo; 7] = [
+impl ToolInfo {
+    /// A tool that is not compiled in. Fails rather than registering a
+    /// category nothing targets — see [`CATEGORIES`].
+    #[allow(dead_code)] // see REGISTERED
+    pub fn new(
+        name: impl Into<String>,
+        category: &str,
+        summary: impl Into<String>,
+    ) -> Result<Self> {
+        let category = CATEGORIES
+            .iter()
+            .find(|known| **known == category)
+            .ok_or_else(|| {
+                anyhow!("{category:?} is not a tool category; expected one of {CATEGORIES:?}")
+            })?;
+        Ok(Self {
+            name: Cow::Owned(name.into()),
+            category,
+            summary: Cow::Owned(summary.into()),
+        })
+    }
+}
+
+/// Every bucket `clank tools allow <category>` can target.
+///
+/// A closed set, and the reason [`ToolInfo::category`] is still `&'static
+/// str` while its name is not. A tool in no category can only be set by its
+/// own name, which is a surprise waiting to happen: `tools never all` would
+/// leave it on.
+#[allow(dead_code)] // see REGISTERED
+pub const CATEGORIES: [&str; 4] = ["read", "write", "terminal", "web"];
+
+/// The tools compiled into the binary, in the order a listing should show
+/// them: the harmless first, the ones that change your machine last.
+///
+/// Not the whole list any more — [`tools`] is. Read this directly only
+/// where "what ships in the binary" is the actual question, which is the
+/// schemas below and the drift test that holds them together.
+pub const BUILTIN: [ToolInfo; 7] = [
     ToolInfo {
-        name: "read_file",
+        name: Cow::Borrowed("read_file"),
         category: "read",
-        summary: "Read a file from disk",
+        summary: Cow::Borrowed("Read a file from disk"),
     },
     ToolInfo {
-        name: "list_files",
+        name: Cow::Borrowed("list_files"),
         category: "read",
-        summary: "List a directory",
+        summary: Cow::Borrowed("List a directory"),
     },
     ToolInfo {
-        name: "search_files",
+        name: Cow::Borrowed("search_files"),
         category: "read",
-        summary: "Search file contents for a pattern",
+        summary: Cow::Borrowed("Search file contents for a pattern"),
     },
     ToolInfo {
-        name: "web_fetch",
+        name: Cow::Borrowed("web_fetch"),
         category: "web",
-        summary: "Fetch a web page as text",
+        summary: Cow::Borrowed("Fetch a web page as text"),
     },
     ToolInfo {
-        name: "write_file",
+        name: Cow::Borrowed("write_file"),
         category: "write",
-        summary: "Write or overwrite a file",
+        summary: Cow::Borrowed("Write or overwrite a file"),
     },
     ToolInfo {
-        name: "replace_in_file",
+        name: Cow::Borrowed("replace_in_file"),
         category: "write",
-        summary: "Replace a string inside a file",
+        summary: Cow::Borrowed("Replace a string inside a file"),
     },
     ToolInfo {
-        name: "run_terminal_command",
+        name: Cow::Borrowed("run_terminal_command"),
         category: "terminal",
-        summary: "Run a shell command",
+        summary: Cow::Borrowed("Run a shell command"),
     },
 ];
+
+/// Tools that were not compiled in, as [`set_registered`] last left them.
+///
+/// Empty in every build so far, because nothing registers anything yet —
+/// the MCP client that will is the next thing to build. The surface around
+/// it ([`set_registered`], [`registered`], [`validate`], [`category_in`],
+/// [`CATEGORIES`] and [`ToolInfo::new`]) is therefore `dead_code` as far as
+/// the binary is concerned and carries an `allow` each, in the same spirit
+/// as [`crate::ui::AgentEvent`]: the API is complete and the tests exercise
+/// all of it, the one missing piece is a caller. Those attributes come off
+/// with the first `register` call, and if they ever need keeping, this did
+/// not turn out to be worth building ahead of its consumer.
+///
+/// Process-wide rather than per-clanker because what goes in here is
+/// process-wide: one MCP server per config entry, shared by every clanker,
+/// outliving any one session. The gates stay per-clanker — they key off a
+/// tool's *name*, which is why nothing about them had to change for this.
+static REGISTERED: RwLock<Vec<ToolInfo>> = RwLock::new(Vec::new());
+
+/// Every tool the agent has: the built-ins, then whatever was registered.
+///
+/// A snapshot, not a borrow. The lock is held for the length of a clone and
+/// never across a caller's work, which matters because the callers are an
+/// async turn and a render pass.
+pub fn tools() -> Vec<ToolInfo> {
+    merge(&read_registered())
+}
+
+/// The whole list from a registered set handed in: built-ins first, in the
+/// order [`BUILTIN`] declares, then the registered ones in theirs.
+///
+/// Split out from [`tools`] so the composition is testable without writing
+/// to the process-wide registry — see the note on [`set_registered`].
+pub fn merge(registered: &[ToolInfo]) -> Vec<ToolInfo> {
+    let mut all: Vec<ToolInfo> = BUILTIN.to_vec();
+    all.extend(registered.iter().cloned());
+    all
+}
+
+/// Just the registered ones.
+#[allow(dead_code)] // see REGISTERED
+pub fn registered() -> Vec<ToolInfo> {
+    read_registered().clone()
+}
+
+/// Replaces the registered set wholesale.
+///
+/// Total rather than incremental — "here is the list now" — because the
+/// thing that will drive it is a set of servers that connect, disconnect and
+/// reconnect, and recomputing one list from the servers that are up is the
+/// only version of this with no stale-entry case to get wrong.
+///
+/// Rejected before anything is written if [`validate`] objects.
+///
+/// **Not callable from a test.** The registry is process-wide and the test
+/// binary runs its tests in parallel threads, so a write here is visible to
+/// every other test while it runs — and `ToolAccessSettings::none()` is
+/// built by enumerating this list, so a tool registered mid-suite makes
+/// "no tools" mean something else in a test that never mentioned tools.
+/// Everything worth asserting is reachable without writing: [`validate`]
+/// for the rules, [`merge`] for the composition, [`category_in`] and
+/// `ToolAccessSettings::{any_tools_in, rows_in}` for the readers.
+#[allow(dead_code)] // see REGISTERED
+pub fn set_registered(tools: Vec<ToolInfo>) -> Result<()> {
+    validate(&tools)?;
+    *REGISTERED.write().unwrap_or_else(|e| e.into_inner()) = tools;
+    Ok(())
+}
+
+/// Whether a set can be registered as it stands.
+///
+/// Refuses a name a built-in already has. The reference filesystem server
+/// exports `read_file`, `write_file` and `search_files` — three of the seven
+/// below — so this is the common case, not a corner: silently shadowing a
+/// built-in would change what `read_file` means mid-session, and silently
+/// dropping the server's would leave a gate you can set and a tool that
+/// never runs. The caller namespaces (`server/tool`) and tries again.
+///
+/// Refuses a repeated name for the same reason one step along: two entries
+/// under one name make every lookup here depend on which was found first.
+#[allow(dead_code)] // see REGISTERED
+pub fn validate(tools: &[ToolInfo]) -> Result<()> {
+    let mut seen = std::collections::BTreeSet::new();
+    for tool in tools {
+        if BUILTIN.iter().any(|builtin| builtin.name == tool.name) {
+            return Err(anyhow!(
+                "{} is already a built-in tool; register it under a name of its own",
+                tool.name
+            ));
+        }
+        if !seen.insert(tool.name.as_ref()) {
+            return Err(anyhow!("{} was registered twice", tool.name));
+        }
+    }
+    Ok(())
+}
+
+/// A poisoned lock still holds a perfectly good list — the panic that
+/// poisoned it happened elsewhere — and refusing to read it would turn an
+/// unrelated panic into a clanker with no tools.
+fn read_registered() -> std::sync::RwLockReadGuard<'static, Vec<ToolInfo>> {
+    REGISTERED.read().unwrap_or_else(|e| e.into_inner())
+}
 
 /// The bucket a tool falls in, or `"unknown"` for a name that is not one of
 /// ours — which the gates treat as the most restricted thing there is.
 pub fn category_of(tool_name: &str) -> &'static str {
-    TOOLS
+    BUILTIN
+        .iter()
+        .find(|tool| tool.name == tool_name)
+        .map(|tool| tool.category)
+        .or_else(|| {
+            read_registered()
+                .iter()
+                .find(|tool| tool.name == tool_name)
+                .map(|tool| tool.category)
+        })
+        .unwrap_or("unknown")
+}
+
+/// [`category_of`] against a list handed in, so the rule can be tested
+/// without touching the process-wide registry.
+#[allow(dead_code)] // see REGISTERED
+pub fn category_in(tools: &[ToolInfo], tool_name: &str) -> &'static str {
+    tools
         .iter()
         .find(|tool| tool.name == tool_name)
         .map(|tool| tool.category)
@@ -1332,6 +1498,152 @@ async fn run_terminal_command(
 #[cfg(test)]
 mod tests {
 
+    /// A stand-in for what will arrive from a server: owned strings, a
+    /// namespaced name, a category derived from the server's annotations.
+    fn registered_tool(name: &str, category: &str) -> ToolInfo {
+        ToolInfo::new(name, category, "a tool from somewhere else").unwrap()
+    }
+
+    #[test]
+    fn a_registered_tool_joins_the_list_after_the_built_ins() {
+        let extra = vec![
+            registered_tool("fs/read_text_file", "read"),
+            registered_tool("fs/write_file", "write"),
+        ];
+        let all = merge(&extra);
+
+        assert_eq!(all.len(), BUILTIN.len() + 2);
+        // Built-ins keep their order and keep coming first: the listing is
+        // meant to run harmless-to-dangerous, and that only holds if the
+        // set that was ordered on purpose stays at the top.
+        assert_eq!(all[0].name, BUILTIN[0].name);
+        assert_eq!(all[BUILTIN.len()].name, "fs/read_text_file");
+        assert_eq!(all.last().unwrap().name, "fs/write_file");
+    }
+
+    #[test]
+    fn a_registered_tool_is_governed_like_any_other() {
+        use crate::config::{ToolAccess, ToolAccessSettings};
+
+        // The three bugs this refactor exists to fix, in one place. Before
+        // it, all of these read a fixed array of seven: a clanker whose
+        // only tools came from a server reported having none (so its turn
+        // ran as a plain exchange), `clank tools` listed nothing to set,
+        // and there was no row to set it on.
+        let all = merge(&[
+            registered_tool("fs/read_text_file", "read"),
+            registered_tool("fs/write_file", "write"),
+        ]);
+
+        // Asserted one reader at a time and never as a conjunction. Both
+        // of these are wrong together in a self-consistent way — if "all"
+        // and "any" both see only the built-ins, then "every tool off"
+        // agrees with itself while leaving two tools on — so a test that
+        // only checked `!none.any_tools()` passed against the bug.
+        let none = ToolAccessSettings::none_in(&all);
+        assert_eq!(
+            none.access("fs/write_file"),
+            ToolAccess::Never,
+            "`tools off` has to reach a tool it was never compiled against"
+        );
+        assert!(!none.any_tools_in(&all));
+
+        // A clanker whose *only* tools came from a server: every built-in
+        // off, one registered tool at its default. This is what used to
+        // report having no tools at all, which quietly ran the turn as a
+        // plain exchange with nothing to carry it.
+        let only_registered = ToolAccessSettings::none_in(&BUILTIN);
+        assert!(
+            only_registered.any_tools_in(&all),
+            "a registered tool is a tool, so this clanker is agentic"
+        );
+
+        let fresh = ToolAccessSettings::default();
+        assert!(fresh.any_tools_in(&all));
+        let rows = fresh.rows_in(&all);
+        assert_eq!(rows.len(), all.len(), "all of them are listed");
+        let (name, category, access) = rows
+            .iter()
+            .find(|(name, _, _)| name == "fs/write_file")
+            .expect("a registered tool has a row");
+        assert_eq!(*category, "write");
+        assert_eq!(
+            *access,
+            ToolAccess::Ask,
+            "{name} must not be allowed by default"
+        );
+    }
+
+    #[test]
+    fn a_registered_tool_reaches_the_bulk_targets() {
+        use crate::config::{ToolAccess, ToolAccessSettings};
+
+        // The reason `category` is still a closed set: `tools never all`
+        // and `tools never read` have to reach a tool nobody compiled in,
+        // or it is settable only by its own name — which is how you end up
+        // believing you turned everything off and leaving one on.
+        let all = merge(&[registered_tool("fs/read_text_file", "read")]);
+        let off = ToolAccessSettings::default()
+            .with_in(&all, "read", ToolAccess::Never)
+            .expect("\"read\" matches");
+        assert_eq!(off.access("fs/read_text_file"), ToolAccess::Never);
+        assert_eq!(off.access("read_file"), ToolAccess::Never);
+    }
+
+    #[test]
+    fn category_lookup_falls_back_to_unknown_for_a_stranger() {
+        let all = merge(&[registered_tool("fs/read_text_file", "read")]);
+        assert_eq!(category_in(&all, "fs/read_text_file"), "read");
+        assert_eq!(category_in(&all, "read_file"), "read");
+        assert_eq!(category_in(&all, "fs/nothing_like_it"), "unknown");
+    }
+
+    #[test]
+    fn a_tool_cannot_be_registered_over_a_built_in() {
+        // Measured, not imagined: the reference filesystem server exports
+        // all three of these names.
+        for name in ["read_file", "write_file", "search_files"] {
+            let err = validate(&[registered_tool(name, "read")]).expect_err("{name} is a built-in");
+            assert!(err.to_string().contains("already a built-in"), "{err}");
+        }
+        assert!(validate(&[registered_tool("fs/read_file", "read")]).is_ok());
+    }
+
+    #[test]
+    fn the_same_name_cannot_be_registered_twice() {
+        let err = validate(&[
+            registered_tool("fs/read_text_file", "read"),
+            registered_tool("fs/read_text_file", "write"),
+        ])
+        .expect_err("a repeated name makes every lookup order-dependent");
+        assert!(err.to_string().contains("registered twice"), "{err}");
+    }
+
+    #[test]
+    fn a_tool_cannot_be_registered_into_a_category_nothing_targets() {
+        let err = ToolInfo::new("fs/thing", "filesystem", "x")
+            .expect_err("\"filesystem\" is not one of CCC's buckets");
+        assert!(err.to_string().contains("not a tool category"), "{err}");
+        for known in CATEGORIES {
+            assert!(ToolInfo::new("fs/thing", known, "x").is_ok());
+        }
+    }
+
+    #[test]
+    fn a_registered_tool_is_not_yet_offered_to_the_model() {
+        // Deliberate, and the next thing to build. `get_tool_definitions`
+        // is a hand-written list of schemas for the seven built-ins, and a
+        // tool from a server carries its own `inputSchema` instead. Until
+        // that is wired, registering one makes it listable and gateable but
+        // not callable — which is why nothing registers anything yet.
+        let defined: Vec<String> = get_tool_definitions()
+            .iter()
+            .map(|d| d["function"]["name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(defined.len(), BUILTIN.len());
+        assert!(!defined.iter().any(|name| name.contains('/')));
+    }
+
     #[test]
     fn every_tool_is_in_both_lists() {
         // The schemas are written for the model; `TOOLS` is the same set
@@ -1342,7 +1654,7 @@ mod tests {
             .iter()
             .map(|d| d["function"]["name"].as_str().unwrap().to_string())
             .collect();
-        let known: Vec<String> = TOOLS.iter().map(|t| t.name.to_string()).collect();
+        let known: Vec<String> = BUILTIN.iter().map(|t| t.name.to_string()).collect();
 
         for name in &defined {
             assert!(known.contains(name), "{name} has a schema but no entry");
@@ -1357,14 +1669,14 @@ mod tests {
     fn every_tool_has_a_category_the_bulk_targets_reach() {
         // A tool in no category can only be set by its own name, which is a
         // surprise waiting to happen: `tools never all` would leave it on.
-        for tool in TOOLS {
+        for tool in BUILTIN {
             assert!(
-                ["read", "write", "terminal", "web"].contains(&tool.category),
+                CATEGORIES.contains(&tool.category),
                 "{} is in {:?}, which nothing targets",
                 tool.name,
                 tool.category
             );
-            assert_eq!(category_of(tool.name), tool.category);
+            assert_eq!(category_of(&tool.name), tool.category);
         }
         assert_eq!(category_of("not_a_tool"), "unknown");
     }

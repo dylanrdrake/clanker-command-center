@@ -778,13 +778,16 @@ mod tests {
         // and changes nothing, and a prompt per page is what would push the
         // model back to curling through the shell. Everything else asks.
         let fresh = ToolAccessSettings::default();
-        for tool in crate::tools::TOOLS {
-            let expected = match tool.name {
+        // `BUILTIN` rather than `tools()`: these three defaults are a fact
+        // about the tools that ship, and reading the live list would make
+        // the assertion depend on what some other test registered.
+        for tool in crate::tools::BUILTIN {
+            let expected = match tool.name.as_ref() {
                 "run_terminal_command" => ToolAccess::Never,
                 "web_fetch" => ToolAccess::Allow,
                 _ => ToolAccess::Ask,
             };
-            assert_eq!(fresh.access(tool.name), expected, "{}", tool.name);
+            assert_eq!(fresh.access(&tool.name), expected, "{}", tool.name);
         }
         // A name we do not know is the last thing that should run unwatched.
         assert_eq!(fresh.access("something_else"), ToolAccess::Ask);
@@ -825,7 +828,7 @@ mod tests {
         assert!(offered.iter().any(|name| name == "read_file"));
         // The shell is `never` out of the box, so two are missing.
         assert!(!offered.iter().any(|name| name == "run_terminal_command"));
-        assert_eq!(offered.len(), crate::tools::TOOLS.len() - 2);
+        assert_eq!(offered.len(), crate::tools::BUILTIN.len() - 2);
 
         // And with everything off there is nothing to send, which is what a
         // clanker with no tools now is.

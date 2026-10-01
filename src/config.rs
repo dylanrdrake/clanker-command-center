@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Result};
 use keyring::Entry;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
@@ -126,16 +127,34 @@ impl ToolAccessSettings {
     /// Whether this clanker has any tools at all — the thing that used to be
     /// stored as "agent mode".
     pub fn any_tools(&self) -> bool {
-        crate::tools::TOOLS
-            .iter()
-            .any(|tool| self.access(tool.name) != ToolAccess::Never)
+        self.any_tools_in(&crate::tools::tools())
     }
 
     /// Every tool with its access, in listing order.
-    pub fn rows(&self) -> Vec<(&'static str, &'static str, ToolAccess)> {
-        crate::tools::TOOLS
+    pub fn rows(&self) -> Vec<(Cow<'static, str>, &'static str, ToolAccess)> {
+        self.rows_in(&crate::tools::tools())
+    }
+
+    /// The two above against a list handed in rather than the live one.
+    ///
+    /// The live list is process-wide and now writable at runtime — see
+    /// `tools::set_registered` — so these exist to keep the rules testable
+    /// without a test having to mutate state every other test can see.
+    pub fn any_tools_in(&self, tools: &[crate::tools::ToolInfo]) -> bool {
+        tools
             .iter()
-            .map(|tool| (tool.name, tool.category, self.access(tool.name)))
+            .any(|tool| self.access(&tool.name) != ToolAccess::Never)
+    }
+
+    /// [`Self::rows`] against a list handed in — see
+    /// [`Self::any_tools_in`].
+    pub fn rows_in(
+        &self,
+        tools: &[crate::tools::ToolInfo],
+    ) -> Vec<(Cow<'static, str>, &'static str, ToolAccess)> {
+        tools
+            .iter()
+            .map(|tool| (tool.name.clone(), tool.category, self.access(&tool.name)))
             .collect()
     }
 
@@ -144,10 +163,21 @@ impl ToolAccessSettings {
     /// word that names none of those, so a caller can report the typo rather
     /// than silently changing nothing.
     pub fn with(&self, target: &str, access: ToolAccess) -> Option<Self> {
-        let matched: Vec<&'static str> = crate::tools::TOOLS
+        self.with_in(&crate::tools::tools(), target, access)
+    }
+
+    /// [`Self::with`] against a list handed in rather than the live one —
+    /// see [`Self::any_tools_in`].
+    pub fn with_in(
+        &self,
+        tools: &[crate::tools::ToolInfo],
+        target: &str,
+        access: ToolAccess,
+    ) -> Option<Self> {
+        let matched: Vec<String> = tools
             .iter()
             .filter(|tool| target == "all" || tool.name == target || tool.category == target)
-            .map(|tool| tool.name)
+            .map(|tool| tool.name.to_string())
             .collect();
         if matched.is_empty() {
             return None;
@@ -157,10 +187,10 @@ impl ToolAccessSettings {
             // Held only while it differs from the default, so "set it back
             // to what it would have been" and "never mentioned it" store the
             // same thing — and a later change of default reaches both.
-            if access == default_access(name) {
-                updated.overrides.remove(name);
+            if access == default_access(&name) {
+                updated.overrides.remove(&name);
             } else {
-                updated.overrides.insert(name.to_string(), access);
+                updated.overrides.insert(name, access);
             }
         }
         Some(updated)
@@ -174,8 +204,15 @@ impl ToolAccessSettings {
     /// Every tool off: what `tools off` means, and what a clanker with no
     /// tools is.
     pub fn none() -> Self {
+        Self::none_in(&crate::tools::tools())
+    }
+
+    /// [`Self::none`] over a list handed in — see [`Self::any_tools_in`].
+    /// Worth its own name because "every tool off" is a claim about a list,
+    /// and which list it was is exactly what a test needs to pin down.
+    pub fn none_in(tools: &[crate::tools::ToolInfo]) -> Self {
         Self::default()
-            .with("all", ToolAccess::Never)
+            .with_in(tools, "all", ToolAccess::Never)
             .expect("\"all\" always matches")
     }
 

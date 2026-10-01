@@ -373,17 +373,18 @@ pub fn session_settings_rows(settings: &SessionSettings) -> Vec<(String, String)
 /// What each tool may do, as label/value rows — the body of `clank tools`
 /// and of `/tools`, so the two cannot describe the same state differently.
 ///
-/// Ordered as [`crate::tools::TOOLS`] is: what only reads first, what
-/// changes your machine last, so the dangerous end is where the eye lands.
+/// Ordered as [`crate::tools::tools`] is: the built-ins, what only reads
+/// first and what changes your machine last, so the dangerous end is where
+/// the eye lands — then anything registered at runtime after them.
 pub fn tool_rows(access: &ToolAccessSettings) -> Vec<(String, String)> {
-    crate::tools::TOOLS
+    crate::tools::tools()
         .iter()
         .map(|tool| {
             (
                 tool.name.to_string(),
                 format!(
                     "{:<6} {:<8} · {}",
-                    access.access(tool.name).label(),
+                    access.access(&tool.name).label(),
                     tool.category,
                     tool.summary
                 ),
