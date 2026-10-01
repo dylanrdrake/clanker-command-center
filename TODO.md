@@ -178,6 +178,36 @@ NEXT:
   through a custom highlighter rather than a password API it doesn't have.
   Worth doing the next time that command is touched; it is the last live
   item from deepseek-audit.md, which is otherwise spent.
+* three threads left hanging off `CompactionGuard` (c8cc849), in the order
+  they are worth picking up:
+  - Nothing tests the wiring, which is how the bug in it got in. Every guard
+    test calls `measured` directly, so they pass just as happily with the
+    wrong argument — which is exactly what shipped: `last_prompt` instead of
+    `first_prompt`, reading a good compaction followed by forty tool calls
+    as a failed one. Catching that class needs a test at the `Worker` level,
+    driving a turn and asserting what the guard was told, which is more
+    scaffolding than `conversation.rs` has ever had. The reasoning lives in
+    doc comments instead, which is the cheap half.
+  - `MIN_COMPACT_AT` is only enforced by `clank compact-at`. A hand-edited
+    config.json with `compact_at: 500` loads without complaint, and the
+    guard is what keeps that from looping — one wasted compactor call rather
+    than one every turn. Arguably the right layering; if the floor should be
+    an actual invariant it belongs in `load_config`, which then has to decide
+    between refusing the file and clamping the value, and refusing is the
+    behaviour that file already has for anything it can't read.
+  - The guard isn't persisted, so a reopened clanker spends one compaction
+    re-learning its floor. Left deliberately — a floor is a fact about a
+    threshold and a system prompt a new process may not share, and a stale
+    one costs more than the call. Revisit only if that call is ever felt.
+* `EXEMPT_FRACTION` is still the number in compact.rs most worth revisiting,
+  and now that the three budgets all scale with the threshold (7dd991d,
+  c8cc849) it is the only one whose size was never checked against real use:
+  a sixth of the threshold spent on carrying file reads verbatim past the
+  seam. Too small and a compacted clanker loses the code it was working on;
+  too large and it has no room to grow before it meets the line again.
+  Judge it from the `request_usage` rows, which now record each request's
+  prompt size per turn — a compaction that lands near the threshold instead
+  of well under it is this number being too generous.
 * project-scoped sessions via a .clank/ folder, like .git: walk up from cwd to
   find it, sessions live there. Bigger than storing working_dir (which is done):
   it changes WHERE state lives. Costs to weigh first — storage splits from one
