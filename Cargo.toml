@@ -61,6 +61,16 @@ html2text = "0.17.1"
 # needs a real query rather than an environment variable.
 terminal-colorsaurus = "1.0.3"
 
+# `killpg`, for stopping an MCP server *and the processes it started*. A
+# server launched through a runner like `npx` is a grandchild, so killing
+# the pid we spawned leaves it running with the stdout pipe still open —
+# which is a call that gets no reply and no EOF either. Unix only, because
+# this is a signal to a process group and Windows groups processes with job
+# objects instead. Already in the tree under tokio, so naming it here costs
+# a line rather than a build.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [profile.release]
 opt-level = 3
 lto = true

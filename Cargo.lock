@@ -482,6 +482,7 @@ dependencies = [
  "home",
  "html2text",
  "keyring",
+ "libc",
  "ratatui",
  "regex",
  "reqwest",
