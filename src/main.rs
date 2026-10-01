@@ -1189,6 +1189,14 @@ async fn cmd_compact_at(value: Option<u64>, clear: bool) -> Result<()> {
         Some(0) => anyhow::bail!(
             "A threshold of 0 would compact before every turn. Give a token count,              or --clear to turn automatic compaction off."
         ),
+        Some(value) if value < config::MIN_COMPACT_AT => anyhow::bail!(
+            "A threshold of {value} is below the {} minimum. The system prompt and tool \
+             schemas ride every request whatever is folded away, and the summary and \
+             kept tail take about half the threshold on top, so a compacted request \
+             could not get back under it. Give a larger token count, or --clear to turn \
+             automatic compaction off.",
+            config::MIN_COMPACT_AT
+        ),
         Some(value) => {
             config.compact_at = Some(value);
             save_config(&config)?;
@@ -1629,6 +1637,7 @@ async fn compact_cli(
     session: &mut ChatSession,
     model: &str,
     compact_at: Option<u64>,
+    guard: &mut compact::CompactionGuard,
     forced: bool,
 ) -> Result<()> {
     let from = session.compacted_seq();
@@ -1658,6 +1667,7 @@ async fn compact_cli(
         eprintln!("{} Failed to save token usage: {}", "✗".red(), e);
     }
     session.set_compaction(cut, compacted.summary)?;
+    guard.compacted();
     println!("{}", ui::compacted_notice(cut).blue());
     Ok(())
 }
@@ -1706,6 +1716,7 @@ async fn cmd_clanker(
     // against — see `Config::compactor`.
     let compactor = resolve_compactor(&config);
     let compact_at = config.compact_at;
+    let mut guard = compact::CompactionGuard::default();
 
     let mut prior_prompts: Vec<String> = Vec::new();
     let mut session = match resume {
@@ -1861,8 +1872,15 @@ async fn cmd_clanker(
 
         match ui::classify(&line) {
             ui::Submission::Compact => {
-                if let Err(e) =
-                    compact_cli(&client, &mut session, &compactor, compact_at, true).await
+                if let Err(e) = compact_cli(
+                    &client,
+                    &mut session,
+                    &compactor,
+                    compact_at,
+                    &mut guard,
+                    true,
+                )
+                .await
                 {
                     println!("{} Compaction failed: {}", "✗".red(), e);
                 }
@@ -1872,11 +1890,19 @@ async fn cmd_clanker(
                 // Before the message is recorded, so what gets summarized is
                 // the conversation up to now rather than the question that
                 // is about to be asked of it.
-                if compact_at.is_some_and(|threshold| session.prompt_tokens() >= threshold) {
+                if compact_at.is_some_and(|threshold| guard.due(session.prompt_tokens(), threshold))
+                {
                     // Reported, not fatal: an oversized history makes for a
                     // worse request, not an impossible one.
-                    if let Err(e) =
-                        compact_cli(&client, &mut session, &compactor, compact_at, false).await
+                    if let Err(e) = compact_cli(
+                        &client,
+                        &mut session,
+                        &compactor,
+                        compact_at,
+                        &mut guard,
+                        false,
+                    )
+                    .await
                     {
                         println!("{} Compaction failed: {}", "✗".red(), e);
                     }
@@ -1903,7 +1929,7 @@ async fn cmd_clanker(
                 // this copy and everything past `sent` is folded back into
                 // the session below — the agent loop can no longer be handed
                 // the session's own vector, because the two differ.
-                let mut messages = session.request_messages();
+                let mut messages = session.request_messages(compact_at);
                 let sent = messages.len();
                 let turn = if session.is_agentic() {
                     let max_iterations = session.max_iterations();
@@ -1958,6 +1984,13 @@ async fn cmd_clanker(
                 session.set_activity(failed.then_some(store::Activity::Failed), None);
                 if let Err(e) = session.add_tokens(usage.total() as i64) {
                     eprintln!("{} Failed to save token usage: {}", "✗".red(), e);
+                }
+                // Whether a compaction this turn ran got the request back
+                // under the line. The turn's *first* request, not its last:
+                // the last one carries everything this turn's tool calls
+                // appended — see `CompactionGuard::measured`.
+                if let Some(threshold) = compact_at {
+                    guard.measured(usage.first_prompt(), threshold);
                 }
                 // How big the last request was, which is what decides
                 // whether the next one compacts first.

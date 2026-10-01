@@ -351,6 +351,7 @@ impl Conversation {
             tool_access_default,
             compactor,
             compact_at,
+            compaction_guard: crate::compact::CompactionGuard::default(),
             events: event_tx,
         };
         let task = tokio::spawn(worker.run(command_rx));
@@ -449,6 +450,9 @@ struct Worker {
     /// and these become what `default` resolves to.
     compactor: Option<String>,
     compact_at: Option<u64>,
+    /// Keeps automatic compaction from repeating every turn when it cannot
+    /// bring the request back under `compact_at`.
+    compaction_guard: crate::compact::CompactionGuard,
     /// What `clank tools` allows, which is what `/tools on` turns on. A
     /// clanker starts with no tools, so the configured access is a policy
     /// for when they are switched on rather than a state it is created in.
@@ -601,7 +605,7 @@ impl Worker {
         let client = Arc::clone(&self.client);
         // What the provider sees, which is not the whole history once this
         // clanker has been compacted — see `ChatSession::request_messages`.
-        let mut messages = self.session.request_messages();
+        let mut messages = self.session.request_messages(self.compact_at);
         // How much of that array was already accounted for, so `absorb` can
         // tell what the turn added. Taken from what is being sent rather
         // than from the session's own length: those are the same number
@@ -843,6 +847,16 @@ impl Worker {
                 message: format!("Failed to save token usage: {e}"),
             }));
         }
+        // Whether a compaction this turn ran before actually got the
+        // request back under the line, which is what decides whether the
+        // guard lets the next turn compact again. The turn's *first*
+        // request, not its last: the last one carries everything this turn's
+        // tool calls appended, so judging a fold by it would read a
+        // successful compaction followed by forty tool calls as a failure.
+        if let Some(threshold) = self.compact_at {
+            self.compaction_guard
+                .measured(usage.first_prompt(), threshold);
+        }
         // How big the last request was, which is what decides whether the
         // next turn compacts first. Recorded on the same terms as the total:
         // a turn that failed part-way still measured the requests it made.
@@ -912,7 +926,9 @@ impl Worker {
     /// that was never taken would fold away a conversation two messages long.
     fn compaction_due(&self) -> bool {
         match self.compact_at {
-            Some(threshold) => self.session.prompt_tokens() >= threshold,
+            Some(threshold) => self
+                .compaction_guard
+                .due(self.session.prompt_tokens(), threshold),
             None => false,
         }
     }
@@ -988,6 +1004,7 @@ impl Worker {
                             }
                             match self.session.set_compaction(cut, compacted.summary) {
                                 Ok(()) => {
+                                    self.compaction_guard.compacted();
                                     let _ = self.events.send(Event::Compacted { folded: cut });
                                 }
                                 // The summary exists but couldn't be saved.

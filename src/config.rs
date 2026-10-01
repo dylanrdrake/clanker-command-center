@@ -237,6 +237,20 @@ pub const DEFAULT_MODEL: &str = "openrouter/auto";
 /// leaves `/compact` as the only way in.
 pub const DEFAULT_COMPACT_AT: u64 = 60_000;
 
+/// The lowest `compact-at` accepted.
+///
+/// Two things a compaction cannot shrink set this. The system prompt and the
+/// tool schemas ride every request whatever is folded away — about a
+/// thousand tokens together — and the three compaction budgets together
+/// (`TAIL_FRACTION`, `SUMMARY_FRACTION` and `EXEMPT_FRACTION`: a quarter, an
+/// eighth and a sixth) claim roughly half the threshold by construction. The
+/// two meet somewhere near 2k, below which a compacted request cannot get
+/// back under the line and every turn would compact again.
+///
+/// 4k rather than that break-even point, so the smallest usable threshold
+/// still leaves something for the message you are about to send.
+pub const MIN_COMPACT_AT: u64 = 4_000;
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Config {
     /// Legacy field: API keys used to be stored here in plaintext. Only

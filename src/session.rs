@@ -619,7 +619,7 @@ impl ChatSession {
     /// Only the copy is changed. What is stored still says exactly what was
     /// typed, which is what lets a later compaction fold that same message
     /// without a summary of the previous one baked into it.
-    pub fn request_messages(&self) -> Vec<ChatMessage> {
+    pub fn request_messages(&self, compact_at: Option<u64>) -> Vec<ChatMessage> {
         let Some(summary) = &self.compaction_summary else {
             return self.messages.clone();
         };
@@ -640,7 +640,7 @@ impl ChatSession {
         let seam = self.compacted_seq.min(self.messages.len());
         let preamble = crate::compact::summary_message(
             summary,
-            &crate::compact::carried(&self.messages, seam),
+            &crate::compact::carried(&self.messages, seam, compact_at),
         );
         match messages.first_mut() {
             Some(first) => {
@@ -1221,7 +1221,7 @@ mod tests {
         session.push_user("first".to_string());
         session.push_assistant("reply".to_string());
 
-        let sent = session.request_messages();
+        let sent = session.request_messages(None);
         assert_eq!(sent.len(), 2);
         assert_eq!(sent[0].content.as_deref(), Some("first"));
     }
@@ -1236,7 +1236,7 @@ mod tests {
             .set_compaction(2, "they discussed one".to_string())
             .unwrap();
 
-        let sent = session.request_messages();
+        let sent = session.request_messages(None);
         assert_eq!(sent.len(), 1, "everything past the seam, and nothing added");
         assert_eq!(sent[0].role, "user");
         let carried = sent[0].content.as_deref().unwrap();
@@ -1264,7 +1264,7 @@ mod tests {
             .set_compaction(2, "they looked at a broken function".to_string())
             .unwrap();
 
-        let sent = session.request_messages();
+        let sent = session.request_messages(None);
         assert_eq!(sent.len(), 1, "still one message, so alternation holds");
         let body = sent[0].content.as_deref().unwrap();
 
@@ -1327,7 +1327,7 @@ mod tests {
             ..Default::default()
         });
 
-        let body = session.request_messages()[0].content.clone().unwrap();
+        let body = session.request_messages(None)[0].content.clone().unwrap();
         assert!(
             !body.contains("STALE TEXT"),
             "a read folded away, then written to in the kept tail, is still carried verbatim"
@@ -1378,7 +1378,7 @@ mod tests {
         assert_eq!(resumed.compaction_summary(), Some("the first message"));
         // Otherwise the first turn after a reopen resends everything the
         // compaction just paid to summarize.
-        assert_eq!(resumed.request_messages().len(), 1);
+        assert_eq!(resumed.request_messages(None).len(), 1);
     }
 
     #[test]

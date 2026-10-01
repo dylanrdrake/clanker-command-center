@@ -64,20 +64,29 @@ const SUMMARY_FRACTION: u64 = 8;
 
 /// The most verbatim content a compacted request may carry past the seam.
 ///
-/// A fixed size rather than a fraction of the threshold, unlike the two
-/// budgets above, because this one is applied by
-/// [`crate::session::ChatSession::request_messages`] — which is asked what
-/// the history looks like, not what it may cost, and has no threshold in
-/// hand. Sized as a sixth of the default threshold at [`BYTES_PER_TOKEN`],
-/// so a clanker on default settings spends a little over half the threshold
-/// on the summary, the kept tail and this together, and still has room to
-/// grow before it meets the line again.
+/// A fraction of the threshold, like the two budgets above. It used to be
+/// fixed at a sixth of the *default* threshold because
+/// [`crate::session::ChatSession::request_messages`] had no threshold in
+/// hand; it is now passed one. At a low `compact-at` the fixed figure was
+/// larger than the threshold itself, so a compacted request could not get
+/// back under the line.
 ///
 /// The number here most worth revisiting. File reads are the bulk of a
 /// coding conversation rather than an occasional pasted block, so this
 /// decides how much of the code a compacted clanker was working on it still
 /// has in front of it, and only real use will say whether a sixth is right.
-const EXEMPT_BUDGET: usize = (crate::config::DEFAULT_COMPACT_AT / 6) as usize * BYTES_PER_TOKEN;
+const EXEMPT_FRACTION: u64 = 6;
+
+/// [`EXEMPT_FRACTION`] of the threshold, in bytes.
+///
+/// Scales with `compact_at` like the other two budgets. It used to be fixed
+/// at a sixth of the *default* threshold, which at a low `compact-at` was
+/// larger than the threshold itself: a compacted request could not get back
+/// under the line, so the next turn compacted again, and again.
+fn exempt_budget(compact_at: Option<u64>) -> usize {
+    (compact_at.unwrap_or(crate::config::DEFAULT_COMPACT_AT) / EXEMPT_FRACTION) as usize
+        * BYTES_PER_TOKEN
+}
 
 /// Whether a message is a fenced code block someone wrote into the
 /// conversation, as opposed to one a tool went and fetched.
@@ -183,11 +192,12 @@ fn read_result(result: &str) -> Option<(String, Option<String>)> {
 /// because that is a copy the file no longer agrees with. Ordering in the
 /// history answers staleness without a single filesystem call.
 ///
-/// Bounded by [`EXEMPT_BUDGET`] with the newest kept first, because a
+/// Bounded by [`exempt_budget`] with the newest kept first, because a
 /// carried message is carried in every request from here on and exemption
 /// without a ceiling would reintroduce exactly the growth compaction exists
 /// to stop. What does not fit is named rather than paraphrased.
-pub fn carried(messages: &[ChatMessage], seam: usize) -> Vec<Carried> {
+pub fn carried(messages: &[ChatMessage], seam: usize, compact_at: Option<u64>) -> Vec<Carried> {
+    let budget = exempt_budget(compact_at);
     let calls = calls_by_id(messages);
     let mut found: Vec<Carried> = Vec::new();
     // The most recent read of each path, and the most recent write to it.
@@ -311,7 +321,7 @@ pub fn carried(messages: &[ChatMessage], seam: usize) -> Vec<Carried> {
     let mut bytes = 0;
     found.retain(|carried| {
         let cost = carried.body.len() + carried.label.as_ref().map_or(0, String::len);
-        if bytes + cost > EXEMPT_BUDGET {
+        if bytes + cost > budget {
             return false;
         }
         bytes += cost;
@@ -719,6 +729,70 @@ pub async fn compact(
     })
 }
 
+/// Stops automatic compaction from running every turn when it cannot help.
+///
+/// The prompt size is measured again after each turn, so a compaction that
+/// leaves the request at or above the threshold (a system prompt and tool
+/// schemas that are themselves most of it, say) would fire again on the very
+/// next turn, spending a compactor call and the provider's cache each time to
+/// gain nothing. After such a compaction the guard remembers the size it
+/// bottomed out at, and waits for the history to grow by half a threshold
+/// beyond it before trying again. A measurement under the threshold clears
+/// it. A forced `/compact` is never blocked; it just restarts the watch.
+///
+/// Nothing here is persisted, so a reopened clanker spends one compaction
+/// re-learning its floor. Left that way deliberately: the floor is a fact
+/// about a threshold and a system prompt that a new process may not share,
+/// and one call is a cheaper way to find out than a stale number is.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CompactionGuard {
+    /// A compaction has happened and no turn has measured its result yet.
+    pending: bool,
+    /// The size the last compaction failed to get under the threshold.
+    floor: Option<u64>,
+}
+
+impl CompactionGuard {
+    /// Whether a prompt of `prompt_tokens` should compact before the next turn.
+    pub fn due(&self, prompt_tokens: u64, threshold: u64) -> bool {
+        if prompt_tokens < threshold {
+            return false;
+        }
+        match self.floor {
+            Some(floor) => prompt_tokens >= floor.saturating_add(threshold / 2),
+            None => true,
+        }
+    }
+
+    /// A compaction was just applied.
+    pub fn compacted(&mut self) {
+        self.pending = true;
+        self.floor = None;
+    }
+
+    /// A turn opened with a request of `prompt_tokens`.
+    ///
+    /// The turn's *first* request, which is the only one that measures what
+    /// a compaction produced. Its last request carries everything the turn's
+    /// own tool calls appended — judging a fold by that would read a
+    /// compaction to a quarter of the threshold, followed by forty tool
+    /// calls, as a compaction that failed, and suppress the next one until
+    /// the history had grown half a threshold past the turn's own peak.
+    pub fn measured(&mut self, prompt_tokens: u64, threshold: u64) {
+        // Unmeasured (a failed turn, a provider with no breakdown) says
+        // nothing about whether the compaction worked.
+        if prompt_tokens == 0 {
+            return;
+        }
+        if self.pending {
+            self.pending = false;
+            self.floor = (prompt_tokens >= threshold).then_some(prompt_tokens);
+        } else if prompt_tokens < threshold {
+            self.floor = None;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -811,7 +885,7 @@ mod tests {
         ];
 
         assert_eq!(
-            bodies(&carried(&folded, folded.len())),
+            bodies(&carried(&folded, folded.len(), None)),
             vec!["here is the failing bit:\n```rs\nfn f() {}\n```"],
             "a pasted block has no file behind it — summarize it and it is gone"
         );
@@ -828,9 +902,9 @@ mod tests {
         ];
 
         assert!(
-            carried(&folded, folded.len()).is_empty(),
+            carried(&folded, folded.len(), None).is_empty(),
             "{:?}",
-            bodies(&carried(&folded, folded.len()))
+            bodies(&carried(&folded, folded.len(), None))
         );
     }
 
@@ -841,7 +915,7 @@ mod tests {
             read_back("c1", "fn parse() { todo!() }"),
         ];
 
-        let kept = carried(&folded, folded.len());
+        let kept = carried(&folded, folded.len(), None);
         assert_eq!(bodies(&kept), vec!["fn parse() { todo!() }"]);
         assert!(
             kept[0].label.as_ref().unwrap().contains("src/parser.rs"),
@@ -863,7 +937,7 @@ mod tests {
         ];
 
         assert_eq!(
-            bodies(&carried(&folded, folded.len())),
+            bodies(&carried(&folded, folded.len(), None)),
             vec!["the new text"]
         );
     }
@@ -878,7 +952,7 @@ mod tests {
         ];
 
         assert_eq!(
-            bodies(&carried(&folded, folded.len())),
+            bodies(&carried(&folded, folded.len(), None)),
             vec!["parser text", "lexer text"],
             "carried in the order the conversation put them in"
         );
@@ -898,9 +972,9 @@ mod tests {
         ];
 
         assert!(
-            carried(&messages, 3).is_empty(),
+            carried(&messages, 3, None).is_empty(),
             "{:?}",
-            bodies(&carried(&messages, 3))
+            bodies(&carried(&messages, 3, None))
         );
     }
 
@@ -913,7 +987,7 @@ mod tests {
             tool_call("c2", "replace_in_file", "src/parser.rs"),
         ];
 
-        let kept = carried(&messages, 3);
+        let kept = carried(&messages, 3, None);
         assert_eq!(kept.len(), 1);
         assert!(
             !kept[0].body.contains("before the edit"),
@@ -931,7 +1005,7 @@ mod tests {
         ];
 
         assert!(
-            carried(&messages, 1).is_empty(),
+            carried(&messages, 1, None).is_empty(),
             "a block in the kept tail would be sent twice"
         );
     }
@@ -947,7 +1021,7 @@ mod tests {
             message("tool", "File updated"),
         ];
 
-        let kept = carried(&folded, folded.len());
+        let kept = carried(&folded, folded.len(), None);
         assert_eq!(kept.len(), 1);
         assert!(
             !kept[0].body.contains("the text before the edit"),
@@ -969,7 +1043,7 @@ mod tests {
         ];
 
         assert_eq!(
-            bodies(&carried(&folded, folded.len())),
+            bodies(&carried(&folded, folded.len(), None)),
             vec!["the text after the edit"]
         );
     }
@@ -980,7 +1054,7 @@ mod tests {
         failed.content = Some(r#"{"success":false,"error":"File not found: x"}"#.to_string());
         let folded = [tool_call("c1", "read_file", "nowhere.rs"), failed];
 
-        assert!(carried(&folded, folded.len()).is_empty());
+        assert!(carried(&folded, folded.len(), None).is_empty());
     }
 
     #[test]
@@ -993,10 +1067,10 @@ mod tests {
             .map(|n| message("user", &format!("{n}\n{block}")))
             .collect();
 
-        let kept = carried(&folded, folded.len());
+        let kept = carried(&folded, folded.len(), None);
         let bytes: usize = kept.iter().map(|item| item.body.len()).sum();
 
-        assert!(bytes <= EXEMPT_BUDGET, "{bytes} bytes carried");
+        assert!(bytes <= exempt_budget(None), "{bytes} bytes carried");
         assert!(kept.len() < folded.len(), "something had to be dropped");
         assert!(
             kept.last().unwrap().body.starts_with("19"),
@@ -1387,5 +1461,59 @@ mod tests {
         let rendered = render(&message);
         assert!(rendered.contains("read_file"));
         assert!(rendered.contains("src/main.rs"));
+    }
+
+    #[test]
+    fn guard_allows_compaction_until_one_fails_to_help() {
+        let mut guard = CompactionGuard::default();
+        assert!(guard.due(5_200, 5_000));
+        assert!(!guard.due(4_000, 5_000));
+
+        guard.compacted();
+        guard.measured(5_400, 5_000);
+        // Still over after compacting: no repeat on the same size.
+        assert!(!guard.due(5_400, 5_000));
+        assert!(!guard.due(7_000, 5_000));
+        // Real growth beyond the floor lets it try again.
+        assert!(guard.due(8_000, 5_000));
+    }
+
+    #[test]
+    fn guard_clears_once_a_measurement_is_under_the_threshold() {
+        let mut guard = CompactionGuard::default();
+        guard.compacted();
+        guard.measured(5_400, 5_000);
+        guard.measured(3_000, 5_000);
+        assert!(guard.due(5_100, 5_000));
+    }
+
+    #[test]
+    fn guard_ignores_unmeasured_turns() {
+        let mut guard = CompactionGuard::default();
+        guard.compacted();
+        guard.measured(0, 5_000);
+        guard.measured(5_400, 5_000);
+        assert!(!guard.due(5_400, 5_000));
+    }
+
+    #[test]
+    fn a_tool_heavy_turn_after_a_good_compaction_sets_no_floor() {
+        // The regression this guard is one wrong argument away from: a fold
+        // to 20k against a 60k threshold, then a turn whose tool calls take
+        // the last request to 90k. Fed the turn's first request, the guard
+        // sees the compaction worked and stays out of the way.
+        let mut guard = CompactionGuard::default();
+        guard.compacted();
+        guard.measured(20_000, 60_000);
+        assert!(
+            guard.due(61_000, 60_000),
+            "a compaction that worked must not suppress the next one"
+        );
+    }
+
+    #[test]
+    fn carried_budget_scales_with_the_threshold() {
+        assert!(exempt_budget(Some(5_000)) < exempt_budget(None));
+        assert!(exempt_budget(Some(5_000)) / BYTES_PER_TOKEN < 5_000);
     }
 }

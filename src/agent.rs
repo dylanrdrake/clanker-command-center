@@ -315,11 +315,15 @@ pub struct UsageTracker {
     counts: Arc<Mutex<Counts>>,
 }
 
-/// The two numbers a turn's requests are worth keeping: what they cost in
-/// total, and how big the last of them was.
+/// The numbers a turn's requests are worth keeping: what they cost in
+/// total, and how big the first and the last of them were.
 #[derive(Debug, Default)]
 struct Counts {
     total: u64,
+    /// The prompt size of the turn's first request, which is the one that
+    /// measures what the history looked like going in — before the turn's
+    /// own tool calls added to it. `0` while no request has reported one.
+    first_prompt: u64,
     /// The prompt size of the most recent request, not a sum — it is a
     /// measurement of how large the history has grown, and adding successive
     /// measurements of the same growing thing would say nothing. `0` while
@@ -336,6 +340,9 @@ impl UsageTracker {
         let mut counts = self.counts.lock().expect("usage tracker poisoned");
         counts.total += usage.total_tokens;
         if usage.prompt_tokens > 0 {
+            if counts.first_prompt == 0 {
+                counts.first_prompt = usage.prompt_tokens;
+            }
             counts.last_prompt = usage.prompt_tokens;
         }
         // Kept individually as well as summed, because the sum cannot answer
@@ -361,6 +368,21 @@ impl UsageTracker {
             .expect("usage tracker poisoned")
             .requests
             .clone()
+    }
+
+    /// How big the turn's first request was, as the provider reported it.
+    /// `0` when nothing reported a breakdown — see [`Usage::prompt_tokens`].
+    ///
+    /// What [`last_prompt`](Self::last_prompt) cannot answer: whether a
+    /// compaction worked. The last request of an agentic turn includes
+    /// everything that turn's own tool calls appended, so a fold that landed
+    /// well under the threshold still ends the turn far above it. This is
+    /// the measurement of the history the turn started from.
+    pub fn first_prompt(&self) -> u64 {
+        self.counts
+            .lock()
+            .expect("usage tracker poisoned")
+            .first_prompt
     }
 
     /// How big the turn's last request was, as the provider reported it.
@@ -633,6 +655,9 @@ mod tests {
         // Not a sum: it is how big the last request was, and the last one
         // was 12.
         assert_eq!(caller.last_prompt(), 12);
+        // The other end of the turn, which is what says whether the history
+        // it started from was oversized.
+        assert_eq!(caller.first_prompt(), 8);
     }
 
     #[test]
@@ -653,6 +678,24 @@ mod tests {
         });
         assert_eq!(usage.total(), 140);
         assert_eq!(usage.last_prompt(), 90);
+        assert_eq!(usage.first_prompt(), 90);
+    }
+
+    #[test]
+    fn the_first_prompt_size_is_the_one_a_turn_opened_with() {
+        // An agentic turn: the history going in, then three tool calls
+        // growing it. A compaction is judged by the first of these, not the
+        // last — the last includes what the turn itself added.
+        let usage = UsageTracker::default();
+        for prompt_tokens in [20_000, 40_000, 70_000, 90_000] {
+            usage.add(Usage {
+                total_tokens: 10,
+                prompt_tokens,
+                ..Default::default()
+            });
+        }
+        assert_eq!(usage.first_prompt(), 20_000);
+        assert_eq!(usage.last_prompt(), 90_000);
     }
 
     #[test]
