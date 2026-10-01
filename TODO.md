@@ -35,7 +35,6 @@ NEXT:
   blocking prompt loop has no box to put it in, so `$` there would have to
   mean something different — probably run-and-print with no send step.
 * change status and /status to config and /config or maybe settings and /settings. In the in-session print out of the session config/settings should say something about how the session config/settings override the global ones
-* running on windows resulted in some terminal freezes, especially when logging and launching
 * --headless: built, then taken back out again. The implementation is in
   51f4ef7 if it's wanted back — flag on `ask` and `agent`, a refusal when any
   approval gate is on, and a `CLANK_HEADLESS` env marker stopping a headless
@@ -169,6 +168,16 @@ NEXT:
   tools.rs's 30s default for a terminal command when the model doesn't give one.
   The 90s stream idle one has stalled real turns twice. Would follow the same
   shape as sandbox/verbose: seeded config fields, `clank <name> <value>`.
+* `clank login` reads the API key with echo on — a plain `read_line` on
+  stdin — so the key renders as you type it and then lives in the terminal's
+  scrollback, in a tmux buffer, and in anything recording the session. Where
+  the key is *stored* was done properly (OS keychain, never config.json),
+  which is what makes the prompt itself the weak link rather than a detail.
+  A masked read is the fix, and the dependencies to do it are already here:
+  `crossterm` can read keys in raw mode directly, or `rustyline` can mask
+  through a custom highlighter rather than a password API it doesn't have.
+  Worth doing the next time that command is touched; it is the last live
+  item from deepseek-audit.md, which is otherwise spent.
 * project-scoped sessions via a .clank/ folder, like .git: walk up from cwd to
   find it, sessions live there. Bigger than storing working_dir (which is done):
   it changes WHERE state lives. Costs to weigh first — storage splits from one

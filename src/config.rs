@@ -3,6 +3,7 @@ use keyring::Entry;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -553,9 +554,60 @@ pub fn load_config() -> Result<Config> {
 }
 
 pub fn save_config(config: &Config) -> Result<()> {
-    let config_path = get_config_path()?;
     let json = serde_json::to_string_pretty(config)?;
-    fs::write(&config_path, json)?;
+    write_atomic(&get_config_path()?, &json)
+}
+
+/// Writes beside the target and renames over it, so an interrupted write
+/// leaves the old file intact rather than a truncated one. The temp name
+/// includes the PID so concurrent processes don't clobber each other's.
+///
+/// `config.json` is the one file the app refuses to start without parsing —
+/// a half-written one turns "fix the file, or delete it to start from
+/// defaults" from advice about a typo into the recovery path for a bug this
+/// function exists to prevent. So the rename is not the whole of it:
+///
+/// The contents are **fsynced before** the rename. A rename is atomic in
+/// ordering, not in durability, and without the sync a power cut can commit
+/// the rename while the temp file's blocks are still in the page cache —
+/// which lands a zero-length `config.json`, the exact outcome being
+/// defended against. ext4's heuristics usually cover this; usually is not
+/// the guarantee worth having here.
+///
+/// The directory is deliberately *not* synced afterwards. That would make
+/// the rename itself durable, and losing it leaves the previous config in
+/// place — the last setting change is gone, nothing is corrupt — so it buys
+/// a safe outcome at the price of a platform split, since a directory
+/// cannot be opened as a file on Windows.
+///
+/// The target's permissions are carried onto the replacement. A rename
+/// swaps the inode, so without this a `chmod 600 config.json` is silently
+/// undone by the next setting change — no secrets live in the file today
+/// (see [`Config::api_key`]), but reverting a mode the user chose is not
+/// this function's call to make.
+fn write_atomic(path: &Path, contents: &str) -> Result<()> {
+    let mut tmp_name = path.as_os_str().to_owned();
+    tmp_name.push(format!(".{}.tmp", std::process::id()));
+    let tmp_path = PathBuf::from(tmp_name);
+
+    // Every failure past this point leaves a temp file behind, so they all
+    // land in one place and clean up before returning.
+    let staged = (|| -> Result<()> {
+        let mut file = fs::File::create(&tmp_path)?;
+        file.write_all(contents.as_bytes())?;
+        // Before the sync, so the mode is part of what gets flushed. A
+        // missing target is the first-ever save, which keeps the default.
+        if let Ok(existing) = fs::metadata(path) {
+            fs::set_permissions(&tmp_path, existing.permissions())?;
+        }
+        file.sync_all()?;
+        Ok(())
+    })();
+
+    if let Err(e) = staged.and_then(|()| fs::rename(&tmp_path, path).map_err(Into::into)) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e);
+    }
     Ok(())
 }
 
@@ -659,6 +711,56 @@ impl SessionGates {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A directory of this test module's own, named so two runs and two
+    /// test binaries can't collide in it.
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "clank-config-test-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn write_atomic_replaces_and_leaves_no_temp() {
+        let dir = scratch_dir("atomic");
+        let path = dir.join("config.json");
+        write_atomic(&path, "old").unwrap();
+        write_atomic(&path, "new").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new");
+        assert_eq!(
+            fs::read_dir(&dir).unwrap().count(),
+            1,
+            "the temp file has to be gone, not merely unused"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_keeps_the_mode_the_file_already_had() {
+        // A rename swaps the inode, so the replacement is born with the
+        // umask default unless the old mode is carried over. Tightening
+        // config.json and then changing a setting must not loosen it again.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = scratch_dir("mode");
+        let path = dir.join("config.json");
+        write_atomic(&path, "first").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        write_atomic(&path, "second").unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "mode was reset to {mode:o}");
+        fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn timeouts_seed_themselves_in_a_config_that_predates_them() {
