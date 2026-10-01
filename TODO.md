@@ -15,117 +15,40 @@
 * Skills? implement Agent Skill Standard: agentskills.io
 
 NEXT:
-* MCP servers, and installing them the way every other harness does. The
-  top priority: it is the one feature whose absence means a capability CCC
-  cannot grow into rather than a rough edge on one it has. Every tool the
-  agent gets today has to be written into tools.rs and shipped in a binary;
-  with this, a server someone else wrote is a config entry.
-
-  Half of it is already in place, which is the reason to do it now rather
-  than later. `ToolAccessSettings` is a `BTreeMap<String, ToolAccess>` keyed
-  by tool name, `#[serde(transparent)]`, and documented as needing no
-  migration for a tool it has never heard of — so per-tool gates already
-  work for names that don't exist at compile time. Better, `category_of`
-  returns `"unknown"` for an unrecognised name and `default_access` maps
-  that to `Ask`, with the comment "a name we do not recognise is the last
-  thing that should run unattended". An MCP tool therefore lands on `ask`
-  with no new policy written at all. The approval path, the per-clanker
-  override, the `/tools` row — all of it keys off a string.
-
-  What actually breaks is the places that assume the tool list is finite and
-  known:
-  - `TOOLS: [ToolInfo; 7]` is a fixed-size array, and both `any_tools()` and
-    `rows()` iterate it. A clanker whose only enabled tools came from a
-    server would report having no tools (so the turn runs as a plain
-    exchange) and show nothing in `clank tools`. This is the change that
-    touches the most code: the array becomes something a runtime registry
-    can extend, and the drift test that asserts `TOOLS` and
-    `get_tool_definitions()` agree needs to mean something different.
-  - `execute_tool` is a `match name` over literals with no fallthrough.
-    Needs an arm that routes an unmatched name to the server that owns it,
-    which is also where a name has to carry its server: `server/tool`.
-    Measured, not assumed — the reference filesystem server exports
-    `read_file`, `write_file` and `search_files`, so three of CCC's seven
-    built-in names are taken by the *first* server anyone installs.
-    Namespacing isn't a nicety for the two-server case; it is required for
-    one, and it is also what keeps a gate written in config.json pinned to
-    the tool you meant.
-  - `"unknown"` is the right *default* and the wrong permanent *category*.
-    `clank tools allow read` works in bulk over categories, and every MCP
-    tool sharing one bucket means no bulk control and nothing for `sandbox`
-    to bound. There *is* a field to derive one from, which an earlier draft
-    of this entry denied: every tool on both reference servers carries
-    `annotations` — `readOnlyHint`, `destructiveHint`, `idempotentHint`,
-    `openWorldHint`. `readOnlyHint` splits read from write cleanly and
-    bucketed all 14 filesystem tools correctly on the first try. But the
-    mapping is not 1:1 and shouldn't be forced: `web` exists in CCC because
-    `web_fetch` touches nothing local, which is a different axis from
-    anything annotations describe. Mapping `openWorldHint` onto it put
-    `gzip-file-as-resource` in the web bucket, which is wrong. So derive
-    read/write from `readOnlyHint`, leave `web` for built-ins, and treat a
-    tool with no annotations as `unknown`/`ask`. These are *hints* a server
-    asserts about itself, so they set the default a user can see and
-    override — never the permission itself.
-
-  Three things to decide before writing any of it:
-  - **Where the schemas are paid for.** Measured, and worse than guessed.
-    `get_tool_definitions()` rides every single request: CCC's 7 built-ins
-    are 3,644 bytes (~900 tok). The reference filesystem server alone adds
-    14 tools and 8,407 bytes (~2,100 tok) — more than doubling the tool
-    overhead of every request for the rest of the session — and the
-    everything server adds 5,331 (~1,300 tok). Two servers is ~3,400
-    tokens of schema before a word is said, and it is fixed overhead no
-    fold can shrink: exactly the floor `MIN_COMPACT_AT` is computed
-    against. So enabling a server has to move that floor, `clank mcp add`
-    should say what it just cost per request, and per-clanker enablement is
-    load-bearing rather than a nicety — a clanker needing none of a
-    server's tools must not carry its schemas.
-    Per-clanker enablement matters more here than it does for anything
-    else: a clanker that needs none of a server's tools should not carry
-    its schemas.
-  - **Secrets.** Servers are usually configured with env-var API keys, and
-    32cb9ab just finished establishing that config.json holds no secrets —
-    the one key lives in the OS keychain. Server env vars belong there too,
-    with config.json holding the variable *names*, or the guarantee is
-    quietly reversed.
-  - **Process lifetime**, and this is the one with a trap in it. One
-    shared server per config entry is almost certainly right — tool calls
-    are independent, gates are already per-session — but its lifetime is
-    then the app's rather than a session's, and killing it is not what it
-    looks like. `npx` is a shim: the pid handed back is `npm exec`, which
-    forks the real server as a grandchild. Killing the pid you spawned
-    leaves the server alive, reparented to init, *still holding the stdout
-    pipe open* — so a call in flight gets no reply and no EOF either, and
-    a turn waiting on that read waits forever. Confirmed by `ps`: the
-    orphan survives, and a kill over the shared process group clears it.
-    So servers want their own process group plus a per-call timeout;
-    neither alone is enough, and nothing about the child handle hints at
-    it. Two smaller facts from the same spike: stderr must be drained or a
-    chatty server blocks on a full pipe, and the server pushes unsolicited
-    notifications (`notifications/tools/list_changed`) interleaved with
-    replies, so the reader has to demultiplex by id rather than pair one
-    read to one write. Startup is ~0.9s warm, essentially all of it npx
-    rather than the server, which argues for spawning lazily on first use
-    and keeping it. The `$` command work has the same shape and none of
-    its streaming plumbing to reuse.
-
-  All of the above past the first two paragraphs is measured, not reasoned:
-  a throwaway Python spike spawned both reference servers over stdio, did
-  the handshake (protocol 2025-06-18 negotiated by both), read `tools/list`
-  verbatim, translated it into CCC's tool-definition shape to price it, and
-  probed teardown. Worth redoing against the server *you* intend to ship
-  support for first, but the shape above is real.
-
-  Install UX, "like other harnesses": `clank mcp add <name> -- <cmd> <args>`,
-  `clank mcp list`/`remove`, and — the part that makes it feel installed
-  rather than configured — reading a server list in the shape everything
-  else already writes, so a server already set up for another harness is
-  pasted rather than re-declared. HTTP/SSE transports can come second;
-  stdio is what the ecosystem actually ships.
-
-  Adjacent, not the same: the Agent Skill Standard item above. Skills add
-  instructions, MCP adds tools; they collide only in that both want a
-  per-clanker "what is loaded" list, which is worth designing once.
+* MCP, what is left of it. The client, the config entries, `clank mcp
+  add`/`list`/`remove`/`env`, the startup connect and the dispatch are built
+  (7814084 and the four commits before it) — a server's tools arrive as
+  `server__tool`, land in a category from its `readOnlyHint`, and are
+  governed by the same gates as the built-ins with no new policy. What is
+  not done, roughly in the order it will be missed:
+  - **Per-clanker servers.** The one that matters. Servers are global, so
+    every clanker with tools carries every connected server's schemas, and
+    they are not small: the reference filesystem server's 14 tools cost
+    ~2,100 tokens against ~900 for all seven built-ins. That is fixed
+    overhead no fold can shrink, so it raises the floor `MIN_COMPACT_AT` is
+    computed against — and a clanker that needs none of a server's tools
+    should not be paying for them. Wants the same global/per-clanker shape
+    as the compactor item below.
+  - **`notifications/tools/list_changed` is read and ignored.** A server
+    that gains or loses a tool mid-session is not re-read; restart picks it
+    up. Acting on it means rebuilding the whole registered set from every
+    connected server, which `set_registered` is already total enough to do
+    — the open question is what happens to a gate set on a tool that has
+    just disappeared.
+  - **Nothing reconnects a server that dies.** The calls in flight fail
+    correctly and say why, but the tools stay registered and every later
+    call fails too, until CCC is restarted.
+  - **stdio only.** No HTTP or SSE transport. `Connection` is generic over
+    its streams precisely so that is a second constructor rather than a
+    second client, but nothing has needed it yet.
+  - **Windows leaks servers.** The clean shutdown is a signal to a process
+    group, which is how Unix groups processes and not how Windows does. A
+    server launched through a runner there can outlive CCC. Wants a job
+    object, which is a different mechanism rather than a different signal.
+  - **`gj`-shaped servers get no useful summary.** The `clank tools` line
+    falls back to the first 60 characters of the description when a server
+    ships no `title`, which reads as a truncated sentence. Nothing to fix on
+    this side; worth knowing when a listing looks bad.
 
 * Per-clanker compactor, overriding the global one like every other
   redundant global/per-clanker pair. The global settings and the machinery
@@ -307,6 +230,14 @@ NEXT:
     an actual invariant it belongs in `load_config`, which then has to decide
     between refusing the file and clamping the value, and refusing is the
     behaviour that file already has for anything it can't read.
+
+    MCP changed the arithmetic under this one, which is the part worth
+    revisiting first. The constant was derived from a fixed ~1k tokens of
+    system prompt and tool schemas; connect one ordinary server and that
+    becomes ~3k, so the floor a compacted request cannot get under is no
+    longer a constant at all — it is a function of how many servers are up.
+    Either the minimum is computed from the live tool surface, or it stays a
+    constant and stops meaning what its comment claims.
   - The guard isn't persisted, so a reopened clanker spends one compaction
     re-learning its floor. Left deliberately — a floor is a fact about a
     threshold and a system prompt a new process may not share, and a stale

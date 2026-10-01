@@ -11,6 +11,7 @@ CCC is most stable on Linux at the moment!
 - **Streaming responses** — Replies appear as they're generated rather than all at once
 - **File operations** — LLM can read, search, write, and modify local files. Reads are bounded and pageable, so one large file can't swallow a conversation's context
 - **Per-tool permissions** — every tool asks, runs freely, or isn't offered at all, set globally or per clanker with `clank tools`
+- **MCP servers** — tools from any Model Context Protocol server over stdio, added with `clank mcp add` and governed by exactly the same per-tool permissions as the built-ins
 - **Model selection** — Choose from configured provider's models
 - **Agentic loops** — Multi-turn execution with tool calling
 - **Persistent clankers** — `clanker`/`tui` conversations are saved to SQLite and resumable across restarts
@@ -416,7 +417,15 @@ $ clank tools
   write_file             ask    write    · Write or overwrite a file
   replace_in_file        ask    write    · Replace a string inside a file
   run_terminal_command   never  terminal · Run a shell command
+  gj__whoami             ask    read     · Show who is signed in
+  gj__multi_execute_tool ask    write    · Run one or more operations by slug
 ```
+
+The last two come from an [MCP server](#mcp) and are governed exactly like
+the built-ins — same three states, same categories, same per-clanker
+overrides. Bare `clank tools` starts your configured servers before it
+lists, since a tool that can't be seen can't be set; that costs a second or
+so per server, and `clank mcp` is the listing that doesn't.
 
 Each tool is in one of three states:
 
@@ -479,6 +488,77 @@ didn't becomes `allow`. Nothing is migrated and nothing is rewritten. The
 shell is the exception — it takes its new default of `never` whatever the
 old gate said, since the old model had no way to express "not offered" and
 an upgrade shouldn't leave you with a shell a fresh install doesn't have.
+
+#### `mcp`
+Tools from someone else's program. An [MCP](https://modelcontextprotocol.io)
+server is a process that speaks JSON-RPC over its stdin and stdout and
+answers with a list of tools; CCC starts the ones you configure, offers
+their tools to the model, and routes the calls back.
+
+```bash
+# Everything after `--` is the command that runs the server
+clank mcp add fs -- npx -y @modelcontextprotocol/server-filesystem .
+
+# A server that needs a token: declare the variable's NAME here
+clank mcp add gh --env GITHUB_TOKEN -- /usr/local/bin/gh-mcp
+
+# ...then store its value in the OS keychain
+clank mcp env gh GITHUB_TOKEN
+
+# What's configured, and whether each variable has a value
+clank mcp            # same as `clank mcp list`
+
+# Remove it, and forget anything stored for it
+clank mcp remove gh
+```
+
+**Its tools are named `server__tool`.** The server's name you chose, then
+`__`, then the tool's own name — so `fs` offering `read_file` becomes
+`fs__read_file`. Namespaced because collisions are the common case rather
+than a corner: the reference filesystem server exports `read_file`,
+`write_file` and `search_files`, three of CCC's seven built-ins. A server
+whose name would make an unusable tool name is refused when you add it, not
+when a turn fails.
+
+**Nothing runs unasked.** Every tool arrives on `ask`, so the first call to
+one stops and shows you what it's about to do. A server says whether each of
+its tools only reads (`readOnlyHint`), which puts it in the `read` category
+rather than `write`; one that says nothing lands in `write`, because without
+being told there's no reason to assume otherwise. Either way it's a row in
+`clank tools` you can change:
+
+```bash
+clank tools allow fs__read_text_file   # one of them
+clank tools allow read                 # every read tool, built-in or not
+clank tools never write                # sweeps the server's writers too
+```
+
+**Secrets stay out of `config.json`.** The file holds variable *names*; the
+values live in your OS keychain next to your API key. At startup each name is
+looked up in the keychain first and then in the environment CCC is running
+in, so a token you already export for other tools works without being copied
+anywhere. A name with no value in either place is reported and left unset —
+a server that checks for its token should find it missing rather than blank.
+
+**What it costs.** A server's schemas ride every request for as long as it's
+connected, and they aren't small: the reference filesystem server's 14 tools
+add about 2,100 tokens, against roughly 900 for all seven built-ins. That's
+fixed overhead no [compaction](#compact-at-value) can fold away, so it raises the
+floor every request sits on. Worth knowing before adding several.
+
+**A failing server costs only itself.** It's reported and skipped; the other
+servers connect and the clanker opens without it. CCC starts servers fresh
+on each invocation and stops them when it exits — including anything they
+started themselves, which matters more than it sounds: a server launched
+through a runner like `npx` is a grandchild process, and killing only what
+was spawned leaves the real server alive holding its pipe open.
+
+**Current limits.** stdio transport only — no HTTP or SSE. Servers are
+global rather than per-clanker, so every clanker with tools carries every
+connected server's schemas. A server that announces its tool list has
+changed is not yet re-read; restart to pick it up. On Windows the process
+group that makes the clean shutdown above work isn't available, so a server
+launched through a runner can outlive CCC.
 
 #### A prompt on its own
 
@@ -1338,6 +1418,14 @@ is `never`, not that nothing was said about it:
   "effort_style": "nested",
   "compactor": "anthropic/claude-haiku-4.5",
   "compact_at": 60000,
+  "mcp_servers": [
+    {
+      "name": "fs",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "."],
+      "env": ["FS_TOKEN"]
+    }
+  ],
   "extra_headers": {},
   "sandbox": true,
   "verbose": false,
@@ -1352,7 +1440,8 @@ is `never`, not that nothing was said about it:
 - Your API key is **not** in this file — `clank login`/`logout` store and remove it from the OS keychain instead (see [Security](#security)). If you have an old config with a plaintext `api_key` field, the next command that loads config transparently migrates it into the OS keychain and rewrites the file without it.
 - `base_url` is managed via `clank endpoint` and is the API endpoint used by every command. Defaults to OpenRouter; point it at any OpenAI-compatible service.
 - `default_model` is managed via `clank model` and is used by `ask`, `clanker`, and `agent` when `-m`/`--model` isn't passed, and always by `tui`, which has no flags at all.
-- `tools` settings control what the agent may do, and what it may do without asking. Managed via `clank tools`.
+- `tools` settings control what the agent may do, and what it may do without asking. Managed via `clank tools`. A tool from an MCP server is keyed here by its full `server__tool` name, like any other.
+- `mcp_servers` is managed via `clank mcp` and lists the MCP servers to start — see [`mcp`](#mcp). Absent by default, and left out of the file entirely while empty. `env` holds variable **names**, never values: each one is read from your OS keychain (`clank mcp env`) and then from CCC's own environment at startup, so nothing secret is written here.
 - `max_iterations` is managed via `clank max-iterations` and is the default for `clanker` and one-off runs when `--max-iterations` isn't passed, and for `tui`, which has no flags at all. `null` (after `clank max-iterations --clear`) means a clanker with tools has no cap until one is set somewhere — it does not fall back to 20.
 - `temperature` is managed via `clank temperature` and is the default for `ask`, `clanker`, and `agent` when `--temperature` isn't passed, and for `tui`, which has no flags at all. `null` (after `clank temperature --clear`) means requests are sent with no `temperature` field at all — it does not fall back to 0.7.
 - `verbose` is managed via `clank verbose` and is the value new clankers start with; `/verbose` changes the clanker you're in, not this.
@@ -1489,6 +1578,8 @@ sudo dnf groupinstall "Development Tools"
 
 - The agent's file-writing tools (`write_file`, `replace_in_file`) are confined to your current working directory by default, checked against the path a write resolves to so `..` and symlinks can't step outside it. Turn it off per clanker with `/sandbox off` or globally with `clank sandbox off`. Reads and terminal commands are not bounded this way — a terminal command runs whatever you approve, and a read changes nothing, so confining it would only break ordinary work like reading a file under `/etc`. `search_files` follows the read rule and can walk outside the working directory too; what bounds it is the number of files it will walk past, not where it starts, since bounding the path could not put anything out of reach that `read_file` can already name. This gates the agent's tools only; `clank` writes its own `~/.clank` state directly and is unaffected
 - API keys are stored in your OS keychain (macOS Keychain, Windows Credential Manager, or the Linux Secret Service via `keyring`), not in a plaintext file. An older `~/.clank/config.json` with a plaintext `api_key` field is migrated into the keychain automatically the next time you run any `clank` command, and the field is stripped from the file afterward
+- **An MCP server is someone else's program, running as you.** CCC starts it as a child process with your permissions — it is not confined by the sandbox above, which bounds the agent's own file-writing tools and nothing else. Its tools all arrive on `ask` so no call happens without you seeing it, and it is named in `clank tools` like anything else, but what the server does when a call is approved is between it and your machine. A server also describes its own tools, including whether each one only reads: those hints decide which category a tool lands in and therefore what `clank tools allow read` sweeps, so they set a *default you can see and change* and are not treated as a permission. Add servers you'd install by hand
+- Values for a server's environment variables are stored in your OS keychain under a `mcp:<server>:<VARIABLE>` entry, alongside your API key, and `clank mcp remove` deletes them with the server. `~/.clank/config.json` holds only the variable names
 - `clanker`/`tui` history is stored in `~/.clank/chats.db` with message content, tool calls, reasoning, and titles encrypted at rest (AES-256-GCM, key held in your OS keychain under a separate `db_encryption_key` entry) — but the surrounding clanker metadata (roles, model names, effort levels, timestamps) is stored in the clear, and rows written before encryption existed stay plaintext until they're next written. The key lives in the same keychain `clank` already uses, so this protects the file at rest (backups, drive theft) rather than against someone who can run `clank` as you; avoid pasting secrets into a clanker if you plan to share the database file
 - The last 100 LLM API errors (a non-2xx response, a stalled/dropped connection, a malformed stream) are kept at `~/.clank/errors.log`, so a confusing one can be looked back at without having to catch and copy it in the moment — plain text, one line per entry, oldest dropped as new ones come in
 - Each of those entries records the shape of the request that failed — role sequence, tool-call and reasoning counts — but no message text. To capture the request itself, set `CLANK_DEBUG_REQUESTS=1`: the failing request's full JSON body is written to `~/.clank/failed-request.json` (only the most recent one, overwritten each time) and the log entry names the file. **That file contains the entire conversation verbatim** — every message, tool call and tool result — so it's off by default, and worth deleting once you're done with it
