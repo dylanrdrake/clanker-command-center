@@ -43,7 +43,6 @@ pub struct ToolInfo {
 impl ToolInfo {
     /// A tool that is not compiled in. Fails rather than registering a
     /// category nothing targets — see [`CATEGORIES`].
-    #[allow(dead_code)] // see REGISTERED
     pub fn new(
         name: impl Into<String>,
         category: &str,
@@ -84,7 +83,6 @@ impl ToolInfo {
 /// str` while its name is not. A tool in no category can only be set by its
 /// own name, which is a surprise waiting to happen: `tools never all` would
 /// leave it on.
-#[allow(dead_code)] // see REGISTERED
 pub const CATEGORIES: [&str; 4] = ["read", "write", "terminal", "web"];
 
 /// The tools compiled into the binary, in the order a listing should show
@@ -145,15 +143,8 @@ pub static BUILTIN: LazyLock<Vec<ToolInfo>> = LazyLock::new(|| {
 
 /// Tools that were not compiled in, as [`set_registered`] last left them.
 ///
-/// Empty in every build so far, because nothing registers anything yet —
-/// the MCP client that will is the next thing to build. The surface around
-/// it ([`set_registered`], [`registered`], [`validate`], [`category_in`],
-/// [`CATEGORIES`] and [`ToolInfo::new`]) is therefore `dead_code` as far as
-/// the binary is concerned and carries an `allow` each, in the same spirit
-/// as [`crate::ui::AgentEvent`]: the API is complete and the tests exercise
-/// all of it, the one missing piece is a caller. Those attributes come off
-/// with the first `register` call, and if they ever need keeping, this did
-/// not turn out to be worth building ahead of its consumer.
+/// Written by `mcp::connect_all` at startup, from the servers that came
+/// up. Empty whenever no server is configured, which is the default.
 ///
 /// Process-wide rather than per-clanker because what goes in here is
 /// process-wide: one MCP server per config entry, shared by every clanker,
@@ -182,7 +173,6 @@ pub fn merge(registered: &[ToolInfo]) -> Vec<ToolInfo> {
 }
 
 /// Just the registered ones.
-#[allow(dead_code)] // see REGISTERED
 pub fn registered() -> Vec<ToolInfo> {
     read_registered().clone()
 }
@@ -204,7 +194,6 @@ pub fn registered() -> Vec<ToolInfo> {
 /// Everything worth asserting is reachable without writing: [`validate`]
 /// for the rules, [`merge`] for the composition, [`category_in`] and
 /// `ToolAccessSettings::{any_tools_in, rows_in}` for the readers.
-#[allow(dead_code)] // see REGISTERED
 pub fn set_registered(tools: Vec<ToolInfo>) -> Result<()> {
     validate(&tools)?;
     *REGISTERED.write().unwrap_or_else(|e| e.into_inner()) = tools;
@@ -222,7 +211,6 @@ pub fn set_registered(tools: Vec<ToolInfo>) -> Result<()> {
 ///
 /// Refuses a repeated name for the same reason one step along: two entries
 /// under one name make every lookup here depend on which was found first.
-#[allow(dead_code)] // see REGISTERED
 pub fn validate(tools: &[ToolInfo]) -> Result<()> {
     let mut seen = std::collections::BTreeSet::new();
     for tool in tools {
@@ -249,22 +237,17 @@ fn read_registered() -> std::sync::RwLockReadGuard<'static, Vec<ToolInfo>> {
 /// The bucket a tool falls in, or `"unknown"` for a name that is not one of
 /// ours — which the gates treat as the most restricted thing there is.
 pub fn category_of(tool_name: &str) -> &'static str {
-    BUILTIN
-        .iter()
-        .find(|tool| tool.name == tool_name)
-        .map(|tool| tool.category)
-        .or_else(|| {
-            read_registered()
-                .iter()
-                .find(|tool| tool.name == tool_name)
-                .map(|tool| tool.category)
-        })
-        .unwrap_or("unknown")
+    // Built-ins first: a registered tool cannot take one of their names
+    // (`validate` refuses it), so the order is for cost rather than
+    // precedence — the common lookup never takes the lock.
+    match category_in(&BUILTIN, tool_name) {
+        "unknown" => category_in(&read_registered(), tool_name),
+        found => found,
+    }
 }
 
 /// [`category_of`] against a list handed in, so the rule can be tested
 /// without touching the process-wide registry.
-#[allow(dead_code)] // see REGISTERED
 pub fn category_in(tools: &[ToolInfo], tool_name: &str) -> &'static str {
     tools
         .iter()
@@ -789,18 +772,18 @@ pub async fn execute_tool(
 
             web_fetch(url).await
         }
-        // A name that is not a built-in. Once a tool can be registered it
-        // can also be *called*, and a registered tool that reaches here is
-        // a different failure from a hallucinated one: the model was
-        // offered it, so the gap is on this side. Separated because the
-        // first is a bug to go and fix and the second is a model being
-        // wrong, and one message for both would hide the bug.
+        // A name that is not a built-in. A registered tool goes to the
+        // server that owns it; anything else is the model inventing a
+        // tool, and the two are kept apart because the first is a bug on
+        // this side and the second is not.
         other => {
             if registered().iter().any(|tool| tool.name == other) {
-                Err(anyhow!(
-                    "{other} is registered but nothing can run it yet; \
-                     no server is wired up to dispatch to"
-                ))
+                let text = crate::mcp::call(other, args).await?;
+                // `content` rather than `output`: every field of a result
+                // gets its own row in `/verbose`, so the name is read by a
+                // person, and a server's reply is the same kind of thing a
+                // file read returns.
+                Ok(json!({"success": true, "content": text}))
             } else {
                 Err(anyhow!("Unknown tool: {other}"))
             }

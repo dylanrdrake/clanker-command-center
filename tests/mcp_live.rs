@@ -64,7 +64,7 @@ async fn connects_lists_calls_and_cleans_up_after_itself() {
 
     // The part worth having a live test for: the pid we spawned is `npm
     // exec`, and the server is its child. Shutdown has to reap both.
-    let before = ps_matching("server-filesystem");
+    let before = ps_matching(dir.to_str().unwrap());
     println!("before shutdown, {} process(es):", before.len());
     for line in &before {
         println!("    {line}");
@@ -75,7 +75,7 @@ async fn connects_lists_calls_and_cleans_up_after_itself() {
     // waited for the group itself, so a crutch here would hide the bug a
     // caller that quits immediately would hit.
     server.shutdown().await;
-    let after = ps_matching("server-filesystem");
+    let after = ps_matching(dir.to_str().unwrap());
     println!("after shutdown, {} process(es):", after.len());
     for line in &after {
         println!("    {line}");
@@ -89,16 +89,100 @@ async fn connects_lists_calls_and_cleans_up_after_itself() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// Every process whose command line mentions `pattern`, named rather than
-/// counted — which of them survived is the useful half.
+/// The server processes matching `pattern`, named rather than counted —
+/// which of them survived is the useful half.
+///
+/// Pass something unique to one server, which is why both tests pass their
+/// own temp directory: it is on the server's command line and nothing
+/// else's. Two earlier versions of this got it wrong in the same way, by
+/// matching too widely — first the shell running the test, then the *other*
+/// test's server, since these share a process and run at the same time.
+///
+/// Filtered on the executable too: a server is launched by a node runner,
+/// so anything else matching is a bystander.
 fn ps_matching(pattern: &str) -> Vec<String> {
     let out = std::process::Command::new("ps")
-        .args(["-eo", "pid,ppid,pgid,args"])
+        .args(["-eo", "pid,ppid,pgid,comm,args"])
         .output()
         .expect("ps");
     String::from_utf8_lossy(&out.stdout)
         .lines()
-        .filter(|line| line.contains(pattern) && !line.contains("ps -eo"))
+        .filter(|line| line.contains(pattern))
+        .filter(|line| {
+            let command = line.split_whitespace().nth(3).unwrap_or_default();
+            command.starts_with("node") || command.starts_with("npm")
+        })
         .map(|line| line.trim().chars().take(110).collect())
         .collect()
+}
+
+/// The dispatch chain, which is the one link a fake server cannot test:
+/// `tools::execute_tool` is given a namespaced name by the model, finds it
+/// in the registry, and routes it to the server that owns it.
+#[tokio::test]
+#[ignore = "spawns npx"]
+async fn a_registered_tool_is_callable_by_the_name_the_model_sees() {
+    use clanker_command_center::{mcp, tools};
+
+    let dir = std::env::temp_dir().join(format!("clank-mcp-dispatch-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("note.txt"), "routed all the way through\n").unwrap();
+
+    let started = mcp::connect_all(&[filesystem_server(dir.to_str().unwrap())]).await;
+    assert!(
+        started.iter().all(|s| s.outcome.is_ok()),
+        "the server should have connected"
+    );
+
+    // Registered as a side effect of connecting, so the model is offered it.
+    let offered: Vec<String> = tools::get_tool_definitions()
+        .iter()
+        .map(|d| d["function"]["name"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        offered.iter().any(|name| name == "fs/read_text_file"),
+        "{offered:?}"
+    );
+
+    // The actual dispatch: the name the model would emit, straight into
+    // the function the agent loop calls.
+    let result = tools::execute_tool(
+        "fs/read_text_file",
+        &json!({"path": dir.join("note.txt").to_str().unwrap()}).to_string(),
+        true,
+        30,
+    )
+    .await
+    .expect("a registered tool routes to its server");
+    println!("execute_tool result: {result}");
+    assert_eq!(result["success"], true);
+    assert!(result["content"]
+        .as_str()
+        .unwrap()
+        .contains("routed all the way"));
+
+    // A server error comes back as an error, not as a successful call
+    // carrying a complaint.
+    let refused = tools::execute_tool(
+        "fs/read_text_file",
+        &json!({"path": "/etc/shadow"}).to_string(),
+        true,
+        30,
+    )
+    .await
+    .expect_err("outside the allowed directory");
+    println!("execute_tool refusal: {refused}");
+
+    // And a name that looks namespaced but belongs to nobody.
+    let nobody = tools::execute_tool("ghost/tool", "{}", true, 30)
+        .await
+        .expect_err("no such tool");
+    assert!(nobody.to_string().contains("Unknown tool"), "{nobody}");
+
+    mcp::shutdown_all().await;
+    assert!(
+        ps_matching(dir.to_str().unwrap()).is_empty(),
+        "shutdown_all left something running"
+    );
+    std::fs::remove_dir_all(&dir).ok();
 }

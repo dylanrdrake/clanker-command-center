@@ -94,6 +94,12 @@ enum Commands {
     /// Check configuration status
     Status,
 
+    /// Add, list or remove MCP servers, whose tools the agent can then use
+    Mcp {
+        #[command(subcommand)]
+        action: Option<McpAction>,
+    },
+
     /// List available models
     Models,
 
@@ -298,6 +304,43 @@ enum Commands {
     },
 }
 
+#[derive(Subcommand, Clone)]
+enum McpAction {
+    /// Add a server. Everything after `--` is the command to run it.
+    ///
+    /// e.g. clank mcp add fs -- npx -y @modelcontextprotocol/server-filesystem .
+    Add {
+        /// What its tools are prefixed with: `name/tool`
+        name: String,
+
+        /// Environment variable this server needs. Repeatable. The *name*
+        /// only — set its value with `clank mcp env`, which puts it in the
+        /// OS keychain rather than in config.json.
+        #[arg(long = "env", value_name = "VARIABLE")]
+        env: Vec<String>,
+
+        /// The command and its arguments
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
+
+    /// List the configured servers
+    List,
+
+    /// Remove a server, and forget any values stored for it
+    Remove { name: String },
+
+    /// Store the value of one of a server's environment variables
+    Env {
+        name: String,
+        /// The variable to set
+        variable: String,
+        /// Forget the stored value instead of setting one
+        #[arg(long)]
+        clear: bool,
+    },
+}
+
 #[derive(Subcommand)]
 enum HeaderCommands {
     /// Show current extra headers
@@ -420,11 +463,76 @@ fn resolve_effort_level(config: &config::Config, cli_value: Option<String>) -> O
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    let outcome = dispatch(cli).await;
+    // Whatever happened. An MCP server is a child process of this one, and
+    // a process that exits without stopping them is the orphan problem by
+    // another route — see `mcp::StdioServer::shutdown`. A no-op when
+    // nothing connected, which is every command that does not run a tool.
+    mcp::shutdown_all().await;
+    outcome
+}
 
+/// Starts every configured MCP server and registers what they offer.
+///
+/// Called only from the paths that can actually run or list a tool, so
+/// `clank model` stays instant. Returns without doing anything when no
+/// server is configured, which is the default.
+///
+/// A server that will not start costs that server and is reported. The
+/// alternative — refusing to open a clanker because something unrelated to
+/// the conversation is broken — is worse, and the tools simply are not
+/// there, which `clank tools` then shows.
+async fn connect_mcp_servers() {
+    let Ok(config) = load_config() else {
+        // A config that will not parse is reported by every other path
+        // already; failing here as well would say it twice.
+        return;
+    };
+    if config.mcp_servers.is_empty() {
+        return;
+    }
+
+    let mut specs = Vec::new();
+    for server in &config.mcp_servers {
+        match config::resolve_server(server) {
+            Ok((spec, missing)) => {
+                for variable in missing {
+                    eprintln!(
+                        "{} {}: {variable} is not set — clank mcp env {} {variable}",
+                        "!".yellow(),
+                        server.name,
+                        server.name
+                    );
+                }
+                specs.push(spec);
+            }
+            Err(e) => eprintln!("{} {}: {e}", "✗".red(), server.name),
+        }
+    }
+
+    for started in mcp::connect_all(&specs).await {
+        match started.outcome {
+            Ok(count) => {
+                if config.verbose {
+                    eprintln!(
+                        "{} {} offered {count} tool{}",
+                        "✓".green(),
+                        started.name,
+                        if count == 1 { "" } else { "s" }
+                    );
+                }
+            }
+            Err(e) => eprintln!("{} {}: {e}", "✗".red(), started.name),
+        }
+    }
+}
+
+async fn dispatch(cli: Cli) -> Result<()> {
     match cli.command {
         // A prompt on its own is a one-off run; nothing at all opens the TUI.
         None => match cli.prompt {
             Some(prompt) => {
+                connect_mcp_servers().await;
                 cmd_run(
                     &prompt,
                     cli.tools,
@@ -437,11 +545,15 @@ async fn main() -> Result<()> {
                 )
                 .await?
             }
-            None => cmd_tui().await?,
+            None => {
+                connect_mcp_servers().await;
+                cmd_tui().await?
+            }
         },
         Some(Commands::Login) => cmd_login().await?,
         Some(Commands::Logout) => cmd_logout().await?,
         Some(Commands::Status) => cmd_status().await?,
+        Some(Commands::Mcp { action }) => cmd_mcp(action).await?,
         Some(Commands::Models) => cmd_models().await?,
         Some(Commands::Model { name, clear }) => cmd_model(name, clear).await?,
         Some(Commands::Endpoint { url, clear }) => cmd_endpoint(url, clear).await?,
@@ -449,7 +561,15 @@ async fn main() -> Result<()> {
         Some(Commands::CompactAt { value, clear }) => cmd_compact_at(value, clear).await?,
         Some(Commands::EffortStyle { value, clear }) => cmd_effort_style(value, clear).await?,
         Some(Commands::Headers { action }) => cmd_headers(action).await?,
-        Some(Commands::Tools { state, target }) => cmd_tools(state, target).await?,
+        Some(Commands::Tools { state, target }) => {
+            // Connected first on purpose, even though this only reads and
+            // writes settings. A server's tools can't be listed or gated
+            // while they are unknown — `with()` refuses a name it has
+            // never heard of — so `clank tools ask fs/read_file` would
+            // report a typo that isn't one.
+            connect_mcp_servers().await;
+            cmd_tools(state, target).await?
+        }
         Some(Commands::MaxIterations { value, clear }) => cmd_max_iterations(value, clear).await?,
         Some(Commands::Temperature { value, clear }) => cmd_temperature(value, clear).await?,
         Some(Commands::Stream { value }) => cmd_stream(value).await?,
@@ -468,6 +588,7 @@ async fn main() -> Result<()> {
             here,
             title,
         }) => {
+            connect_mcp_servers().await;
             cmd_clanker(
                 model,
                 max_iterations,
@@ -535,6 +656,173 @@ async fn cmd_login() -> Result<()> {
 async fn cmd_logout() -> Result<()> {
     clear_api_key()?;
     println!("{} API key removed", "✓".green());
+    Ok(())
+}
+
+/// `clank mcp`, and its four actions.
+///
+/// Bare `clank mcp` lists, like `clank model` with no argument shows the
+/// current one rather than complaining.
+async fn cmd_mcp(action: Option<McpAction>) -> Result<()> {
+    match action.unwrap_or(McpAction::List) {
+        McpAction::List => cmd_mcp_list().await,
+        McpAction::Add { name, env, command } => cmd_mcp_add(name, env, command).await,
+        McpAction::Remove { name } => cmd_mcp_remove(&name).await,
+        McpAction::Env {
+            name,
+            variable,
+            clear,
+        } => cmd_mcp_env(&name, &variable, clear).await,
+    }
+}
+
+async fn cmd_mcp_add(name: String, env: Vec<String>, command: Vec<String>) -> Result<()> {
+    // Rejected here rather than at connect time: a name with a `/` in it
+    // cannot be routed, and finding that out when a tool is called is far
+    // too late.
+    mcp::ServerSpec::new(&name, command.first().cloned().unwrap_or_default())?;
+
+    let mut config = load_config()?;
+    if config.mcp_servers.iter().any(|server| server.name == name) {
+        anyhow::bail!(
+            "There is already a server called {name}. Remove it first, or pick another name."
+        );
+    }
+
+    let (program, args) = command
+        .split_first()
+        .ok_or_else(|| anyhow::anyhow!("Give the command to run the server after `--`"))?;
+    config.mcp_servers.push(config::McpServerConfig {
+        name: name.clone(),
+        command: program.clone(),
+        args: args.to_vec(),
+        env: env.clone(),
+    });
+    save_config(&config)?;
+
+    println!("{} Added {name}", "✓".green());
+    println!("  {} {}", program, args.join(" "));
+    for variable in &env {
+        let stored = config::get_mcp_env(&name, variable)
+            .ok()
+            .flatten()
+            .is_some();
+        let where_from = if stored {
+            format!("{} in the keychain", "✓".green())
+        } else if std::env::var(variable).is_ok() {
+            format!("{} from this environment", "✓".green())
+        } else {
+            format!("{} unset — clank mcp env {name} {variable}", "✗".red())
+        };
+        println!("  {variable}: {where_from}");
+    }
+    println!(
+        "\n{}",
+        "Its tools are off until you allow them — see clank tools.".bright_black()
+    );
+    Ok(())
+}
+
+async fn cmd_mcp_list() -> Result<()> {
+    let config = load_config()?;
+    if config.mcp_servers.is_empty() {
+        println!(
+            "\n{}\n  {}",
+            "No MCP servers configured.".blue(),
+            "clank mcp add <name> -- <command to run it>".bright_black()
+        );
+        return Ok(());
+    }
+
+    println!("\n{}", "MCP servers:".blue());
+    for server in &config.mcp_servers {
+        println!(
+            "  {} · {} {}",
+            server.name.bold(),
+            server.command,
+            server.args.join(" ")
+        );
+        // Reported per variable because a server missing its token starts
+        // and then fails every call, which reads as the server being broken.
+        for variable in &server.env {
+            let state = if config::get_mcp_env(&server.name, variable)
+                .ok()
+                .flatten()
+                .is_some()
+            {
+                format!("{} keychain", "✓".green())
+            } else if std::env::var(variable).is_ok() {
+                format!("{} environment", "✓".green())
+            } else {
+                format!("{} unset", "✗".red())
+            };
+            println!("      {variable}: {state}");
+        }
+    }
+    println!(
+        "\n{}",
+        "Tools appear as <server>/<tool> in clank tools once the server is reached.".bright_black()
+    );
+    Ok(())
+}
+
+async fn cmd_mcp_remove(name: &str) -> Result<()> {
+    let mut config = load_config()?;
+    let before = config.mcp_servers.len();
+    let removed: Vec<config::McpServerConfig> = config
+        .mcp_servers
+        .iter()
+        .filter(|server| server.name == name)
+        .cloned()
+        .collect();
+    config.mcp_servers.retain(|server| server.name != name);
+    if config.mcp_servers.len() == before {
+        anyhow::bail!("There is no server called {name}. `clank mcp` lists them.");
+    }
+    save_config(&config)?;
+
+    // Its stored values go with it. Leaving a token in the keychain for a
+    // server nobody has any more is the kind of thing that is never found
+    // again to be cleaned up.
+    for server in &removed {
+        for variable in &server.env {
+            if let Err(e) = config::clear_mcp_env(name, variable) {
+                eprintln!("{} Could not forget {variable}: {e}", "✗".yellow());
+            }
+        }
+    }
+    println!("{} Removed {name}", "✓".green());
+    Ok(())
+}
+
+async fn cmd_mcp_env(name: &str, variable: &str, clear: bool) -> Result<()> {
+    let config = load_config()?;
+    if !config.mcp_servers.iter().any(|server| server.name == name) {
+        anyhow::bail!("There is no server called {name}. `clank mcp` lists them.");
+    }
+
+    if clear {
+        config::clear_mcp_env(name, variable)?;
+        println!("{} Forgot {variable} for {name}", "✓".green());
+        return Ok(());
+    }
+
+    // Read the same way `clank login` reads a key, which is to say with
+    // the echo still on — see the note about that in TODO.md. Worth fixing
+    // in both places at once rather than differently in each.
+    print!("{} ", format!("Value for {variable}:").blue());
+    io::stdout().flush()?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let value = input.trim();
+    if value.is_empty() {
+        anyhow::bail!("Nothing entered, so nothing was stored.");
+    }
+    config::set_mcp_env(name, variable, value)?;
+    println!(
+        "{} Stored {variable} for {name} in the OS keychain",
+        "✓".green()
+    );
     Ok(())
 }
 
@@ -753,8 +1041,18 @@ async fn cmd_tools(state: Option<String>, target: Option<String>) -> Result<()> 
 
 /// The tool listing, shared by `clank tools` and `clank status`.
 fn print_tools(access: &ToolAccessSettings) {
-    for (name, value) in ui::tool_rows(access) {
-        println!("  {:<22} {}", name, value.bright_black());
+    let rows = ui::tool_rows(access);
+    // Measured rather than fixed. The width used to be the longest built-in
+    // plus a space; a tool from a server is named `server/tool` and routinely
+    // longer than that, which ran the name into the column beside it.
+    let width = rows
+        .iter()
+        .map(|(name, _)| name.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(20);
+    for (name, value) in &rows {
+        println!("  {name:<width$} {}", value.bright_black());
     }
 }
 

@@ -1057,7 +1057,17 @@ fn render_item(
                     Style::new().dark_gray().italic(),
                 ),
             ]));
-            for (name, _, state) in access.rows() {
+            let rows = access.rows();
+            // Measured, not fixed: a tool from a server is named
+            // `server/tool` and is routinely longer than the widest
+            // built-in this column used to be sized for.
+            let width = rows
+                .iter()
+                .map(|(name, _, _)| name.chars().count())
+                .max()
+                .unwrap_or(0)
+                .max(20);
+            for (name, _, state) in rows {
                 // Coloured by how much is being taken on trust: green stops
                 // and asks, yellow runs unwatched, grey is not there at all.
                 let (mark, style) = match state {
@@ -1066,7 +1076,7 @@ fn render_item(
                     ToolAccess::Never => ("✗", Style::new().dark_gray()),
                 };
                 lines.push(Line::from(vec![
-                    Span::styled(format!("      {name:<22}"), Style::new().dark_gray()),
+                    Span::styled(format!("      {name:<width$}"), Style::new().dark_gray()),
                     Span::styled(format!("{mark} {}", state.label()), style),
                 ]));
             }

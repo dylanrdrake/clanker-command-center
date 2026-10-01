@@ -19,18 +19,11 @@
 //! - [`StdioServer`], the process. Spawning, and the part that is not what
 //!   it looks like — see [`StdioServer::shutdown`].
 
-// Nothing constructs any of this yet: the config entries, the `clank mcp`
-// commands and the startup connect are the next commit, and this one is the
-// client they will use. Allowed at the module level rather than fifteen
-// times, and it comes off with the first caller — the same bargain the
-// runtime-registry surface in `tools` is under.
-#![allow(dead_code)]
-
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot};
@@ -467,10 +460,13 @@ pub fn call_result_text(result: &Value) -> Result<String> {
 /// Holds the connection, the tools it offered at connect time, and what is
 /// needed to stop it — which is more than it sounds.
 pub struct StdioServer {
-    name: String,
     connection: Connection,
     tools: Vec<ToolInfo>,
-    child: tokio::process::Child,
+    /// Taken by [`Self::shutdown`], which is why it is behind a lock and an
+    /// `Option`: a connected server is shared (every turn may call it) so
+    /// stopping it cannot need `self` by value, and stopping it twice has to
+    /// be harmless.
+    child: Mutex<Option<tokio::process::Child>>,
     /// The child's process group, when it could be put in one of its own.
     /// `None` on platforms where that isn't how processes are grouped.
     group: Option<u32>,
@@ -558,16 +554,11 @@ impl StdioServer {
         }
 
         Ok(Self {
-            name: spec.name.clone(),
             connection,
             tools,
-            child,
+            child: Mutex::new(Some(child)),
             group,
         })
-    }
-
-    pub fn name(&self) -> &str {
-        &self.name
     }
 
     /// What this server offered, already namespaced and categorised.
@@ -603,7 +594,14 @@ impl StdioServer {
     /// process we spawned, and a server launched through a runner there can
     /// outlive CCC. Noted rather than solved: it wants a job object, which
     /// is a different mechanism rather than a different signal.
-    pub async fn shutdown(mut self) {
+    pub async fn shutdown(&self) {
+        // Taken, so a second call is a no-op rather than a second round of
+        // signals at a pgid that may have been reused by then. Nothing is
+        // awaited while the lock is held.
+        let Some(mut child) = self.child.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+            return;
+        };
+
         #[cfg(unix)]
         if let Some(group) = self.group {
             let pgid = group as libc::pid_t;
@@ -622,7 +620,7 @@ impl StdioServer {
             // exists to prevent. The child is reaped each time round only
             // so it stops counting as a member of its own group.
             for _ in 0..20 {
-                let _ = self.child.try_wait();
+                let _ = child.try_wait();
                 if !group_alive(pgid) {
                     return;
                 }
@@ -633,7 +631,7 @@ impl StdioServer {
             unsafe {
                 libc::killpg(pgid, libc::SIGKILL);
             }
-            let _ = self.child.wait().await;
+            let _ = child.wait().await;
             // Reparented children are reaped by init rather than by us, so
             // the group empties a moment after the signal rather than with
             // it. Confirmed here so a caller that quits immediately after
@@ -646,7 +644,116 @@ impl StdioServer {
             }
             return;
         }
-        let _ = self.child.kill().await;
+        let _ = child.kill().await;
+    }
+}
+
+/// The servers that are up, by name.
+///
+/// Process-wide for the same reason the tool registry is: one server per
+/// config entry, shared by every clanker, outliving any one session. A
+/// server is behind an `Arc` so a call can take a handle and drop the lock
+/// before awaiting — the alternative serialises every tool call in the
+/// process behind one mutex.
+static CONNECTED: RwLock<Option<HashMap<String, Arc<StdioServer>>>> = RwLock::new(None);
+
+fn connected() -> std::sync::RwLockReadGuard<'static, Option<HashMap<String, Arc<StdioServer>>>> {
+    CONNECTED.read().unwrap_or_else(|e| e.into_inner())
+}
+
+/// What happened to one server at startup.
+pub struct Started {
+    pub name: String,
+    /// How many tools it offered, or why it did not get that far.
+    pub outcome: Result<usize>,
+}
+
+/// Connects every configured server and registers everything they offer.
+///
+/// One server failing costs that server. The rest connect, their tools are
+/// registered, and the failure is reported for whoever is listening to
+/// print — a missing `npx` or a server that will not start is a reason to
+/// carry on without it, not a reason to refuse to open a clanker.
+///
+/// The registry is rebuilt wholesale from the servers that came up, because
+/// `set_registered` is total: that is what makes a reconnect, a removal and
+/// a first run the same code path with no stale entry to clean up.
+pub async fn connect_all(specs: &[ServerSpec]) -> Vec<Started> {
+    let mut started = Vec::new();
+    let mut live: HashMap<String, Arc<StdioServer>> = HashMap::new();
+    let mut offered: Vec<ToolInfo> = Vec::new();
+
+    for spec in specs {
+        match StdioServer::connect(spec).await {
+            Ok(server) => {
+                let tools = server.tools().to_vec();
+                started.push(Started {
+                    name: spec.name.clone(),
+                    outcome: Ok(tools.len()),
+                });
+                offered.extend(tools);
+                live.insert(spec.name.clone(), Arc::new(server));
+            }
+            Err(e) => started.push(Started {
+                name: spec.name.clone(),
+                outcome: Err(e),
+            }),
+        }
+    }
+
+    // Registered before the servers are published, so a tool can never be
+    // callable before it is governable.
+    if let Err(e) = crate::tools::set_registered(offered) {
+        // The tools are refused as a set — a collision or a duplicate — so
+        // nothing is registered and nothing should be reachable either.
+        for server in live.values() {
+            server.shutdown().await;
+        }
+        started.push(Started {
+            name: "(registry)".to_string(),
+            outcome: Err(e),
+        });
+        return started;
+    }
+
+    *CONNECTED.write().unwrap_or_else(|e| e.into_inner()) = Some(live);
+    started
+}
+
+/// Routes a call to the server that owns the tool.
+///
+/// The namespaced name is the whole routing table: `fs/read_text_file` is
+/// the server `fs` and its own `read_text_file`, which is the name it has
+/// to be called by.
+pub async fn call(full_name: &str, arguments: Value) -> Result<String> {
+    let Some((server_name, tool)) = route(full_name) else {
+        return Err(anyhow!(
+            "{full_name} is not a tool from a server; there is no `/` in it to route on"
+        ));
+    };
+    let server = connected()
+        .as_ref()
+        .and_then(|live| live.get(server_name).cloned())
+        .ok_or_else(|| {
+            anyhow!("no server named {server_name} is connected, so {full_name} cannot be called")
+        })?;
+    server.call(tool, arguments).await
+}
+
+/// Stops every server, and everything they started.
+///
+/// Called on the way out. Nothing depends on it running — a dropped
+/// `StdioServer` still kills the process it spawned — but a drop cannot
+/// reach that process's own children, which is the whole point of
+/// [`StdioServer::shutdown`].
+pub async fn shutdown_all() {
+    let live = CONNECTED
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+        .unwrap_or_default();
+    for (_, server) in live {
+        server.shutdown().await;
     }
 }
 
@@ -843,6 +950,24 @@ mod tests {
         // built-in rather than like a successful call returning a complaint.
         let failed = json!({"isError": true, "content": [{"type": "text", "text": "nope"}]});
         assert_eq!(call_result_text(&failed).unwrap_err().to_string(), "nope");
+    }
+
+    #[tokio::test]
+    async fn a_call_to_a_tool_with_no_server_says_which_part_is_missing() {
+        // Two different failures that both arrive as "this didn't work".
+        // A name with no `/` was never a server's tool, so there is
+        // nothing to look up; a name with one belongs to a server that
+        // isn't there, which is a different thing to go and fix.
+        let unroutable = call("read_file", json!({})).await.expect_err("no `/`");
+        assert!(unroutable.to_string().contains("no `/`"), "{unroutable}");
+
+        let absent = call("nope/anything", json!({}))
+            .await
+            .expect_err("no such server");
+        assert!(
+            absent.to_string().contains("no server named nope"),
+            "{absent}"
+        );
     }
 
     /// Drives a `Connection` from the other end of a duplex, so the

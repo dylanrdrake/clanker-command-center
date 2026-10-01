@@ -289,6 +289,26 @@ pub const DEFAULT_COMPACT_AT: u64 = 60_000;
 /// still leaves something for the message you are about to send.
 pub const MIN_COMPACT_AT: u64 = 4_000;
 
+/// One MCP server to start, as `config.json` holds it.
+///
+/// `env` is variable *names*, never values. A server is usually configured
+/// with an API token, and `config.json` holds no secrets — the one key CCC
+/// has lives in the OS keychain, and anything written here would reverse
+/// that quietly. The value for each name is looked up at connect time: the
+/// keychain first (`clank mcp env`), then this process's own environment,
+/// so a token already exported for other tools works without being copied
+/// anywhere.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct McpServerConfig {
+    /// The prefix its tools get: `name/tool`.
+    pub name: String,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env: Vec<String>,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Config {
     /// Legacy field: API keys used to be stored here in plaintext. Only
@@ -329,6 +349,11 @@ pub struct Config {
     /// restores the byte-for-byte request CCC sent before caching existed.
     #[serde(default = "default_cache")]
     pub cache: Option<bool>,
+    /// The MCP servers to start, and whose tools to offer — see
+    /// [`McpServerConfig`]. Empty by default: a tool that can do anything
+    /// the server's author wanted is not something to acquire by upgrading.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp_servers: Vec<McpServerConfig>,
     /// Legacy: the three category gates, as configs written before tools had
     /// their own states hold them. Read so those keep meaning what they
     /// meant, never written again — it disappears from the file the next
@@ -510,6 +535,7 @@ impl Default for Config {
             default_model: default_model(),
             compactor: default_compactor(),
             compact_at: default_compact_at(),
+            mcp_servers: Vec::new(),
             cache: default_cache(),
             approval: ApprovalSettings::default(),
             // Explicitly the defaults, not `None`: `None` means "this config
@@ -655,6 +681,61 @@ fn keyring_entry() -> Result<Entry> {
 /// Reads the API key from the OS keychain (macOS Keychain, Windows
 /// Credential Manager, or the Linux Secret Service). Returns `Ok(None)`
 /// if no key has been stored yet.
+/// The keychain entry holding one server's one environment value.
+///
+/// Namespaced by server so two servers can both want `API_TOKEN`, and
+/// prefixed so none of them can collide with [`KEYRING_USERNAME`].
+fn mcp_env_entry(server: &str, variable: &str) -> Result<Entry> {
+    Ok(Entry::new(
+        KEYRING_SERVICE,
+        &format!("mcp:{server}:{variable}"),
+    )?)
+}
+
+/// The stored value for one of a server's environment variables.
+pub fn get_mcp_env(server: &str, variable: &str) -> Result<Option<String>> {
+    match mcp_env_entry(server, variable)?.get_password() {
+        Ok(value) => Ok(Some(value)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+pub fn set_mcp_env(server: &str, variable: &str, value: &str) -> Result<()> {
+    mcp_env_entry(server, variable)?.set_password(value)?;
+    Ok(())
+}
+
+pub fn clear_mcp_env(server: &str, variable: &str) -> Result<()> {
+    match mcp_env_entry(server, variable)?.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// What to start a server with, with every environment value resolved.
+///
+/// A name with no value anywhere is left out rather than passed as empty:
+/// a server that checks whether its token is set should find it missing,
+/// not find it blank. What is missing is named, so `clank mcp` can say so
+/// instead of the server failing obscurely.
+pub fn resolve_server(config: &McpServerConfig) -> Result<(crate::mcp::ServerSpec, Vec<String>)> {
+    let mut spec =
+        crate::mcp::ServerSpec::new(&config.name, &config.command)?.with_args(&config.args);
+    let mut missing = Vec::new();
+    for variable in &config.env {
+        let value = get_mcp_env(&config.name, variable)
+            .ok()
+            .flatten()
+            .or_else(|| std::env::var(variable).ok());
+        match value {
+            Some(value) => spec.env.push((variable.clone(), value)),
+            None => missing.push(variable.clone()),
+        }
+    }
+    Ok((spec, missing))
+}
+
 pub fn get_api_key() -> Result<Option<String>> {
     match keyring_entry()?.get_password() {
         Ok(key) => Ok(Some(key)),
@@ -797,6 +878,93 @@ mod tests {
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "mode was reset to {mode:o}");
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_config_written_before_mcp_existed_loads_with_no_servers() {
+        // Every config.json on disk predates this field. A missing one has
+        // to mean "no servers" rather than a parse error, the same way
+        // every other added setting has.
+        let config: Config = serde_json::from_str("{}").expect("an empty object is a config");
+        assert!(config.mcp_servers.is_empty());
+        // And it stays out of the file while it is empty, so adding the
+        // feature does not rewrite everyone's config.
+        let written = serde_json::to_string(&config).unwrap();
+        assert!(!written.contains("mcp_servers"), "{written}");
+    }
+
+    #[test]
+    fn a_server_round_trips_through_the_config_file() {
+        let mut config = Config::default();
+        config.mcp_servers.push(McpServerConfig {
+            name: "fs".to_string(),
+            command: "npx".to_string(),
+            args: vec![
+                "-y".to_string(),
+                "@modelcontextprotocol/server-filesystem".to_string(),
+            ],
+            env: vec!["FS_TOKEN".to_string()],
+        });
+        let written = serde_json::to_string(&config).unwrap();
+        let read: Config = serde_json::from_str(&written).unwrap();
+        assert_eq!(read.mcp_servers, config.mcp_servers);
+
+        // The variable's *name* is in the file. Its value is not, and must
+        // never be: config.json holds no secrets.
+        assert!(written.contains("FS_TOKEN"), "the name belongs in the file");
+    }
+
+    #[test]
+    fn an_environment_value_is_found_without_the_keychain() {
+        // The fallback that makes a token already exported for other tools
+        // work without being copied anywhere. Named per-test because the
+        // process environment is shared with every other test.
+        let variable = format!("CLANK_TEST_TOKEN_{}", std::process::id());
+        std::env::set_var(&variable, "from-the-environment");
+
+        let config = McpServerConfig {
+            name: "probe".to_string(),
+            command: "true".to_string(),
+            args: vec!["--flag".to_string()],
+            env: vec![variable.clone()],
+        };
+        let (spec, missing) = resolve_server(&config).unwrap();
+
+        assert!(missing.is_empty(), "{missing:?}");
+        assert_eq!(
+            spec.env,
+            vec![(variable.clone(), "from-the-environment".to_string())]
+        );
+        assert_eq!(spec.args, vec!["--flag".to_string()]);
+        std::env::remove_var(&variable);
+    }
+
+    #[test]
+    fn a_value_that_is_nowhere_is_named_rather_than_passed_as_empty() {
+        // A server that checks whether its token is set should find it
+        // missing, not find it blank — and whoever ran the command should
+        // be told which one, because the alternative is a server that
+        // starts and then fails every call.
+        let config = McpServerConfig {
+            name: "probe".to_string(),
+            command: "true".to_string(),
+            args: Vec::new(),
+            env: vec![format!("CLANK_TEST_UNSET_{}", std::process::id())],
+        };
+        let (spec, missing) = resolve_server(&config).unwrap();
+        assert_eq!(missing, config.env);
+        assert!(spec.env.is_empty(), "{:?}", spec.env);
+    }
+
+    #[test]
+    fn a_server_name_that_cannot_be_routed_is_refused_before_it_is_stored() {
+        let config = McpServerConfig {
+            name: "has/slash".to_string(),
+            command: "true".to_string(),
+            args: Vec::new(),
+            env: Vec::new(),
+        };
+        assert!(resolve_server(&config).is_err());
     }
 
     #[test]
