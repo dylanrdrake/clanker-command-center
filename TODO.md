@@ -15,6 +15,78 @@
 * Skills? implement Agent Skill Standard: agentskills.io
 
 NEXT:
+* MCP servers, and installing them the way every other harness does. The
+  top priority: it is the one feature whose absence means a capability CCC
+  cannot grow into rather than a rough edge on one it has. Every tool the
+  agent gets today has to be written into tools.rs and shipped in a binary;
+  with this, a server someone else wrote is a config entry.
+
+  Half of it is already in place, which is the reason to do it now rather
+  than later. `ToolAccessSettings` is a `BTreeMap<String, ToolAccess>` keyed
+  by tool name, `#[serde(transparent)]`, and documented as needing no
+  migration for a tool it has never heard of — so per-tool gates already
+  work for names that don't exist at compile time. Better, `category_of`
+  returns `"unknown"` for an unrecognised name and `default_access` maps
+  that to `Ask`, with the comment "a name we do not recognise is the last
+  thing that should run unattended". An MCP tool therefore lands on `ask`
+  with no new policy written at all. The approval path, the per-clanker
+  override, the `/tools` row — all of it keys off a string.
+
+  What actually breaks is the places that assume the tool list is finite and
+  known:
+  - `TOOLS: [ToolInfo; 7]` is a fixed-size array, and both `any_tools()` and
+    `rows()` iterate it. A clanker whose only enabled tools came from a
+    server would report having no tools (so the turn runs as a plain
+    exchange) and show nothing in `clank tools`. This is the change that
+    touches the most code: the array becomes something a runtime registry
+    can extend, and the drift test that asserts `TOOLS` and
+    `get_tool_definitions()` agree needs to mean something different.
+  - `execute_tool` is a `match name` over literals with no fallthrough.
+    Needs an arm that routes an unmatched name to the server that owns it,
+    which is also where a name has to carry its server: `server/tool`, both
+    so two servers can export `search` and so a gate written in config.json
+    stays pinned to the one you meant.
+  - `"unknown"` is the right *default* and the wrong permanent *category*.
+    `clank tools allow read` works in bulk over categories, and every MCP
+    tool sharing one bucket means no bulk control and nothing for `sandbox`
+    to bound. Either servers declare a category per tool (MCP has no field
+    for it, so this is CCC's own mapping) or they get a category each and
+    bulk ops learn to take a server name.
+
+  Three things to decide before writing any of it:
+  - **Where the schemas are paid for.** `get_tool_definitions()` goes into
+    every single request — 7 tools measure 3,644 bytes, about 900 tokens.
+    A handful of servers can multiply that, and it is fixed overhead no
+    compaction can shrink, which is exactly the floor `MIN_COMPACT_AT` is
+    computed against. So enabling a server has to raise that floor, and
+    `clank mcp add` should probably say what it just cost per request.
+    Per-clanker enablement matters more here than it does for anything
+    else: a clanker that needs none of a server's tools should not carry
+    its schemas.
+  - **Secrets.** Servers are usually configured with env-var API keys, and
+    32cb9ab just finished establishing that config.json holds no secrets —
+    the one key lives in the OS keychain. Server env vars belong there too,
+    with config.json holding the variable *names*, or the guarantee is
+    quietly reversed.
+  - **Process lifetime.** stdio servers are child processes, while CCC runs
+    many clankers in one process. One shared server per config entry is
+    almost certainly right (tool calls are independent, gates are already
+    per-session), but then its lifetime is the app's rather than a session's,
+    and a server that dies mid-turn, hangs, or writes to stderr forever
+    needs an answer that isn't "the turn hangs". The `$` command work has
+    the same shape and none of its streaming plumbing to reuse.
+
+  Install UX, "like other harnesses": `clank mcp add <name> -- <cmd> <args>`,
+  `clank mcp list`/`remove`, and — the part that makes it feel installed
+  rather than configured — reading a server list in the shape everything
+  else already writes, so a server already set up for another harness is
+  pasted rather than re-declared. HTTP/SSE transports can come second;
+  stdio is what the ecosystem actually ships.
+
+  Adjacent, not the same: the Agent Skill Standard item above. Skills add
+  instructions, MCP adds tools; they collide only in that both want a
+  per-clanker "what is loaded" list, which is worth designing once.
+
 * Per-clanker compactor, overriding the global one like every other
   redundant global/per-clanker pair. The global settings and the machinery
   are built (`clank compactor`, `clank compact-at`, `/compact`); what is
