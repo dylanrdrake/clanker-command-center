@@ -71,10 +71,21 @@ impl ServerSpec {
         if name.is_empty() {
             return Err(anyhow!("a server needs a name"));
         }
-        if name.contains('/') {
+        if name.contains(SEPARATOR) {
             return Err(anyhow!(
-                "{name:?} cannot be a server name: the `/` is what separates \
-                 a server from its tool in `{name}/some_tool`"
+                "{name:?} cannot be a server name: `{SEPARATOR}` is what separates \
+                 a server from its tool in `{name}{SEPARATOR}some_tool`"
+            ));
+        }
+        // The server's name is the front of every tool name it contributes,
+        // and a provider rejects the whole request over one bad character —
+        // so it is caught here, when it is typed, rather than at the first
+        // turn after it.
+        if !representable(&name) {
+            return Err(anyhow!(
+                "{name:?} cannot be a server name: a tool name reaches the model as \
+                 `{name}{SEPARATOR}some_tool`, and providers only accept letters, \
+                 digits, `_` and `-` there"
             ));
         }
         Ok(Self {
@@ -95,7 +106,32 @@ impl ServerSpec {
     }
 }
 
-/// The name a tool is known by once it is CCC's: `server/tool`.
+/// What separates a server from its tool in a namespaced name.
+///
+/// Not `/`, which is what this was and which does not work. A tool name
+/// goes to the provider inside the schema, and providers hold it to
+/// `^[a-zA-Z0-9_-]{1,128}$` — no slash. The request is rejected whole, so
+/// one unrepresentable name costs the entire turn rather than one tool:
+///
+/// ```text
+/// tools.0.custom.name: String should match pattern '^[a-zA-Z0-9_-]{1,128}$'
+/// ```
+///
+/// A doubled underscore is in the permitted set, is the convention other
+/// harnesses settled on, and stays unambiguous as long as a server's own
+/// name cannot contain one — which [`ServerSpec::new`] enforces.
+pub const SEPARATOR: &str = "__";
+
+/// Every character a provider will accept in a tool name.
+fn representable(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// The name a tool is known by once it is CCC's: `server__tool`.
 ///
 /// Namespaced because the first server anyone installs collides. The
 /// reference filesystem server exports `read_file`, `write_file` and
@@ -103,15 +139,16 @@ impl ServerSpec {
 /// `tools::set_registered` refuses a bare collision rather than letting one
 /// shadow the other.
 pub fn namespaced(server: &str, tool: &str) -> String {
-    format!("{server}/{tool}")
+    format!("{server}{SEPARATOR}{tool}")
 }
 
 /// Which server a namespaced name belongs to, and what it is called there.
 ///
-/// `None` for a name with no `/`, which is a built-in or a model's
-/// invention rather than anything to route.
+/// `None` for a name with no separator, which is a built-in or a model's
+/// invention rather than anything to route. Split at the *first* separator,
+/// so a tool whose own name contains one still routes to the right server.
 pub fn route(name: &str) -> Option<(&str, &str)> {
-    name.split_once('/')
+    name.split_once(SEPARATOR)
 }
 
 /// The bucket an MCP tool falls in, from the hints it declares about itself.
@@ -209,6 +246,17 @@ pub fn tool_from_mcp(server: &str, tool: &Value) -> Result<ToolInfo> {
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("{server} offered a tool with no name"))?;
     let full_name = namespaced(server, bare);
+    // Refused here so the tool is skipped and named — see `tools_from_list`.
+    // A name the provider will not take fails the whole request, not just
+    // the call, so one tool with a dot in it would otherwise cost every
+    // turn for as long as the server is connected.
+    if !representable(&full_name) {
+        return Err(anyhow!(
+            "{server} offers {bare:?}, which cannot be sent to a provider: \
+             a tool name may only hold letters, digits, `_` and `-`, and at \
+             most 128 of them"
+        ));
+    }
     let category = category_from_annotations(tool.get("annotations"));
     ToolInfo::new(
         full_name.clone(),
@@ -728,7 +776,7 @@ pub async fn connect_all(specs: &[ServerSpec]) -> Vec<Started> {
 pub async fn call(full_name: &str, arguments: Value) -> Result<String> {
     let Some((server_name, tool)) = route(full_name) else {
         return Err(anyhow!(
-            "{full_name} is not a tool from a server; there is no `/` in it to route on"
+            "{full_name} is not a tool from a server; there is no `{SEPARATOR}` in it to route on"
         ));
     };
     let server = connected()
@@ -823,11 +871,11 @@ mod tests {
         // too, and `set_registered` refuses a bare collision — so the name
         // has to arrive already namespaced, not get fixed up later.
         let tool = tool_from_mcp("fs", &real_write_file()).unwrap();
-        assert_eq!(tool.name, "fs/write_file");
+        assert_eq!(tool.name, "fs__write_file");
         assert_eq!(route(&tool.name), Some(("fs", "write_file")));
         // And the model is told the namespaced name, which is the only one
         // that says where to send the call.
-        assert_eq!(tool.schema["function"]["name"], "fs/write_file");
+        assert_eq!(tool.schema["function"]["name"], "fs__write_file");
         crate::tools::validate(&[tool]).expect("namespaced, so it no longer collides");
     }
 
@@ -928,9 +976,79 @@ mod tests {
 
     #[test]
     fn a_server_name_cannot_contain_the_separator() {
-        let err = ServerSpec::new("a/b", "x").expect_err("that `/` would split wrong");
+        let err = ServerSpec::new("a__b", "x").expect_err("that would split wrong");
         assert!(err.to_string().contains("separates"), "{err}");
         assert!(ServerSpec::new("fs", "npx").is_ok());
+    }
+
+    #[test]
+    fn every_name_sent_to_a_provider_matches_what_a_provider_accepts() {
+        // The bug this pins, verbatim from the 400 that found it:
+        //   tools.0.custom.name: String should match pattern
+        //   '^[a-zA-Z0-9_-]{1,128}$'
+        // The name was namespaced with a `/`, which is not in that set, and
+        // a provider rejects the entire request over it — so every turn
+        // failed for as long as a server was connected, before the model
+        // saw anything. Asserted against the pattern itself rather than
+        // against the separator, so changing the separator to something
+        // else invalid fails here instead of in front of a user.
+        let pattern = regex::Regex::new("^[a-zA-Z0-9_-]{1,128}$").unwrap();
+
+        for tool in [real_read_text_file(), real_write_file()] {
+            let translated = tool_from_mcp("fs", &tool).unwrap();
+            let sent = translated.schema["function"]["name"].as_str().unwrap();
+            assert!(pattern.is_match(sent), "{sent:?} would be refused");
+            assert_eq!(sent, translated.name, "the gate keys off the same name");
+        }
+
+        // And the real server that found it: hyphens are fine, which is
+        // what the everything server uses.
+        let hyphenated = json!({"name": "get-annotated-message"});
+        let translated = tool_from_mcp("ev", &hyphenated).unwrap();
+        assert!(pattern.is_match(&translated.name), "{}", translated.name);
+        assert_eq!(
+            route(&translated.name),
+            Some(("ev", "get-annotated-message"))
+        );
+    }
+
+    #[test]
+    fn a_name_a_provider_would_refuse_costs_its_tool_and_not_the_turn() {
+        // One unrepresentable name used to fail the whole request, so a
+        // single tool with a dot in it would have cost every turn. Skipped
+        // and named instead, like an unnamed tool.
+        let reply = json!({"tools": [
+            real_read_text_file(),
+            {"name": "has.a.dot"},
+            {"name": "has a space"},
+            {"name": "x".repeat(130)},
+            real_write_file(),
+        ]});
+        let (tools, skipped) = tools_from_list("fs", &reply);
+
+        assert_eq!(tools.len(), 2, "the two good ones survive");
+        assert_eq!(skipped.len(), 3);
+        assert!(
+            skipped.iter().all(|s| s.contains("cannot be sent")),
+            "{skipped:?}"
+        );
+    }
+
+    #[test]
+    fn a_server_name_a_provider_would_refuse_is_caught_when_it_is_typed() {
+        // Rather than at the first turn after it: the server name is the
+        // front of every tool name it contributes.
+        for bad in ["has space", "has.dot", "has/slash", "héllo"] {
+            let err = ServerSpec::new(bad, "x")
+                .expect_err("a provider would refuse every tool this server named");
+            assert!(
+                err.to_string().contains("providers only accept"),
+                "{bad:?}: {err}"
+            );
+        }
+        for fine in ["fs", "gj", "my-server", "server_2"] {
+            assert!(ServerSpec::new(fine, "x").is_ok(), "{fine:?}");
+        }
     }
 
     #[test]
@@ -958,10 +1076,12 @@ mod tests {
         // A name with no `/` was never a server's tool, so there is
         // nothing to look up; a name with one belongs to a server that
         // isn't there, which is a different thing to go and fix.
-        let unroutable = call("read_file", json!({})).await.expect_err("no `/`");
-        assert!(unroutable.to_string().contains("no `/`"), "{unroutable}");
+        let unroutable = call("read_file", json!({}))
+            .await
+            .expect_err("no separator");
+        assert!(unroutable.to_string().contains("no `__`"), "{unroutable}");
 
-        let absent = call("nope/anything", json!({}))
+        let absent = call("nope__anything", json!({}))
             .await
             .expect_err("no such server");
         assert!(

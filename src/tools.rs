@@ -56,6 +56,25 @@ impl ToolInfo {
             .ok_or_else(|| {
                 anyhow!("{category:?} is not a tool category; expected one of {CATEGORIES:?}")
             })?;
+        // A name the provider will not take. Held here, at the one
+        // constructor every runtime tool goes through, because the failure
+        // is so disproportionate: the name travels inside the schema, a
+        // provider holds it to `^[a-zA-Z0-9_-]{1,128}$`, and it rejects the
+        // whole request over one character — so a single bad name costs
+        // every turn for as long as the tool is registered, before the
+        // model is given anything. Found that way, by a 400 from five
+        // providers at once, when these were namespaced with a `/`.
+        if name.is_empty()
+            || name.len() > 128
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            return Err(anyhow!(
+                "{name:?} cannot be a tool name: a provider accepts only letters, \
+                 digits, `_` and `-`, and at most 128 of them"
+            ));
+        }
         // The provider calls a tool by the name inside the schema, while
         // every gate here keys off the name beside it. Two names for one
         // tool is a tool governed under one and invoked under the other, so
@@ -1578,8 +1597,8 @@ mod tests {
     #[test]
     fn a_registered_tool_joins_the_list_after_the_built_ins() {
         let extra = vec![
-            registered_tool("fs/read_text_file", "read"),
-            registered_tool("fs/write_file", "write"),
+            registered_tool("fs__read_text_file", "read"),
+            registered_tool("fs__write_file", "write"),
         ];
         let all = merge(&extra);
 
@@ -1588,8 +1607,8 @@ mod tests {
         // meant to run harmless-to-dangerous, and that only holds if the
         // set that was ordered on purpose stays at the top.
         assert_eq!(all[0].name, BUILTIN[0].name);
-        assert_eq!(all[BUILTIN.len()].name, "fs/read_text_file");
-        assert_eq!(all.last().unwrap().name, "fs/write_file");
+        assert_eq!(all[BUILTIN.len()].name, "fs__read_text_file");
+        assert_eq!(all.last().unwrap().name, "fs__write_file");
     }
 
     #[test]
@@ -1602,8 +1621,8 @@ mod tests {
         // ran as a plain exchange), `clank tools` listed nothing to set,
         // and there was no row to set it on.
         let all = merge(&[
-            registered_tool("fs/read_text_file", "read"),
-            registered_tool("fs/write_file", "write"),
+            registered_tool("fs__read_text_file", "read"),
+            registered_tool("fs__write_file", "write"),
         ]);
 
         // Asserted one reader at a time and never as a conjunction. Both
@@ -1613,7 +1632,7 @@ mod tests {
         // only checked `!none.any_tools()` passed against the bug.
         let none = ToolAccessSettings::none_in(&all);
         assert_eq!(
-            none.access("fs/write_file"),
+            none.access("fs__write_file"),
             ToolAccess::Never,
             "`tools off` has to reach a tool it was never compiled against"
         );
@@ -1635,7 +1654,7 @@ mod tests {
         assert_eq!(rows.len(), all.len(), "all of them are listed");
         let (name, category, access) = rows
             .iter()
-            .find(|(name, _, _)| name == "fs/write_file")
+            .find(|(name, _, _)| name == "fs__write_file")
             .expect("a registered tool has a row");
         assert_eq!(*category, "write");
         assert_eq!(
@@ -1653,20 +1672,20 @@ mod tests {
         // and `tools never read` have to reach a tool nobody compiled in,
         // or it is settable only by its own name — which is how you end up
         // believing you turned everything off and leaving one on.
-        let all = merge(&[registered_tool("fs/read_text_file", "read")]);
+        let all = merge(&[registered_tool("fs__read_text_file", "read")]);
         let off = ToolAccessSettings::default()
             .with_in(&all, "read", ToolAccess::Never)
             .expect("\"read\" matches");
-        assert_eq!(off.access("fs/read_text_file"), ToolAccess::Never);
+        assert_eq!(off.access("fs__read_text_file"), ToolAccess::Never);
         assert_eq!(off.access("read_file"), ToolAccess::Never);
     }
 
     #[test]
     fn category_lookup_falls_back_to_unknown_for_a_stranger() {
-        let all = merge(&[registered_tool("fs/read_text_file", "read")]);
-        assert_eq!(category_in(&all, "fs/read_text_file"), "read");
+        let all = merge(&[registered_tool("fs__read_text_file", "read")]);
+        assert_eq!(category_in(&all, "fs__read_text_file"), "read");
         assert_eq!(category_in(&all, "read_file"), "read");
-        assert_eq!(category_in(&all, "fs/nothing_like_it"), "unknown");
+        assert_eq!(category_in(&all, "fs__nothing_like_it"), "unknown");
     }
 
     #[test]
@@ -1677,14 +1696,14 @@ mod tests {
             let err = validate(&[registered_tool(name, "read")]).expect_err("{name} is a built-in");
             assert!(err.to_string().contains("already a built-in"), "{err}");
         }
-        assert!(validate(&[registered_tool("fs/read_file", "read")]).is_ok());
+        assert!(validate(&[registered_tool("fs__read_file", "read")]).is_ok());
     }
 
     #[test]
     fn the_same_name_cannot_be_registered_twice() {
         let err = validate(&[
-            registered_tool("fs/read_text_file", "read"),
-            registered_tool("fs/read_text_file", "write"),
+            registered_tool("fs__read_text_file", "read"),
+            registered_tool("fs__read_text_file", "write"),
         ])
         .expect_err("a repeated name makes every lookup order-dependent");
         assert!(err.to_string().contains("registered twice"), "{err}");
@@ -1692,11 +1711,11 @@ mod tests {
 
     #[test]
     fn a_tool_cannot_be_registered_into_a_category_nothing_targets() {
-        let err = ToolInfo::new("fs/thing", "filesystem", "x", tool_schema("fs/thing"))
+        let err = ToolInfo::new("fs__thing", "filesystem", "x", tool_schema("fs__thing"))
             .expect_err("\"filesystem\" is not one of CCC's buckets");
         assert!(err.to_string().contains("not a tool category"), "{err}");
         for known in CATEGORIES {
-            assert!(ToolInfo::new("fs/thing", known, "x", tool_schema("fs/thing")).is_ok());
+            assert!(ToolInfo::new("fs__thing", known, "x", tool_schema("fs__thing")).is_ok());
         }
     }
 
@@ -1706,7 +1725,7 @@ mod tests {
         // use if the model is never told the tool exists: this used to read
         // a hand-written list of the seven built-in schemas, so a
         // registered tool was governable and unreachable at the same time.
-        let all = merge(&[registered_tool("fs/read_text_file", "read")]);
+        let all = merge(&[registered_tool("fs__read_text_file", "read")]);
         let defined: Vec<String> = definitions_for(&all)
             .iter()
             .map(|d| d["function"]["name"].as_str().unwrap().to_string())
@@ -1714,23 +1733,41 @@ mod tests {
 
         assert_eq!(defined.len(), BUILTIN.len() + 1);
         assert!(
-            defined.iter().any(|name| name == "fs/read_text_file"),
+            defined.iter().any(|name| name == "fs__read_text_file"),
             "{defined:?}"
         );
         // Still every built-in, and still in listing order.
         assert_eq!(defined[0], BUILTIN[0].name);
-        assert_eq!(defined.last().unwrap(), "fs/read_text_file");
+        assert_eq!(defined.last().unwrap(), "fs__read_text_file");
     }
 
     #[test]
     fn a_tool_whose_schema_names_something_else_is_refused() {
         // The gates key off the name beside the schema; the model calls the
         // name inside it. If those differ, the tool is governed under one
-        // name and invoked under another — so `tools never fs/write` would
+        // name and invoked under another — so `tools never fs__write_file` would
         // read as honoured and change nothing.
-        let err = ToolInfo::new("fs/write_file", "write", "x", tool_schema("write_file"))
+        let err = ToolInfo::new("fs__write_file", "write", "x", tool_schema("write_file"))
             .expect_err("the schema names a different tool");
         assert!(err.to_string().contains("would not reach it"), "{err}");
+    }
+
+    #[test]
+    fn every_built_in_is_named_something_a_provider_will_accept() {
+        // The same rule that caught the MCP separator, applied to the names
+        // that ship. A provider holds a tool name to
+        // `^[a-zA-Z0-9_-]{1,128}$` and rejects the whole request over one
+        // bad character, so a built-in named with a dot or a space would
+        // break every turn for everyone — and it would break it at the
+        // provider rather than here.
+        let pattern = regex::Regex::new("^[a-zA-Z0-9_-]{1,128}$").unwrap();
+        for tool in BUILTIN.iter() {
+            assert!(
+                pattern.is_match(&tool.name),
+                "{:?} would be refused",
+                tool.name
+            );
+        }
     }
 
     #[test]

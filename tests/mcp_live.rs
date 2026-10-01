@@ -33,8 +33,20 @@ async fn connects_lists_calls_and_cleans_up_after_itself() {
     assert!(tools.len() > 5, "it exports more than a handful");
 
     // Namespaced, so the three that collide with built-ins no longer do.
-    assert!(tools.iter().all(|t| t.name.starts_with("fs/")));
+    assert!(tools.iter().all(|t| t.name.starts_with("fs__")));
     clanker_command_center::tools::validate(tools).expect("no collisions after namespacing");
+
+    // Every name as the provider will see it. A `/` here is what produced
+    // a 400 from every provider and killed the turn before the model saw
+    // anything, so it is checked against a real server's real names.
+    let pattern = regex::Regex::new("^[a-zA-Z0-9_-]{1,128}$").unwrap();
+    for tool in tools {
+        let sent = tool.schema["function"]["name"].as_str().unwrap();
+        assert!(
+            pattern.is_match(sent),
+            "{sent:?} would be refused by a provider"
+        );
+    }
 
     // Annotations actually bucketed them.
     let reads = tools.iter().filter(|t| t.category == "read").count();
@@ -43,7 +55,7 @@ async fn connects_lists_calls_and_cleans_up_after_itself() {
     assert!(reads > 0 && writes > 0);
 
     // A real call, routed by the namespaced name the model would use.
-    let full = "fs/read_text_file";
+    let full = "fs__read_text_file";
     let (_, bare) = route(full).unwrap();
     let text = server
         .call(
@@ -140,14 +152,14 @@ async fn a_registered_tool_is_callable_by_the_name_the_model_sees() {
         .map(|d| d["function"]["name"].as_str().unwrap().to_string())
         .collect();
     assert!(
-        offered.iter().any(|name| name == "fs/read_text_file"),
+        offered.iter().any(|name| name == "fs__read_text_file"),
         "{offered:?}"
     );
 
     // The actual dispatch: the name the model would emit, straight into
     // the function the agent loop calls.
     let result = tools::execute_tool(
-        "fs/read_text_file",
+        "fs__read_text_file",
         &json!({"path": dir.join("note.txt").to_str().unwrap()}).to_string(),
         true,
         30,
@@ -164,7 +176,7 @@ async fn a_registered_tool_is_callable_by_the_name_the_model_sees() {
     // A server error comes back as an error, not as a successful call
     // carrying a complaint.
     let refused = tools::execute_tool(
-        "fs/read_text_file",
+        "fs__read_text_file",
         &json!({"path": "/etc/shadow"}).to_string(),
         true,
         30,
@@ -174,7 +186,7 @@ async fn a_registered_tool_is_callable_by_the_name_the_model_sees() {
     println!("execute_tool refusal: {refused}");
 
     // And a name that looks namespaced but belongs to nobody.
-    let nobody = tools::execute_tool("ghost/tool", "{}", true, 30)
+    let nobody = tools::execute_tool("ghost__tool", "{}", true, 30)
         .await
         .expect_err("no such tool");
     assert!(nobody.to_string().contains("Unknown tool"), "{nobody}");
