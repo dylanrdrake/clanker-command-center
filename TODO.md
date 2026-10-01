@@ -43,23 +43,43 @@ NEXT:
     `get_tool_definitions()` agree needs to mean something different.
   - `execute_tool` is a `match name` over literals with no fallthrough.
     Needs an arm that routes an unmatched name to the server that owns it,
-    which is also where a name has to carry its server: `server/tool`, both
-    so two servers can export `search` and so a gate written in config.json
-    stays pinned to the one you meant.
+    which is also where a name has to carry its server: `server/tool`.
+    Measured, not assumed — the reference filesystem server exports
+    `read_file`, `write_file` and `search_files`, so three of CCC's seven
+    built-in names are taken by the *first* server anyone installs.
+    Namespacing isn't a nicety for the two-server case; it is required for
+    one, and it is also what keeps a gate written in config.json pinned to
+    the tool you meant.
   - `"unknown"` is the right *default* and the wrong permanent *category*.
     `clank tools allow read` works in bulk over categories, and every MCP
     tool sharing one bucket means no bulk control and nothing for `sandbox`
-    to bound. Either servers declare a category per tool (MCP has no field
-    for it, so this is CCC's own mapping) or they get a category each and
-    bulk ops learn to take a server name.
+    to bound. There *is* a field to derive one from, which an earlier draft
+    of this entry denied: every tool on both reference servers carries
+    `annotations` — `readOnlyHint`, `destructiveHint`, `idempotentHint`,
+    `openWorldHint`. `readOnlyHint` splits read from write cleanly and
+    bucketed all 14 filesystem tools correctly on the first try. But the
+    mapping is not 1:1 and shouldn't be forced: `web` exists in CCC because
+    `web_fetch` touches nothing local, which is a different axis from
+    anything annotations describe. Mapping `openWorldHint` onto it put
+    `gzip-file-as-resource` in the web bucket, which is wrong. So derive
+    read/write from `readOnlyHint`, leave `web` for built-ins, and treat a
+    tool with no annotations as `unknown`/`ask`. These are *hints* a server
+    asserts about itself, so they set the default a user can see and
+    override — never the permission itself.
 
   Three things to decide before writing any of it:
-  - **Where the schemas are paid for.** `get_tool_definitions()` goes into
-    every single request — 7 tools measure 3,644 bytes, about 900 tokens.
-    A handful of servers can multiply that, and it is fixed overhead no
-    compaction can shrink, which is exactly the floor `MIN_COMPACT_AT` is
-    computed against. So enabling a server has to raise that floor, and
-    `clank mcp add` should probably say what it just cost per request.
+  - **Where the schemas are paid for.** Measured, and worse than guessed.
+    `get_tool_definitions()` rides every single request: CCC's 7 built-ins
+    are 3,644 bytes (~900 tok). The reference filesystem server alone adds
+    14 tools and 8,407 bytes (~2,100 tok) — more than doubling the tool
+    overhead of every request for the rest of the session — and the
+    everything server adds 5,331 (~1,300 tok). Two servers is ~3,400
+    tokens of schema before a word is said, and it is fixed overhead no
+    fold can shrink: exactly the floor `MIN_COMPACT_AT` is computed
+    against. So enabling a server has to move that floor, `clank mcp add`
+    should say what it just cost per request, and per-clanker enablement is
+    load-bearing rather than a nicety — a clanker needing none of a
+    server's tools must not carry its schemas.
     Per-clanker enablement matters more here than it does for anything
     else: a clanker that needs none of a server's tools should not carry
     its schemas.
@@ -68,13 +88,33 @@ NEXT:
     the one key lives in the OS keychain. Server env vars belong there too,
     with config.json holding the variable *names*, or the guarantee is
     quietly reversed.
-  - **Process lifetime.** stdio servers are child processes, while CCC runs
-    many clankers in one process. One shared server per config entry is
-    almost certainly right (tool calls are independent, gates are already
-    per-session), but then its lifetime is the app's rather than a session's,
-    and a server that dies mid-turn, hangs, or writes to stderr forever
-    needs an answer that isn't "the turn hangs". The `$` command work has
-    the same shape and none of its streaming plumbing to reuse.
+  - **Process lifetime**, and this is the one with a trap in it. One
+    shared server per config entry is almost certainly right — tool calls
+    are independent, gates are already per-session — but its lifetime is
+    then the app's rather than a session's, and killing it is not what it
+    looks like. `npx` is a shim: the pid handed back is `npm exec`, which
+    forks the real server as a grandchild. Killing the pid you spawned
+    leaves the server alive, reparented to init, *still holding the stdout
+    pipe open* — so a call in flight gets no reply and no EOF either, and
+    a turn waiting on that read waits forever. Confirmed by `ps`: the
+    orphan survives, and a kill over the shared process group clears it.
+    So servers want their own process group plus a per-call timeout;
+    neither alone is enough, and nothing about the child handle hints at
+    it. Two smaller facts from the same spike: stderr must be drained or a
+    chatty server blocks on a full pipe, and the server pushes unsolicited
+    notifications (`notifications/tools/list_changed`) interleaved with
+    replies, so the reader has to demultiplex by id rather than pair one
+    read to one write. Startup is ~0.9s warm, essentially all of it npx
+    rather than the server, which argues for spawning lazily on first use
+    and keeping it. The `$` command work has the same shape and none of
+    its streaming plumbing to reuse.
+
+  All of the above past the first two paragraphs is measured, not reasoned:
+  a throwaway Python spike spawned both reference servers over stdio, did
+  the handshake (protocol 2025-06-18 negotiated by both), read `tools/list`
+  verbatim, translated it into CCC's tool-definition shape to price it, and
+  probed teardown. Worth redoing against the server *you* intend to ship
+  support for first, but the shape above is real.
 
   Install UX, "like other harnesses": `clank mcp add <name> -- <cmd> <args>`,
   `clank mcp list`/`remove`, and — the part that makes it feel installed
