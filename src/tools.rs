@@ -3,7 +3,7 @@ use serde_json::json;
 use std::borrow::Cow;
 use std::fs;
 use std::path::Path;
-use std::sync::RwLock;
+use std::sync::{LazyLock, RwLock};
 
 /// One tool, as everything that isn't the model needs to see it: what it is
 /// called, which bucket it falls in for bulk settings, and a line a person
@@ -28,6 +28,16 @@ pub struct ToolInfo {
     /// the one tool that touches nothing local.
     pub category: &'static str,
     pub summary: Cow<'static, str>,
+    /// What the provider is sent for this tool, as a whole
+    /// `{"type":"function","function":{…}}` object.
+    ///
+    /// Carried here rather than in a list beside this one so there is one
+    /// place a tool exists. There used to be two — this set written for
+    /// people and the schemas written for the model — held together by a
+    /// test that could only catch a mismatch after someone had made it. A
+    /// tool from a server brings its own `inputSchema`, and nothing would
+    /// have put that in a hand-written list.
+    pub schema: serde_json::Value,
 }
 
 impl ToolInfo {
@@ -38,17 +48,32 @@ impl ToolInfo {
         name: impl Into<String>,
         category: &str,
         summary: impl Into<String>,
+        schema: serde_json::Value,
     ) -> Result<Self> {
+        let name = name.into();
         let category = CATEGORIES
             .iter()
             .find(|known| **known == category)
             .ok_or_else(|| {
                 anyhow!("{category:?} is not a tool category; expected one of {CATEGORIES:?}")
             })?;
+        // The provider calls a tool by the name inside the schema, while
+        // every gate here keys off the name beside it. Two names for one
+        // tool is a tool governed under one and invoked under the other, so
+        // they are checked to agree once, here, rather than trusted at
+        // every lookup.
+        let in_schema = schema["function"]["name"].as_str();
+        if in_schema != Some(name.as_str()) {
+            return Err(anyhow!(
+                "{name} is named {:?} in its own schema, so a gate on it would not reach it",
+                in_schema.unwrap_or("<missing>")
+            ));
+        }
         Ok(Self {
-            name: Cow::Owned(name.into()),
+            name: Cow::Owned(name),
             category,
             summary: Cow::Owned(summary.into()),
+            schema,
         })
     }
 }
@@ -65,46 +90,58 @@ pub const CATEGORIES: [&str; 4] = ["read", "write", "terminal", "web"];
 /// The tools compiled into the binary, in the order a listing should show
 /// them: the harmless first, the ones that change your machine last.
 ///
-/// Not the whole list any more — [`tools`] is. Read this directly only
-/// where "what ships in the binary" is the actual question, which is the
-/// schemas below and the drift test that holds them together.
-pub const BUILTIN: [ToolInfo; 7] = [
-    ToolInfo {
-        name: Cow::Borrowed("read_file"),
-        category: "read",
-        summary: Cow::Borrowed("Read a file from disk"),
-    },
-    ToolInfo {
-        name: Cow::Borrowed("list_files"),
-        category: "read",
-        summary: Cow::Borrowed("List a directory"),
-    },
-    ToolInfo {
-        name: Cow::Borrowed("search_files"),
-        category: "read",
-        summary: Cow::Borrowed("Search file contents for a pattern"),
-    },
-    ToolInfo {
-        name: Cow::Borrowed("web_fetch"),
-        category: "web",
-        summary: Cow::Borrowed("Fetch a web page as text"),
-    },
-    ToolInfo {
-        name: Cow::Borrowed("write_file"),
-        category: "write",
-        summary: Cow::Borrowed("Write or overwrite a file"),
-    },
-    ToolInfo {
-        name: Cow::Borrowed("replace_in_file"),
-        category: "write",
-        summary: Cow::Borrowed("Replace a string inside a file"),
-    },
-    ToolInfo {
-        name: Cow::Borrowed("run_terminal_command"),
-        category: "terminal",
-        summary: Cow::Borrowed("Run a shell command"),
-    },
+/// Name, category and one-line summary. The schema each one is sent to the
+/// model with lives in [`builtin_schemas`] and is joined on by name in
+/// [`BUILTIN`] — kept apart here only because a schema is thirty lines of
+/// JSON and this table is meant to be read at a glance.
+const BUILTIN_META: [(&str, &str, &str); 7] = [
+    ("read_file", "read", "Read a file from disk"),
+    ("list_files", "read", "List a directory"),
+    ("search_files", "read", "Search file contents for a pattern"),
+    ("web_fetch", "web", "Fetch a web page as text"),
+    ("write_file", "write", "Write or overwrite a file"),
+    ("replace_in_file", "write", "Replace a string inside a file"),
+    ("run_terminal_command", "terminal", "Run a shell command"),
 ];
+
+/// The built-ins, each with its schema attached.
+///
+/// Built once, and it panics if the join is not exact in both directions: a
+/// name in the table with no schema, or a schema with no row. That used to
+/// be a test, which meant the two lists could disagree in a working build
+/// until someone ran it. A tool that only half exists is either invisible
+/// to `clank tools` and so ungovernable, or listed and settable but never
+/// actually offered — neither is worth leaving to a test.
+///
+/// Not the whole list any more — [`tools`] is. Read this directly only
+/// where "what ships in the binary" is the actual question.
+pub static BUILTIN: LazyLock<Vec<ToolInfo>> = LazyLock::new(|| {
+    let schemas = builtin_schemas();
+    let joined: Vec<ToolInfo> = BUILTIN_META
+        .iter()
+        .map(|(name, category, summary)| {
+            let schema = schemas
+                .iter()
+                .find(|schema| schema["function"]["name"] == *name)
+                .unwrap_or_else(|| panic!("{name} is in BUILTIN_META with no schema"))
+                .clone();
+            ToolInfo {
+                name: Cow::Borrowed(name),
+                category,
+                summary: Cow::Borrowed(summary),
+                schema,
+            }
+        })
+        .collect();
+    for schema in &schemas {
+        let name = schema["function"]["name"].as_str().unwrap_or("<unnamed>");
+        assert!(
+            joined.iter().any(|tool| tool.name == name),
+            "{name} has a schema but no row in BUILTIN_META"
+        );
+    }
+    joined
+});
 
 /// Tools that were not compiled in, as [`set_registered`] last left them.
 ///
@@ -139,7 +176,7 @@ pub fn tools() -> Vec<ToolInfo> {
 /// Split out from [`tools`] so the composition is testable without writing
 /// to the process-wide registry — see the note on [`set_registered`].
 pub fn merge(registered: &[ToolInfo]) -> Vec<ToolInfo> {
-    let mut all: Vec<ToolInfo> = BUILTIN.to_vec();
+    let mut all: Vec<ToolInfo> = BUILTIN.clone();
     all.extend(registered.iter().cloned());
     all
 }
@@ -236,7 +273,25 @@ pub fn category_in(tools: &[ToolInfo], tool_name: &str) -> &'static str {
         .unwrap_or("unknown")
 }
 
+/// Every tool's schema, built-ins and registered alike, in listing order.
+///
+/// What the model is offered, before the gates filter it — see
+/// `agent::offered_tools`.
 pub fn get_tool_definitions() -> Vec<serde_json::Value> {
+    definitions_for(&tools())
+}
+
+/// [`get_tool_definitions`] over a list handed in — see
+/// [`ToolAccessSettings::any_tools_in`](crate::config::ToolAccessSettings::any_tools_in).
+pub fn definitions_for(tools: &[ToolInfo]) -> Vec<serde_json::Value> {
+    tools.iter().map(|tool| tool.schema.clone()).collect()
+}
+
+/// The hand-written schemas for the tools that ship in the binary.
+///
+/// Joined onto [`BUILTIN_META`] by name in [`BUILTIN`], so this is the one
+/// place a built-in's wire format is written and nothing else reads it.
+fn builtin_schemas() -> Vec<serde_json::Value> {
     vec![
         json!({
             "type": "function",
@@ -734,7 +789,22 @@ pub async fn execute_tool(
 
             web_fetch(url).await
         }
-        _ => Err(anyhow!("Unknown tool: {}", name)),
+        // A name that is not a built-in. Once a tool can be registered it
+        // can also be *called*, and a registered tool that reaches here is
+        // a different failure from a hallucinated one: the model was
+        // offered it, so the gap is on this side. Separated because the
+        // first is a bug to go and fix and the second is a model being
+        // wrong, and one message for both would hide the bug.
+        other => {
+            if registered().iter().any(|tool| tool.name == other) {
+                Err(anyhow!(
+                    "{other} is registered but nothing can run it yet; \
+                     no server is wired up to dispatch to"
+                ))
+            } else {
+                Err(anyhow!("Unknown tool: {other}"))
+            }
+        }
     }
 }
 
@@ -1499,9 +1569,27 @@ async fn run_terminal_command(
 mod tests {
 
     /// A stand-in for what will arrive from a server: owned strings, a
-    /// namespaced name, a category derived from the server's annotations.
+    /// namespaced name, a category derived from the server's annotations,
+    /// and the server's own `inputSchema` wrapped for the provider.
     fn registered_tool(name: &str, category: &str) -> ToolInfo {
-        ToolInfo::new(name, category, "a tool from somewhere else").unwrap()
+        ToolInfo::new(
+            name,
+            category,
+            "a tool from somewhere else",
+            tool_schema(name),
+        )
+        .unwrap()
+    }
+
+    fn tool_schema(name: &str) -> serde_json::Value {
+        json!({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": "a tool from somewhere else",
+                "parameters": {"type": "object", "properties": {}},
+            }
+        })
     }
 
     #[test]
@@ -1621,55 +1709,71 @@ mod tests {
 
     #[test]
     fn a_tool_cannot_be_registered_into_a_category_nothing_targets() {
-        let err = ToolInfo::new("fs/thing", "filesystem", "x")
+        let err = ToolInfo::new("fs/thing", "filesystem", "x", tool_schema("fs/thing"))
             .expect_err("\"filesystem\" is not one of CCC's buckets");
         assert!(err.to_string().contains("not a tool category"), "{err}");
         for known in CATEGORIES {
-            assert!(ToolInfo::new("fs/thing", known, "x").is_ok());
+            assert!(ToolInfo::new("fs/thing", known, "x", tool_schema("fs/thing")).is_ok());
         }
     }
 
     #[test]
-    fn a_registered_tool_is_not_yet_offered_to_the_model() {
-        // Deliberate, and the next thing to build. `get_tool_definitions`
-        // is a hand-written list of schemas for the seven built-ins, and a
-        // tool from a server carries its own `inputSchema` instead. Until
-        // that is wired, registering one makes it listable and gateable but
-        // not callable — which is why nothing registers anything yet.
-        let defined: Vec<String> = get_tool_definitions()
+    fn a_registered_tool_is_offered_to_the_model() {
+        // The other half of being a tool. Being listed and gateable is no
+        // use if the model is never told the tool exists: this used to read
+        // a hand-written list of the seven built-in schemas, so a
+        // registered tool was governable and unreachable at the same time.
+        let all = merge(&[registered_tool("fs/read_text_file", "read")]);
+        let defined: Vec<String> = definitions_for(&all)
             .iter()
             .map(|d| d["function"]["name"].as_str().unwrap().to_string())
             .collect();
-        assert_eq!(defined.len(), BUILTIN.len());
-        assert!(!defined.iter().any(|name| name.contains('/')));
+
+        assert_eq!(defined.len(), BUILTIN.len() + 1);
+        assert!(
+            defined.iter().any(|name| name == "fs/read_text_file"),
+            "{defined:?}"
+        );
+        // Still every built-in, and still in listing order.
+        assert_eq!(defined[0], BUILTIN[0].name);
+        assert_eq!(defined.last().unwrap(), "fs/read_text_file");
     }
 
     #[test]
-    fn every_tool_is_in_both_lists() {
-        // The schemas are written for the model; `TOOLS` is the same set
-        // written for people and for the gates. A tool in one and not the
-        // other is either invisible to `clank tools` — and so ungovernable —
-        // or listed and settable but never actually offered.
-        let defined: Vec<String> = get_tool_definitions()
-            .iter()
-            .map(|d| d["function"]["name"].as_str().unwrap().to_string())
-            .collect();
-        let known: Vec<String> = BUILTIN.iter().map(|t| t.name.to_string()).collect();
+    fn a_tool_whose_schema_names_something_else_is_refused() {
+        // The gates key off the name beside the schema; the model calls the
+        // name inside it. If those differ, the tool is governed under one
+        // name and invoked under another — so `tools never fs/write` would
+        // read as honoured and change nothing.
+        let err = ToolInfo::new("fs/write_file", "write", "x", tool_schema("write_file"))
+            .expect_err("the schema names a different tool");
+        assert!(err.to_string().contains("would not reach it"), "{err}");
+    }
 
-        for name in &defined {
-            assert!(known.contains(name), "{name} has a schema but no entry");
+    #[test]
+    fn every_built_in_carries_the_schema_that_names_it() {
+        // What used to be a drift test between two lists. The join in
+        // `BUILTIN` panics on a mismatch either way, so this is here to
+        // make that fire in CI rather than in front of a user: forcing the
+        // lazy value is the whole assertion, and the rest pins what the
+        // join is supposed to have produced.
+        assert_eq!(BUILTIN.len(), BUILTIN_META.len());
+        for tool in BUILTIN.iter() {
+            assert_eq!(
+                tool.schema["function"]["name"].as_str(),
+                Some(tool.name.as_ref()),
+                "{} carries a schema for something else",
+                tool.name
+            );
+            assert_eq!(tool.schema["type"], "function");
         }
-        for name in &known {
-            assert!(defined.contains(name), "{name} has an entry but no schema");
-        }
-        assert_eq!(defined.len(), known.len());
     }
 
     #[test]
     fn every_tool_has_a_category_the_bulk_targets_reach() {
         // A tool in no category can only be set by its own name, which is a
         // surprise waiting to happen: `tools never all` would leave it on.
-        for tool in BUILTIN {
+        for tool in BUILTIN.iter() {
             assert!(
                 CATEGORIES.contains(&tool.category),
                 "{} is in {:?}, which nothing targets",

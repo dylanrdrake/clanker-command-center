@@ -781,7 +781,7 @@ mod tests {
         // `BUILTIN` rather than `tools()`: these three defaults are a fact
         // about the tools that ship, and reading the live list would make
         // the assertion depend on what some other test registered.
-        for tool in crate::tools::BUILTIN {
+        for tool in crate::tools::BUILTIN.iter() {
             let expected = match tool.name.as_ref() {
                 "run_terminal_command" => ToolAccess::Never,
                 "web_fetch" => ToolAccess::Allow,
