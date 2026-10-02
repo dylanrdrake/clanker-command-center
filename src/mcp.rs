@@ -727,6 +727,14 @@ pub struct Started {
 /// `set_registered` is total: that is what makes a reconnect, a removal and
 /// a first run the same code path with no stale entry to clean up.
 pub async fn connect_all(specs: &[ServerSpec]) -> Vec<Started> {
+    // Whatever was up before this call. Publishing a new map would only
+    // *drop* the old servers, and a drop reaps the process we spawned
+    // without touching the group it started — which for anything behind a
+    // runner leaves the real server alive holding its pipes. Harmless
+    // while this ran once per process; `/mcp reconnect` is what made it
+    // reachable.
+    shutdown_all().await;
+
     let mut started = Vec::new();
     let mut live: HashMap<String, Arc<StdioServer>> = HashMap::new();
     let mut offered: Vec<ToolInfo> = Vec::new();
@@ -1068,6 +1076,23 @@ mod tests {
         // built-in rather than like a successful call returning a complaint.
         let failed = json!({"isError": true, "content": [{"type": "text", "text": "nope"}]});
         assert_eq!(call_result_text(&failed).unwrap_err().to_string(), "nope");
+    }
+
+    #[tokio::test]
+    async fn connecting_again_stops_what_was_connected_before() {
+        // Not a spawn test — `connect_all` with no specs still has to clear
+        // the previous set, because the map it publishes would otherwise
+        // drop those servers rather than shut them down, and a drop cannot
+        // reach the processes they started.
+        let _ = connect_all(&[]).await;
+        assert!(
+            connected().as_ref().is_some_and(HashMap::is_empty),
+            "the map is published, and empty"
+        );
+        // Idempotent: a second pass over an already-empty set is a no-op
+        // rather than a second round of signals at a reused pgid.
+        let _ = connect_all(&[]).await;
+        assert!(connected().as_ref().is_some_and(HashMap::is_empty));
     }
 
     #[tokio::test]

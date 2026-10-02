@@ -91,6 +91,23 @@ pub struct ToolAccessSettings {
     overrides: std::collections::BTreeMap<String, ToolAccess>,
 }
 
+/// The key under which "and anything else" is stored.
+///
+/// `tools off` used to mean *every tool that existed when you typed it*: it
+/// wrote an entry per tool, so a tool that turned up later had no entry,
+/// fell back to its own default of `ask`, and a clanker deliberately
+/// disarmed quietly had a tool again. That was reachable by upgrading the
+/// binary and is now reachable by rebuilding an MCP server, so `off` had to
+/// become a standing policy rather than a snapshot.
+///
+/// Stored as a reserved key rather than a new field so every `config.json`
+/// and every session row written so far still reads as itself — the struct
+/// stays `transparent` over the same map. The key is safe from collision by
+/// construction, not by luck: a tool name can only hold
+/// `[a-zA-Z0-9_-]` — see [`crate::tools::ToolInfo::new`], which is where a
+/// provider's own rule is enforced — so nothing can ever be called `*`.
+const EVERYTHING_ELSE: &str = "*";
+
 /// What a tool does when nothing has been said about it.
 ///
 /// The shell is off. It is the one tool whose blast radius is everything the
@@ -120,6 +137,15 @@ impl ToolAccessSettings {
     pub fn access(&self, tool_name: &str) -> ToolAccess {
         self.overrides
             .get(tool_name)
+            .copied()
+            .unwrap_or_else(|| self.fallback(tool_name))
+    }
+
+    /// What a tool with nothing said about it gets: the standing policy if
+    /// one is set, otherwise the tool's own default.
+    fn fallback(&self, tool_name: &str) -> ToolAccess {
+        self.overrides
+            .get(EVERYTHING_ELSE)
             .copied()
             .unwrap_or_else(|| default_access(tool_name))
     }
@@ -174,6 +200,29 @@ impl ToolAccessSettings {
         target: &str,
         access: ToolAccess,
     ) -> Option<Self> {
+        // `tools off` is a policy, not a list. It used to write an entry
+        // per tool that existed at the time, which made it a snapshot —
+        // see `EVERYTHING_ELSE`.
+        //
+        // Only `never` is stored this way, and the asymmetry is the whole
+        // point. "Everything off" holding for a tool that turns up later is
+        // the safe direction; "everything allowed" holding for one would
+        // wave through a tool nobody has ever seen, which is exactly what
+        // `default_access` refuses to do for an unrecognised name. So
+        // `allow all` and `ask all` stay claims about the tools in front of
+        // you, and a test pins that.
+        //
+        // A category stays a list for the same reason: "every read tool" is
+        // a claim about what you can see.
+        if target == "all" && access == ToolAccess::Never {
+            let mut updated = self.clone();
+            updated.overrides.clear();
+            updated
+                .overrides
+                .insert(EVERYTHING_ELSE.to_string(), access);
+            return Some(updated);
+        }
+
         let matched: Vec<String> = tools
             .iter()
             .filter(|tool| target == "all" || tool.name == target || tool.category == target)
@@ -183,11 +232,20 @@ impl ToolAccessSettings {
             return None;
         }
         let mut updated = self.clone();
+        if target == "all" {
+            // Otherwise a standing `never` would outlive the `allow all`
+            // that was meant to lift it, and every tool added afterwards
+            // would still arrive off.
+            updated.overrides.remove(EVERYTHING_ELSE);
+        }
         for name in matched {
             // Held only while it differs from the default, so "set it back
             // to what it would have been" and "never mentioned it" store the
             // same thing — and a later change of default reaches both.
-            if access == default_access(&name) {
+            // Compared against the effective default rather than the
+            // tool's own, so setting a tool to what the standing policy
+            // already says stores nothing instead of a redundant row.
+            if access == updated.fallback(&name) {
                 updated.overrides.remove(&name);
             } else {
                 updated.overrides.insert(name, access);
@@ -204,12 +262,13 @@ impl ToolAccessSettings {
     /// Every tool off: what `tools off` means, and what a clanker with no
     /// tools is.
     pub fn none() -> Self {
-        Self::none_in(&crate::tools::tools())
+        Self::none_in(&[])
     }
 
-    /// [`Self::none`] over a list handed in — see [`Self::any_tools_in`].
-    /// Worth its own name because "every tool off" is a claim about a list,
-    /// and which list it was is exactly what a test needs to pin down.
+    /// [`Self::none`] over a list handed in, which it no longer needs: the
+    /// list is irrelevant now that "every tool off" is one stored policy
+    /// rather than an entry per tool. Kept so the call sites that pass a
+    /// list read the same as the ones around them.
     pub fn none_in(tools: &[crate::tools::ToolInfo]) -> Self {
         Self::default()
             .with_in(tools, "all", ToolAccess::Never)
@@ -878,6 +937,88 @@ mod tests {
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "mode was reset to {mode:o}");
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn tools_off_stays_off_when_a_tool_turns_up_later() {
+        // The bug. `off` used to write an entry per tool that existed at
+        // the time, so a tool added afterwards — by upgrading the binary, or
+        // now by rebuilding an MCP server — had no entry, fell back to its
+        // own default of `ask`, and a clanker deliberately disarmed had a
+        // tool again.
+        let off = ToolAccessSettings::none();
+        assert_eq!(off.access("gj__delete_everything"), ToolAccess::Never);
+        assert_eq!(
+            off.access("a_built_in_added_next_version"),
+            ToolAccess::Never
+        );
+        assert_eq!(off.access("read_file"), ToolAccess::Never);
+    }
+
+    #[test]
+    fn allow_all_does_not_wave_through_a_tool_nobody_has_seen() {
+        // The asymmetry, and the reason only `never` is stored as a
+        // standing policy. "Everything off" holding for a future tool is
+        // safe; "everything allowed" holding for one would hand `allow` to
+        // a tool that did not exist when it was typed.
+        let allowed = ToolAccessSettings::default()
+            .with("all", ToolAccess::Allow)
+            .expect("\"all\" always matches");
+        assert_eq!(allowed.access("read_file"), ToolAccess::Allow);
+        assert_eq!(allowed.access("some_future_tool"), ToolAccess::Ask);
+
+        let asked = ToolAccessSettings::default()
+            .with("all", ToolAccess::Ask)
+            .expect("\"all\" always matches");
+        assert_eq!(asked.access("some_future_tool"), ToolAccess::Ask);
+    }
+
+    #[test]
+    fn allow_all_lifts_a_standing_never() {
+        // Otherwise `off` would outlive the `on` meant to undo it, and
+        // every tool added afterwards would still arrive off.
+        let back_on = ToolAccessSettings::none()
+            .with("all", ToolAccess::Allow)
+            .expect("\"all\" always matches");
+        assert_eq!(back_on.access("some_future_tool"), ToolAccess::Ask);
+        assert_eq!(back_on.access("read_file"), ToolAccess::Allow);
+
+        // And `tools on` is the defaults, which is not a policy at all.
+        let defaults = ToolAccessSettings::defaults();
+        assert_eq!(defaults.access("run_terminal_command"), ToolAccess::Never);
+        assert_eq!(defaults.access("web_fetch"), ToolAccess::Allow);
+        assert_eq!(defaults.access("some_future_tool"), ToolAccess::Ask);
+    }
+
+    #[test]
+    fn one_tool_can_be_switched_back_on_under_a_standing_never() {
+        let off_except_one = ToolAccessSettings::none()
+            .with("read_file", ToolAccess::Allow)
+            .expect("a tool by its own name");
+        assert_eq!(off_except_one.access("read_file"), ToolAccess::Allow);
+        assert_eq!(off_except_one.access("list_files"), ToolAccess::Never);
+        assert_eq!(off_except_one.access("anything_new"), ToolAccess::Never);
+    }
+
+    #[test]
+    fn the_standing_policy_survives_the_config_file() {
+        // Stored as a reserved key rather than a new field, so the struct
+        // stays `transparent` and every config written so far still reads
+        // as itself. A tool can never be called `*` — the name charset in
+        // `ToolInfo::new` is what guarantees that — so it cannot collide.
+        let off = ToolAccessSettings::none();
+        let written = serde_json::to_string(&off).unwrap();
+        assert_eq!(written, r#"{"*":"never"}"#);
+        let read: ToolAccessSettings = serde_json::from_str(&written).unwrap();
+        assert_eq!(read.access("anything_new"), ToolAccess::Never);
+
+        // An older row, written as a bare enumeration, still means exactly
+        // what it meant — including that it says nothing about a new tool.
+        let legacy: ToolAccessSettings =
+            serde_json::from_str(r#"{"read_file":"allow","write_file":"never"}"#).unwrap();
+        assert_eq!(legacy.access("read_file"), ToolAccess::Allow);
+        assert_eq!(legacy.access("write_file"), ToolAccess::Never);
+        assert_eq!(legacy.access("list_files"), ToolAccess::Ask);
     }
 
     #[test]

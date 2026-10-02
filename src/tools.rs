@@ -1638,15 +1638,18 @@ mod tests {
         );
         assert!(!none.any_tools_in(&all));
 
-        // A clanker whose *only* tools came from a server: every built-in
-        // off, one registered tool at its default. This is what used to
-        // report having no tools at all, which quietly ran the turn as a
-        // plain exchange with nothing to carry it.
-        let only_registered = ToolAccessSettings::none_in(&BUILTIN);
+        // A clanker whose *only* tool came from a server: everything off,
+        // then that one switched back on. This is what used to report
+        // having no tools at all, which quietly ran the turn as a plain
+        // exchange with nothing to carry it.
+        let only_registered = ToolAccessSettings::none_in(&all)
+            .with_in(&all, "fs__read_text_file", ToolAccess::Ask)
+            .expect("a registered tool is settable by name");
         assert!(
             only_registered.any_tools_in(&all),
             "a registered tool is a tool, so this clanker is agentic"
         );
+        assert_eq!(only_registered.access("fs__write_file"), ToolAccess::Never);
 
         let fresh = ToolAccessSettings::default();
         assert!(fresh.any_tools_in(&all));
