@@ -409,7 +409,7 @@ fn draw_title(frame: &mut Frame, area: Rect, app: &App) {
     ];
     // Where this session runs, beside its name: it is the directory the
     // agent's tools act in and the sandbox bounds, so it is worth being able
-    // to see without asking for `/status`.
+    // to see without asking for `/clanker`.
     if let Some(dir) = &app.working_dir {
         spans.push(Span::styled(
             format!("  {}", home_relative(dir)),
@@ -420,7 +420,7 @@ fn draw_title(frame: &mut Frame, area: Rect, app: &App) {
 
     // Right-aligned on the same row, the way `draw_rule`'s scroll hint
     // overlays its divider — this is the one place a clanker's running
-    // total is always in view, not just on `/status`'s one-time printout.
+    // total is always in view, not just on `/clanker`'s one-time printout.
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             format!("🪙 {} ", crate::ui::format_tokens(app.total_tokens)),
@@ -775,12 +775,12 @@ fn draw_model_browser(
     frame.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 
-/// A titled block of label/value rows, as `/status` and `/help` both show.
+/// A titled block of label/value rows, as `/clanker` and `/help` both show.
 ///
 /// The labels are padded to a common width so the values line up in a
 /// column, and each value goes through `push_labeled`, which hangs a long
 /// one under its label rather than letting it run off the pane — a working
-/// directory for `/status`, a wordy description for `/help`.
+/// directory for `/clanker`, a wordy description for `/help`.
 fn push_row_block(
     lines: &mut Vec<Line<'static>>,
     heading: &str,
@@ -2789,7 +2789,7 @@ mod tests {
         assert!(out.contains("Commands:"), "{out}");
         assert!(out.contains("Show this list"), "{out}");
 
-        // The same block shape `/status` uses: labels padded to a common
+        // The same block shape `/clanker` uses: labels padded to a common
         // width, so every description starts in the same column.
         let starts: Vec<usize> = crate::ui::help_rows()
             .iter()

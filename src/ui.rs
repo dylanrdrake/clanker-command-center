@@ -216,8 +216,9 @@ pub enum Submission {
     /// it.
     ShowSandbox,
     /// Prints/shows every setting this session is running with, without
-    /// changing any of them. Named for `clank status`, which does the same
-    /// job one scope out: global configuration there, this session here.
+    /// changing any of them. Bare `/clanker`; it was `/status`, named for
+    /// `clank status`, which does the same job one scope out: global
+    /// configuration there, this session here.
     ShowStatus,
     /// Renames this clanker. `/clanker` is the namespace for acting on the
     /// session itself, as opposed to the settings it runs with.
@@ -242,7 +243,7 @@ pub enum Submission {
     UnknownCommand(String),
 }
 
-/// Everything `/status` reports, gathered from whichever front end is
+/// Everything bare `/clanker` reports, gathered from whichever front end is
 /// asking. Both hold the same state — the TUI in its `App`, the CLI in its
 /// `ChatSession` — so the shape lives here and the rendering is shared,
 /// rather than each growing its own list that drifts from the other.
@@ -263,7 +264,7 @@ pub struct SessionSettings<'a> {
     /// The model that compacts this clanker's history, and the prompt size
     /// that sets it going. Configuration rather than session state — every
     /// other row here is something the clanker owns — but they change what a
-    /// turn does, and `/status` is where someone looks to find out why a
+    /// turn does, and bare `/clanker` is where someone looks to find out why a
     /// turn paused to summarize itself.
     pub compactor: &'a str,
     pub compact_at: Option<u64>,
@@ -289,7 +290,7 @@ pub fn format_tokens(n: i64) -> String {
     format!("{sign}{grouped}")
 }
 
-/// `/status` as label/value rows, ready for either front end to draw.
+/// Bare `/clanker` as label/value rows, ready for either front end to draw.
 ///
 /// A setting that isn't set says what that *means* rather than showing an
 /// empty cell — a nullified temperature sends no field at all, which is a
@@ -753,7 +754,7 @@ pub fn classify(text: &str) -> Submission {
     // trailing text as ignorable — fine for `/back`, wrong for a namespace
     // where the trailing text is the subcommand.
     if trimmed == "/clanker" {
-        return Submission::ShowTitle;
+        return Submission::ShowStatus;
     }
 
     if let Some(rest) = argument(trimmed, "/clanker") {
@@ -782,10 +783,14 @@ pub fn classify(text: &str) -> Submission {
         }
     }
 
-    if let Some(rest) = trimmed.strip_prefix("/status") {
-        if rest.trim().is_empty() {
-            return Submission::ShowStatus;
-        }
+    // `/status` became bare `/clanker`. Not left to fall through as a
+    // message: it is a word people have typed, and sending it to the model
+    // reads as the model ignoring a command. Not in `COMMANDS` either, so
+    // it is neither listed in `/help` nor offered as a completion.
+    if bare_command(trimmed, "/status") {
+        return Submission::UnknownCommand(
+            "/status is now bare /clanker. Usage: /clanker".to_string(),
+        );
     }
 
     if let Some(value) = argument(trimmed, "/sandbox") {
@@ -911,7 +916,7 @@ struct Command {
     usage: Option<&'static str>,
 }
 
-const COMMANDS: [Command; 21] = [
+const COMMANDS: [Command; 20] = [
     Command {
         word: "help",
         syntax: "/help",
@@ -997,15 +1002,9 @@ const COMMANDS: [Command; 21] = [
         usage: Some("/compact"),
     },
     Command {
-        word: "status",
-        syntax: "/status",
-        blurb: "Show every setting this clanker runs with",
-        usage: Some("/status"),
-    },
-    Command {
         word: "clanker",
         syntax: "/clanker [title <new title>]",
-        blurb: "Show or change this clanker's name",
+        blurb: "Show every setting this clanker runs with, or rename it",
         usage: Some("/clanker title <new title>"),
     },
     Command {
@@ -1827,9 +1826,10 @@ mod tests {
             classify("/clanker title Fix the parser"),
             Submission::SetTitle("Fix the parser".to_string())
         );
-        // Bare, either way round, reads the name.
-        assert_eq!(classify("/clanker"), Submission::ShowTitle);
-        assert_eq!(classify("  /clanker   "), Submission::ShowTitle);
+        // Bare shows every setting, with the name among them; `title` alone
+        // reads just the name.
+        assert_eq!(classify("/clanker"), Submission::ShowStatus);
+        assert_eq!(classify("  /clanker   "), Submission::ShowStatus);
         assert_eq!(classify("/clanker title"), Submission::ShowTitle);
         assert_eq!(classify("/clanker title   "), Submission::ShowTitle);
 
@@ -1902,16 +1902,20 @@ mod tests {
     }
 
     #[test]
-    fn classify_recognizes_the_status_command() {
-        assert_eq!(classify("/status"), Submission::ShowStatus);
-        assert_eq!(classify("  /status   "), Submission::ShowStatus);
-        // It takes no argument, so anything after it is a mistake rather
-        // than a message.
-        assert_eq!(
-            classify("/status verbose"),
-            Submission::UnknownCommand("Unrecognized /status usage. Usage: /status".to_string())
-        );
-        assert_eq!(nearest_command("statu"), Some("status"));
+    fn status_is_now_bare_clanker() {
+        // Pointed at its replacement rather than sent to the model as text.
+        let moved =
+            Submission::UnknownCommand("/status is now bare /clanker. Usage: /clanker".into());
+        assert_eq!(classify("/status"), moved);
+        assert_eq!(classify("  /status   "), moved);
+        assert_eq!(classify("/status verbose"), moved);
+        // Only the exact word: a path or a longer word stays a message.
+        assert!(matches!(classify("/statuses"), Submission::Message(_)));
+        // And it is no longer a command anywhere else.
+        assert_eq!(command_span("/status"), None);
+        assert!(!help_rows()
+            .iter()
+            .any(|(name, _)| name.starts_with("/status")));
     }
 
     #[test]
@@ -2051,7 +2055,7 @@ mod tests {
         assert_eq!(classify("/help"), Submission::ShowHelp);
         assert_eq!(classify("  /help  "), Submission::ShowHelp);
         // Takes no argument, so anything after it is a mistake rather than
-        // a message — the same rule `/status` follows.
+        // a message — the same rule bare `/clanker` follows.
         assert!(matches!(
             classify("/help model"),
             Submission::UnknownCommand(_)

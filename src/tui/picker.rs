@@ -1053,7 +1053,7 @@ fn field_row(deployment: &Deployment, field: Field, label: &str, indent: usize) 
 }
 
 /// A token count squeezed into the few characters a list row can spare —
-/// `format_tokens` in `ui.rs` is for `/status`, where there's room for every
+/// `format_tokens` in `ui.rs` is for `/clanker`, where there's room for every
 /// digit; this is for a column that has to sit beside four others.
 fn format_tokens_compact(n: i64) -> String {
     let n = n.max(0);
@@ -1449,7 +1449,7 @@ mod tests {
 
     #[test]
     fn an_unset_setting_says_what_that_means_rather_than_showing_a_gap() {
-        // The same rule `/status` follows: a nullified setting does
+        // The same rule `/clanker` follows: a nullified setting does
         // something specific, and a blank cell reads as a bug.
         let id = "4f2a91b2-3c1d-4e8a-9f02-7b6c5d4e3a21";
         let mut form = deployment(id, "Parser work");

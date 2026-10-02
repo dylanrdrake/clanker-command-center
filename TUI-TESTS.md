@@ -19,7 +19,6 @@ what it claims:
 
 ```
 /help                 lists every command
-/status               shows the clanker's settings
 /model                reports the current model
 /model <name>         switches it; settings bar updates
 /effort               reports the level
@@ -34,6 +33,7 @@ what it claims:
 /tools allow write    changes both write tools; takes effect immediately
 /tools never run_terminal_command   refused on the spot mid-turn
 /tools on             every tool back to its default
+/clanker              shows the clanker's settings
 /clanker title Foo    renames; the header updates
 /max-iterations 5     sets the cap
 /back                 returns to the launch screen
@@ -227,7 +227,7 @@ Then the things that must not have broken:
   the same clanker should agree.
 - **Discarded output is dimmed.** Run `$ ls`, press `Ctrl-D` to discard. The
   output should stay in the transcript, dimmed to the same grey as a `default`
-  value in `/status`. Then run `$ ls` again and press `Ctrl-S` — that one
+  value in `/clanker`. Then run `$ ls` again and press `Ctrl-S` — that one
   should stay at full brightness. Scroll back and forth: the two should be
   distinguishable at a glance, without reading `sent` / `not sent`.
 
@@ -251,9 +251,9 @@ Then the things that must not have broken:
   carry **the mark that was on screen when you pressed Enter**, both in the
   reply gutter and on its row back in the list. A different one means the id
   being shown is not the id being created.
-- Deploy one with `Tools` on → `/status` inside it says tools are on, and its
+- Deploy one with `Tools` on → `/clanker` inside it says tools are on, and its
   row in the list carries 🔨 rather than 💬. Deploy one with a `Model` or
-  `Effort` you changed on the form → `/status` says the same values back.
+  `Effort` you changed on the form → `/clanker` says the same values back.
 - Deploy one with **Initial Orders** filled in → it opens with that message
   already in the transcript and a turn already running, exactly as if you had
   typed it. Backing out with `Ctrl-B` should show it `working` in the list.
@@ -296,7 +296,7 @@ In a clanker (`/tools` takes the same arguments):
    and it should say it has no way to.
 5. `/tools on` → tools return, and `web_fetch` is back to `allow` rather
    than `ask`.
-6. `/status` → a `Tools` row saying on/off, and an `Each tool` row naming
+6. `/clanker` → a `Tools` row saying on/off, and an `Each tool` row naming
    every one.
 
 **The upgrade path, worth checking once against your real database:** open a
@@ -334,8 +334,8 @@ clank ask "..."                            unknown command now
   clanker should show `read_file allow`.
 - `/agent` and `/ask` are ordinary messages now — type one and it goes to
   the model rather than being caught as a command.
-- `/clanker title Foo` renames; `/clanker` shows the name.
-- `/status` has no "Mode" row; it has `Tools` (on/off) and `Each tool`.
+- `/clanker title Foo` renames; `/clanker title` shows the name; bare `/clanker` shows the settings.
+- `/clanker` has no "Mode" row; it has `Tools` (on/off) and `Each tool`.
 - **The old `kind` column is still written**, so check that a clanker shows
   💬 in the list without being opened, then 🔨 after `/tools on` and backing
   out.
@@ -360,7 +360,7 @@ New: every clanker keeps a running total of what it has spent.
 
 - A fresh clanker reads `🪙 0` in its title row (top right) and on its
   launch-screen row.
-- Send one message → both go up, and to the same number. `/status` prints
+- Send one message → both go up, and to the same number. `/clanker` prints
   the same total again with every digit, comma-grouped.
 - Send another → it *accumulates* rather than being replaced by the last
   turn's cost.

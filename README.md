@@ -15,7 +15,7 @@ CCC is most stable on Linux at the moment!
 - **Model selection** — Choose from configured provider's models
 - **Agentic loops** — Multi-turn execution with tool calling
 - **Persistent clankers** — `clanker`/`tui` conversations are saved to SQLite and resumable across restarts
-- **Token counting** — every clanker keeps a running 🪙 total of what it has spent, in its title row, on the launch screen, and in `/status`
+- **Token counting** — every clanker keeps a running 🪙 total of what it has spent, in its title row, on the launch screen, and in `/clanker`
 - **Compaction** — a long clanker folds its older turns into a summary written by a model you pick, so a conversation stops resending everything it has ever said
 - **Prompt caching** — the part of the history that hasn't changed is reused by the provider instead of reprocessed, so a long conversation stops paying full price for what it already said
 - **Secure credential storage** — API keys live in your OS keychain, not a plaintext file
@@ -692,9 +692,9 @@ exactly:
 | `/sandbox <on\|off>` | Confine the agent's file writes to the working directory, or allow them anywhere. Takes effect immediately, including partway through a running turn |
 | `/sandbox` | Show whether writes are currently confined |
 | `/compact` | Fold everything older than the last couple of turns into a summary now, instead of waiting for the conversation to grow past `clank compact-at`. Nothing is deleted — the transcript still scrolls back to the first word; what changes is what gets sent |
-| `/status` | Show every setting this clanker is running with — model, effort, temperature, iteration cap, sandbox, verbose, highlighting, streaming, what each tool may do, the tokens it has spent, its compactor, and the directory it runs in. The clanker-scoped counterpart to `clank status` |
 | `/highlight <on\|off>` | Band your own messages in the transcript, or don't. Bare `/highlight` shows the current setting |
-| `/clanker title <new title>` | Rename this clanker. Bare `/clanker` (or `/clanker title`) shows its current name |
+| `/clanker` | Show every setting this clanker is running with — model, effort, temperature, iteration cap, sandbox, verbose, highlighting, streaming, what each tool may do, the tokens it has spent, its compactor, and the directory it runs in. The clanker-scoped counterpart to `clank status`. (This was `/status`; typing that now points here.) |
+| `/clanker title <new title>` | Rename this clanker. `/clanker title` alone shows just its current name |
 | `/send`, `/discard` | Answer the `$` command box — the same as `Ctrl-S` and `Ctrl-D`. Typed forms exist because terminals claim chords: Zed's takes `Ctrl-S` |
 | `/allow`, `/deny` | Answer a tool approval — the same as `Ctrl-Y` and `Ctrl-N`. Without a way to answer, a turn waits on a decision it can never be given |
 | `/back` | Return to the launch screen — the same as `Ctrl-B`, which tmux claims as its own prefix |
@@ -821,7 +821,7 @@ seconds so one you're running in another terminal stays current:
 | | Meaning |
 |---|---|
 | 🔨 / 💬 | Whether that clanker has tools, in the column after its state. The hammer is the one the transcript puts in front of every tool call |
-| 🪙 `<n>` | What it has cost so far — see [Token counting](#token-counting). Abbreviated to fit the column (`1.2k`, `3.4M`); `/status` prints every digit |
+| 🪙 `<n>` | What it has cost so far — see [Token counting](#token-counting). Abbreviated to fit the column (`1.2k`, `3.4M`); bare `/clanker` prints every digit |
 | spinner, yellow | Working — a request is in flight right now. The same animation and colour a conversation shows for itself |
 | `?` yellow | Waiting on an approval nobody has answered. A clanker you are *inside* says the same thing in its settings row — `? waiting` in place of the working spinner, since a turn stopped at a gate is not moving |
 | `✗` red | The last turn ended in an error — worth resuming to see why |
@@ -945,9 +945,9 @@ Three things worth knowing:
 | `/tools` | List every tool and what it may do |
 | `/sandbox <on\|off>` | Confine the agent's file writes to the working directory, or allow them anywhere. Takes effect immediately, including partway through a running turn |
 | `/sandbox` | Show whether writes are currently confined |
-| `/status` | Show every setting this clanker is running with — model, effort, temperature, iteration cap, sandbox, verbose, highlighting, streaming, what each tool may do, the tokens it has spent, and the directory it runs in. The clanker-scoped counterpart to `clank status` |
 | `/highlight <on\|off>` | Band your own messages in the transcript, or don't. Bare `/highlight` shows the current setting |
-| `/clanker title <new title>` | Rename this clanker. Bare `/clanker` (or `/clanker title`) shows its current name |
+| `/clanker` | Show every setting this clanker is running with — model, effort, temperature, iteration cap, sandbox, verbose, highlighting, streaming, what each tool may do, the tokens it has spent, its compactor, and the directory it runs in. The clanker-scoped counterpart to `clank status`. (This was `/status`; typing that now points here.) |
+| `/clanker title <new title>` | Rename this clanker. `/clanker title` alone shows just its current name |
 
 Only recognized commands are intercepted — including a *mistyped* one.
 `/tools maybe read`, or a bare `/effort` with no value, is reported as an
@@ -1242,8 +1242,8 @@ a gold coin wherever it appears:
   conversation has cost is in view without asking for it.
 - **On the launch screen**, a column per row, abbreviated to fit (`1.2k`,
   `3.4M`) — which is what makes it comparable across clankers.
-- **In `/status`**, as a `Tokens` row with every digit.
-- **In `clank clanker`**, the same `/status` row, since both front ends
+- **In bare `/clanker`**, as a `Tokens` row with every digit.
+- **In `clank clanker`**, the same row, since both front ends
   render it from the same list.
 
 What it counts is what the provider reports for each request — prompt plus

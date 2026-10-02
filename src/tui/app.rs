@@ -54,7 +54,7 @@ pub enum TranscriptItem {
     },
     Error(String),
     Notice(String),
-    /// Every setting this clanker is running with, from `/status`. Held as
+    /// Every setting this clanker is running with, from `/clanker`. Held as
     /// rendered rows rather than as the settings themselves: the values are
     /// a snapshot of the moment it was asked for, and shouldn't quietly
     /// change under the reader when a later `/effort` scrolls past.
@@ -209,7 +209,7 @@ pub struct App {
     /// Whether this session streams replies token-by-token. Changed with
     /// `/stream`.
     pub stream: bool,
-    /// The directory this session was started in, shown by `/status`.
+    /// The directory this session was started in, shown by `/clanker`.
     pub working_dir: Option<String>,
     /// This session's `/max-iterations` override, changed with
     /// `/max-iterations`/`/max-iterations default`. `None` means nullified —
@@ -225,7 +225,7 @@ pub struct App {
     pub total_tokens: i64,
     /// The model that compacts this clanker's history and the prompt size
     /// that sets it going, copied off the configuration when the clanker was
-    /// opened. Held only so `/status` can report them: nothing here acts on
+    /// opened. Held only so `/clanker` can report them: nothing here acts on
     /// them, the worker does — see [`crate::conversation::Worker`].
     pub compactor: String,
     pub compact_at: Option<u64>,
@@ -654,7 +654,7 @@ impl App {
     }
 
     /// The first eight characters of the id — enough to name the session at
-    /// `clank resume`, and what `/status` shows.
+    /// `clank resume`, and what `/clanker` shows.
     pub fn short_id(&self) -> &str {
         &self.session_id[..8.min(self.session_id.len())]
     }

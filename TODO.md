@@ -101,7 +101,7 @@ NEXT:
   nowhere to type it. And the whole feature is TUI-only, because the CLI's
   blocking prompt loop has no box to put it in, so `$` there would have to
   mean something different — probably run-and-print with no send step.
-* change status and /status to config and /config or maybe settings and /settings. In the in-session print out of the session config/settings should say something about how the session config/settings override the global ones
+* change status and the in-session bare /clanker (was /status) to config and /config or maybe settings and /settings. In the in-session print out of the session config/settings should say something about how the session config/settings override the global ones
 * --headless: built, then taken back out again. The implementation is in
   51f4ef7 if it's wanted back — flag on `ask` and `agent`, a refusal when any
   approval gate is on, and a `CLANK_HEADLESS` env marker stopping a headless
