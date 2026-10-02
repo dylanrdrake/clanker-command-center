@@ -445,9 +445,22 @@ clank tools allow read
 
 # Everything
 clank tools ask all
-clank tools off              # every tool to never
+clank tools off              # every tool to never, including ones added later
 clank tools on               # every tool back to its default
 ```
+
+**`off` is a policy; the rest are lists.** `clank tools off` (and `/tools
+off`) keeps meaning "off" for a tool that turns up afterwards — a new
+built-in in a later version, or one you add to an MCP server. It used to
+mean "every tool that exists right now", so a tool added later fell back to
+its own default of `ask` and a clanker you'd deliberately disarmed quietly
+had a tool again.
+
+`allow all` and `ask all` deliberately *don't* work that way, and neither
+does a category. They're claims about the tools in front of you, because
+"everything allowed" holding for a tool nobody has seen yet is exactly what
+`ask`-by-default exists to prevent. So an unrecognised tool still asks even
+right after `clank tools allow all`.
 
 **Two tools don't default to `ask`, for opposite reasons.**
 
@@ -470,7 +483,8 @@ So `on` is not the same as `ask all`: it restores each tool's *own* default,
 shell off and web free, rather than making everything prompt.
 
 **A clanker with every tool `never` has no tools at all**, which is what
-"ask mode" used to be. There's no separate switch for it — and that is what a
+"ask mode" used to be — and stays that way when a tool is added later,
+since `off` is a standing policy rather than a snapshot. There's no separate switch for it — and that is what a
 new clanker starts as, so having tools is something you turn on with
 `/tools on` rather than something you have to remember to turn off.
 
@@ -553,12 +567,22 @@ started themselves, which matters more than it sounds: a server launched
 through a runner like `npx` is a grandchild process, and killing only what
 was spawned leaves the real server alive holding its pipe open.
 
+**Picking up a rebuilt server.** The tool list is read once per `clank`
+process, at startup — so a server you rebuild while a clanker is open goes
+on offering the list it had when that process started. `/mcp reconnect`
+inside the clanker restarts the servers and re-reads them; opening a clanker
+in a fresh `clank` also gets the current list. Each terminal is its own
+process with its own server children, so each one reconnects separately.
+
 **Current limits.** stdio transport only — no HTTP or SSE. Servers are
 global rather than per-clanker, so every clanker with tools carries every
-connected server's schemas. A server that announces its tool list has
-changed is not yet re-read; restart to pick it up. On Windows the process
-group that makes the clean shutdown above work isn't available, so a server
-launched through a runner can outlive CCC.
+connected server's schemas (a tool set to `never` is still left out of the
+request, so you can stop paying for one you don't want). A server that
+announces its tool list has changed doesn't trigger a re-read on its own —
+`/mcp reconnect` is the manual version — and nothing reconnects a server
+that dies. On Windows the process group that makes the clean shutdown above
+work isn't available, so a server launched through a runner can outlive
+CCC.
 
 #### A prompt on its own
 
@@ -640,6 +664,8 @@ exactly:
 | `/tools <ask\|allow\|never> <tool\|category\|all>` | Switch what a tool may do for the rest of the clanker, and remember it. Takes effect immediately — including partway through a running turn, from its next tool call |
 | `/tools on` / `/tools off` | Tools on, as `clank tools` allows them, or every tool off |
 | `/tools` | List every tool and what it may do |
+| `/mcp` | List the configured MCP servers, and how many tools each is currently offering. A server that didn't come up says so rather than looking like one with no tools |
+| `/mcp reconnect` | Stop every MCP server and start it again, re-reading what each offers — for picking up a server you just rebuilt. Reports what changed (`gj 10→12`, `old gone`). The one slash command that isn't about the clanker it's typed in: servers belong to the `clank` process, so it covers this clanker and any opened next in the same one, and reaches nothing in another terminal. Refused while a turn is running |
 | `/sandbox <on\|off>` | Confine the agent's file writes to the working directory, or allow them anywhere. Takes effect immediately, including partway through a running turn |
 | `/sandbox` | Show whether writes are currently confined |
 | `/compact` | Fold everything older than the last couple of turns into a summary now, instead of waiting for the conversation to grow past `clank compact-at`. Nothing is deleted — the transcript still scrolls back to the first word; what changes is what gets sent |
@@ -1440,7 +1466,7 @@ is `never`, not that nothing was said about it:
 - Your API key is **not** in this file — `clank login`/`logout` store and remove it from the OS keychain instead (see [Security](#security)). If you have an old config with a plaintext `api_key` field, the next command that loads config transparently migrates it into the OS keychain and rewrites the file without it.
 - `base_url` is managed via `clank endpoint` and is the API endpoint used by every command. Defaults to OpenRouter; point it at any OpenAI-compatible service.
 - `default_model` is managed via `clank model` and is used by `ask`, `clanker`, and `agent` when `-m`/`--model` isn't passed, and always by `tui`, which has no flags at all.
-- `tools` settings control what the agent may do, and what it may do without asking. Managed via `clank tools`. A tool from an MCP server is keyed here by its full `server__tool` name, like any other.
+- `tools` settings control what the agent may do, and what it may do without asking. Managed via `clank tools`. A tool from an MCP server is keyed here by its full `server__tool` name, like any other. One key isn't a tool name: `"*"` is the standing policy `tools off` writes, meaning "and anything not named here" — safe from collision because a tool name may only hold `[a-zA-Z0-9_-]`.
 - `mcp_servers` is managed via `clank mcp` and lists the MCP servers to start — see [`mcp`](#mcp). Absent by default, and left out of the file entirely while empty. `env` holds variable **names**, never values: each one is read from your OS keychain (`clank mcp env`) and then from CCC's own environment at startup, so nothing secret is written here.
 - `max_iterations` is managed via `clank max-iterations` and is the default for `clanker` and one-off runs when `--max-iterations` isn't passed, and for `tui`, which has no flags at all. `null` (after `clank max-iterations --clear`) means a clanker with tools has no cap until one is set somewhere — it does not fall back to 20.
 - `temperature` is managed via `clank temperature` and is the default for `ask`, `clanker`, and `agent` when `--temperature` isn't passed, and for `tui`, which has no flags at all. `null` (after `clank temperature --clear`) means requests are sent with no `temperature` field at all — it does not fall back to 0.7.

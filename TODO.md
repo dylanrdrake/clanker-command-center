@@ -53,14 +53,22 @@ NEXT:
     latency too, and has to decide what "connected" means when three
     clankers share one server.
   - **`notifications/tools/list_changed` is read and ignored.** A server
-    that gains or loses a tool mid-session is not re-read; restart picks it
-    up. Acting on it means rebuilding the whole registered set from every
-    connected server, which `set_registered` is already total enough to do
-    — the open question is what happens to a gate set on a tool that has
-    just disappeared.
+    that gains or loses a tool mid-session is not re-read on its own.
+    `/mcp reconnect` is the manual version and covers the case that
+    actually comes up — you rebuilt it, so you know — which is why acting
+    on the notification dropped down this list rather than off it. Doing it
+    automatically is the same `connect_all` call on a timer or a signal; the
+    open question is the one `/mcp reconnect` also has, below.
+  - **A gate on a tool that disappears is silently orphaned.** Harmless
+    today — the entry is ignored and the tool is simply not there — but
+    nothing says so, and after a reconnect that drops a tool you have a
+    setting in `config.json` or a session row that matches nothing. Worth a
+    line in `/mcp reconnect`'s report at least.
   - **Nothing reconnects a server that dies.** The calls in flight fail
     correctly and say why, but the tools stay registered and every later
-    call fails too, until CCC is restarted.
+    call fails too, until `/mcp reconnect` or a restart. Now that the
+    manual path exists, the automatic one is just deciding when to take
+    it.
   - **stdio only.** No HTTP or SSE transport. `Connection` is generic over
     its streams precisely so that is a second constructor rather than a
     second client, but nothing has needed it yet.

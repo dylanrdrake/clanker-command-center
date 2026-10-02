@@ -969,10 +969,11 @@ impl Worker {
     /// rebuilt is re-read.
     ///
     /// Process-wide: the servers and the tools they contribute belong to
-    /// the process, not to this clanker, so this reaches every clanker in
-    /// the same window. The notice says so — it would otherwise read like
-    /// every other slash command, all of which change only the clanker
-    /// they are typed in.
+    /// the `clank` process, not to this clanker — so it covers this
+    /// clanker and any opened next in the same process, and reaches
+    /// nothing in another terminal. The notice says so, because it would
+    /// otherwise read like every other slash command, all of which change
+    /// only the clanker they are typed in.
     async fn reconnect_mcp(&mut self) {
         let before = crate::mcp::connected_counts();
         let config = match crate::config::load_config() {

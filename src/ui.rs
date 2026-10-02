@@ -205,8 +205,9 @@ pub enum Submission {
     ShowMcp,
     /// Stops every MCP server and starts them again, re-reading what they
     /// offer. Process-wide rather than per-clanker, unlike every other
-    /// slash command: the servers and the tools they contribute belong to
-    /// the process, so this reaches every clanker in the same window.
+    /// slash command: the servers belong to the `clank` process, so this
+    /// covers the clanker it is typed in and any opened next in the same
+    /// one, and reaches nothing in another terminal.
     ReconnectMcp,
     /// Confines the agent's file writes to the working directory, or lets
     /// them go anywhere. The read tools are unaffected either way.
@@ -442,6 +443,13 @@ pub fn mcp_rows(
 /// Says what changed rather than only what happened, because the reason to
 /// type it is a server that was rebuilt — and "9 tools" tells you nothing
 /// unless you remember it was 10.
+///
+/// And says how far it reached. Servers are process-wide, so this is not
+/// the clanker-shaped change every other slash command makes: it covers
+/// the clanker it was typed in and any opened next in the same `clank`,
+/// and reaches nothing in another terminal. An earlier version of this
+/// line said "every clanker in this window", which implied several at once
+/// — the TUI holds exactly one.
 pub fn mcp_reconnected_notice(before: &[(String, usize)], after: &[(String, usize)]) -> String {
     if after.is_empty() {
         return "No MCP server came up. See clank mcp.".to_string();
@@ -461,7 +469,8 @@ pub fn mcp_reconnected_notice(before: &[(String, usize)], after: &[(String, usiz
         }
     }
     format!(
-        "Reconnected every MCP server, for every clanker in this window — {} tools.",
+        "Reconnected every MCP server — {}. Servers belong to this clank rather than \
+         to one clanker, so another terminal keeps its own.",
         parts.join(", ")
     )
 }
@@ -2321,8 +2330,13 @@ mod tests {
         assert!(notice.contains("gj 10→12"), "{notice}");
         assert!(notice.contains("new 1, new"), "{notice}");
         assert!(notice.contains("old gone"), "{notice}");
-        // And that it reached more than the clanker it was typed in.
-        assert!(notice.contains("every clanker in this window"), "{notice}");
+        // And how far it reached. Process-wide, not clanker-wide like
+        // every other slash command, and not machine-wide either.
+        assert!(notice.contains("belong to this clank"), "{notice}");
+        assert!(
+            notice.contains("another terminal keeps its own"),
+            "{notice}"
+        );
     }
 
     #[test]
