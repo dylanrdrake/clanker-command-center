@@ -1852,6 +1852,19 @@ fn apply_submission(
             println!("{}", "Tools:".blue());
             print_tools(session.tool_access());
         }
+        ui::Submission::ShowMcp => {
+            let servers = load_config().map(|c| c.mcp_servers).unwrap_or_default();
+            println!("{}", "MCP servers:".blue());
+            for (name, state) in ui::mcp_rows(&servers, &mcp::connected_counts()) {
+                println!("  {name}: {}", state.bright_black());
+            }
+        }
+        // `ReconnectMcp` is handled in the loop instead: it awaits, and
+        // this is where a submission that cannot is listed explicitly
+        // rather than caught by `_`.
+        ui::Submission::ReconnectMcp => {
+            unreachable!("the clanker loop reconnects before reaching here")
+        }
         ui::Submission::SetSandbox(sandbox) => {
             session.set_sandbox(sandbox)?;
             println!("{}", ui::sandbox_notice(sandbox, true).blue());
@@ -2170,6 +2183,15 @@ async fn cmd_clanker(
         }
 
         match ui::classify(&line) {
+            ui::Submission::ReconnectMcp => {
+                // Nothing to refuse against, unlike the TUI: this loop
+                // reads a line, runs a turn, and comes back, so no turn can
+                // be in flight while a command is being read.
+                let before = mcp::connected_counts();
+                connect_mcp_servers().await;
+                let after = mcp::connected_counts();
+                println!("{}", ui::mcp_reconnected_notice(&before, &after).blue());
+            }
             ui::Submission::Compact => {
                 if let Err(e) = compact_cli(
                     &client,

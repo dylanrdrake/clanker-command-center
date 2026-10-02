@@ -796,6 +796,23 @@ pub async fn call(full_name: &str, arguments: Value) -> Result<String> {
     server.call(tool, arguments).await
 }
 
+/// How many tools each connected server is offering, in name order.
+///
+/// What `/mcp` reports and what a reconnect is measured against: the
+/// difference between a server being configured and a server being up.
+pub fn connected_counts() -> Vec<(String, usize)> {
+    let mut counts: Vec<(String, usize)> = connected()
+        .as_ref()
+        .map(|live| {
+            live.iter()
+                .map(|(name, server)| (name.clone(), server.tools().len()))
+                .collect()
+        })
+        .unwrap_or_default();
+    counts.sort();
+    counts
+}
+
 /// Stops every server, and everything they started.
 ///
 /// Called on the way out. Nothing depends on it running — a dropped

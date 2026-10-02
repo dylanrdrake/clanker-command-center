@@ -41,6 +41,9 @@ pub enum Command {
     Include(String),
     /// Answer the outstanding [`Event::ApprovalRequested`].
     Approve(bool),
+    /// Stop every MCP server and start it again — see
+    /// [`Submission::ReconnectMcp`](crate::ui::Submission::ReconnectMcp).
+    ReconnectMcp,
     /// Abort the in-flight turn and drop anything queued behind it.
     Cancel,
     /// Fetch the endpoint's model list, for the browser. Spawned rather than
@@ -219,6 +222,12 @@ pub enum Event {
     Compacted {
         folded: usize,
     },
+    /// Every MCP server stopped and started again, with what each offers
+    /// now. Carries the whole line rather than the numbers because the
+    /// front ends must not describe the same event differently.
+    McpReconnected {
+        summary: String,
+    },
     /// Compaction was asked for and there was nothing to do — too little
     /// history past the last seam to fold. Distinct from a failure: nothing
     /// went wrong, and `/compact` still deserves an answer.
@@ -270,7 +279,14 @@ pub fn command_for(submission: &Submission) -> Option<Command> {
         // bare is here too: the TUI round-trips it through the worker so the
         // answer reflects what the session actually holds, while the CLI
         // reads its own `ChatSession` directly.
-        Submission::ShowHelp
+        // Routed through the worker rather than answered locally, even
+        // though it changes nothing about this session: it has to be
+        // refused while a turn is running, and the worker is the only thing
+        // that knows whether one is. `/mcp` on its own reads process state
+        // and is answered by the front end.
+        Submission::ReconnectMcp => Some(Command::ReconnectMcp),
+        Submission::ShowMcp
+        | Submission::ShowHelp
         | Submission::ShowEffort
         | Submission::ShowModel
         | Submission::ShowTools
@@ -489,6 +505,11 @@ impl Worker {
                 // rewrites the history the next turn will be built from, so
                 // letting a message overtake it would send the very request
                 // it exists to shrink.
+                // Awaited rather than spawned, for the same reason as
+                // `Compact`: it replaces the tools the next turn would be
+                // built from, so letting a message overtake it would send a
+                // request describing servers that are being restarted.
+                Command::ReconnectMcp => self.reconnect_mcp().await,
                 Command::Compact => match self.compact(&mut commands, &mut queue, true).await {
                     CompactOutcome::Done => {}
                     CompactOutcome::Cancelled => {
@@ -566,7 +587,7 @@ impl Worker {
             // Both go somewhere that isn't here — a message starts a turn
             // and a compaction needs a select loop — so neither reaches
             // this, and both callers match them out first.
-            Command::Send(_) | Command::Compact => {}
+            Command::Send(_) | Command::Compact | Command::ReconnectMcp => {}
         }
     }
 
@@ -823,6 +844,17 @@ impl Worker {
                                     .to_string(),
                             });
                         }
+                        // Same reasoning, one layer out: restarting a
+                        // server pulls the connection out from under a call
+                        // the running turn may be about to make, and the
+                        // turn would learn about it as "the server closed
+                        // its output" — a confusing way to be told.
+                        Some(Command::ReconnectMcp) => {
+                            let _ = self.events.send(Event::McpReconnected {
+                                summary: "A turn is running — reconnect once it has finished"
+                                    .to_string(),
+                            });
+                        }
                     }
                 }
             }
@@ -931,6 +963,52 @@ impl Worker {
                 .due(self.session.prompt_tokens(), threshold),
             None => false,
         }
+    }
+
+    /// Stops every MCP server and starts them again, so a server that was
+    /// rebuilt is re-read.
+    ///
+    /// Process-wide: the servers and the tools they contribute belong to
+    /// the process, not to this clanker, so this reaches every clanker in
+    /// the same window. The notice says so — it would otherwise read like
+    /// every other slash command, all of which change only the clanker
+    /// they are typed in.
+    async fn reconnect_mcp(&mut self) {
+        let before = crate::mcp::connected_counts();
+        let config = match crate::config::load_config() {
+            Ok(config) => config,
+            Err(e) => {
+                let _ = self.events.send(Event::McpReconnected {
+                    summary: format!("Could not read the configured servers: {e}"),
+                });
+                return;
+            }
+        };
+
+        let mut specs = Vec::new();
+        for server in &config.mcp_servers {
+            match crate::config::resolve_server(server) {
+                Ok((spec, _missing)) => specs.push(spec),
+                Err(e) => {
+                    let _ = self.events.send(Event::Agent(AgentEvent::Error {
+                        message: format!("{}: {e}", server.name),
+                    }));
+                }
+            }
+        }
+
+        for started in crate::mcp::connect_all(&specs).await {
+            if let Err(e) = started.outcome {
+                let _ = self.events.send(Event::Agent(AgentEvent::Error {
+                    message: format!("{}: {e}", started.name),
+                }));
+            }
+        }
+
+        let after = crate::mcp::connected_counts();
+        let _ = self.events.send(Event::McpReconnected {
+            summary: crate::ui::mcp_reconnected_notice(&before, &after),
+        });
     }
 
     /// Folds everything older than the last couple of turns into a summary,
@@ -1472,5 +1550,17 @@ mod tests {
                 "{submission:?} should be answered by the front end"
             );
         }
+    }
+    #[test]
+    fn a_reconnect_goes_to_the_worker_and_a_listing_does_not() {
+        // `/mcp` reads process state the front end can see as well as the
+        // worker can. `/mcp reconnect` has to go through, because only the
+        // worker knows whether a turn is running — and restarting a server
+        // under a turn that is about to call it is the thing being avoided.
+        assert!(command_for(&Submission::ShowMcp).is_none());
+        assert!(matches!(
+            command_for(&Submission::ReconnectMcp),
+            Some(Command::ReconnectMcp)
+        ));
     }
 }

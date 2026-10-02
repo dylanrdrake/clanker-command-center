@@ -1124,6 +1124,22 @@ fn dispatch_submission(app: &mut App, text: &str, send: &mut impl FnMut(Command)
                         changed: false,
                     });
                 }
+                // Answered here rather than through the worker: it reads
+                // process state, which this screen can see as well as the
+                // worker can. `/mcp reconnect` is the one that has to go
+                // through, because only the worker knows whether a turn is
+                // running.
+                app::Submission::ShowMcp => {
+                    let servers = crate::config::load_config()
+                        .map(|config| config.mcp_servers)
+                        .unwrap_or_default();
+                    for (name, state) in
+                        crate::ui::mcp_rows(&servers, &crate::mcp::connected_counts())
+                    {
+                        app.transcript
+                            .push(TranscriptItem::Notice(format!("{name}: {state}")));
+                    }
+                }
                 // Typed equivalents of the box's chords, for a
                 // terminal or multiplexer that has claimed them.
                 app::Submission::SendShell => settle_shell(app, send, true),
@@ -1154,7 +1170,8 @@ fn dispatch_submission(app: &mut App, text: &str, send: &mut impl FnMut(Command)
                 | app::Submission::Shell(_)
                 | app::Submission::SetToolAccess { .. }
                 | app::Submission::ResetToolAccess
-                | app::Submission::Compact => {
+                | app::Submission::Compact
+                | app::Submission::ReconnectMcp => {
                     unreachable!("command_for routes these to the worker")
                 }
             }

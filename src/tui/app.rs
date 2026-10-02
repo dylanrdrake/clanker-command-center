@@ -550,6 +550,9 @@ impl App {
                 self.compacting = false;
                 self.transcript.push(TranscriptItem::Notice(reason));
             }
+            Event::McpReconnected { summary } => {
+                self.transcript.push(TranscriptItem::Notice(summary));
+            }
             Event::Agent(event) => self.apply_agent(event),
         }
     }
@@ -1945,15 +1948,18 @@ mod tests {
 
     #[test]
     fn tab_steps_through_the_matches_when_there_is_nothing_to_fill_in() {
-        // "m" is all three of these agree on, so there is nothing to add.
+        // "m" is all four of these agree on, so there is nothing to add.
         let mut a = typing("/m");
         let mut seen = Vec::new();
-        for _ in 0..4 {
+        for _ in 0..5 {
             a.complete_command();
             seen.push(a.input.clone());
         }
-        // ...and the fourth press comes back round to the first.
-        assert_eq!(seen, ["/models", "/model", "/max-iterations", "/models"]);
+        // ...and the press after the last comes back round to the first.
+        assert_eq!(
+            seen,
+            ["/models", "/model", "/max-iterations", "/mcp", "/models"]
+        );
     }
 
     #[test]
@@ -2002,7 +2008,10 @@ mod tests {
             Some(CommandHint::Matches { names, active }) => (names, active),
             _ => panic!("{text} did not offer matches"),
         };
-        assert_eq!(matches("/m").0, ["models", "model", "max-iterations"]);
+        assert_eq!(
+            matches("/m").0,
+            ["models", "model", "max-iterations", "mcp"]
+        );
         assert_eq!(matches("/m").1, None);
         // A name that is also the start of a longer one still offers both.
         assert_eq!(matches("/temp").0, ["temperature", "temp"]);
@@ -2054,7 +2063,7 @@ mod tests {
         assert_eq!(a.input, "/models");
         match a.command_hint() {
             Some(CommandHint::Matches { names, active }) => {
-                assert_eq!(names, ["models", "model", "max-iterations"]);
+                assert_eq!(names, ["models", "model", "max-iterations", "mcp"]);
                 assert_eq!(active, Some(0));
             }
             _ => panic!("the list went away mid-run"),

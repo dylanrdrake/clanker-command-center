@@ -201,6 +201,13 @@ pub enum Submission {
     ResetToolAccess,
     /// Prints/shows what each tool may do, without changing anything.
     ShowTools,
+    /// Prints/shows the configured MCP servers and what each is offering.
+    ShowMcp,
+    /// Stops every MCP server and starts them again, re-reading what they
+    /// offer. Process-wide rather than per-clanker, unlike every other
+    /// slash command: the servers and the tools they contribute belong to
+    /// the process, so this reaches every clanker in the same window.
+    ReconnectMcp,
     /// Confines the agent's file writes to the working directory, or lets
     /// them go anywhere. The read tools are unaffected either way.
     SetSandbox(bool),
@@ -391,6 +398,72 @@ pub fn tool_rows(access: &ToolAccessSettings) -> Vec<(String, String)> {
             )
         })
         .collect()
+}
+
+/// What each configured MCP server is, and what it is offering right now,
+/// as label/value rows — the body of `/mcp`.
+///
+/// `live` is the tool count per server that actually connected, which is
+/// what makes the difference between "configured" and "running" visible: a
+/// server with no entry there is one that did not come up.
+pub fn mcp_rows(
+    servers: &[crate::config::McpServerConfig],
+    live: &[(String, usize)],
+) -> Vec<(String, String)> {
+    if servers.is_empty() {
+        return vec![(
+            "No MCP servers".to_string(),
+            "clank mcp add <name> -- <command to run it>".to_string(),
+        )];
+    }
+    servers
+        .iter()
+        .map(|server| {
+            let state = match live.iter().find(|(name, _)| *name == server.name) {
+                Some((_, count)) => format!(
+                    "{count} tool{} · {} {}",
+                    if *count == 1 { "" } else { "s" },
+                    server.command,
+                    server.args.join(" ")
+                ),
+                None => format!(
+                    "not connected · {} {}",
+                    server.command,
+                    server.args.join(" ")
+                ),
+            };
+            (server.name.clone(), state.trim_end().to_string())
+        })
+        .collect()
+}
+
+/// What `/mcp reconnect` reports, once it has run.
+///
+/// Says what changed rather than only what happened, because the reason to
+/// type it is a server that was rebuilt — and "9 tools" tells you nothing
+/// unless you remember it was 10.
+pub fn mcp_reconnected_notice(before: &[(String, usize)], after: &[(String, usize)]) -> String {
+    if after.is_empty() {
+        return "No MCP server came up. See clank mcp.".to_string();
+    }
+    let mut parts: Vec<String> = Vec::new();
+    for (name, count) in after {
+        let was = before.iter().find(|(had, _)| had == name).map(|(_, n)| *n);
+        parts.push(match was {
+            Some(was) if was == *count => format!("{name} {count}"),
+            Some(was) => format!("{name} {was}→{count}"),
+            None => format!("{name} {count}, new"),
+        });
+    }
+    for (name, _) in before {
+        if !after.iter().any(|(up, _)| up == name) {
+            parts.push(format!("{name} gone"));
+        }
+    }
+    format!(
+        "Reconnected every MCP server, for every clanker in this window — {} tools.",
+        parts.join(", ")
+    )
 }
 
 /// One line naming what an approval is asking about, for a list that has a
@@ -641,6 +714,14 @@ pub fn classify(text: &str) -> Submission {
         }
     }
 
+    if let Some(rest) = trimmed.strip_prefix("/mcp") {
+        match rest.trim() {
+            "" => return Submission::ShowMcp,
+            "reconnect" => return Submission::ReconnectMcp,
+            _ => {}
+        }
+    }
+
     if let Some(rest) = trimmed.strip_prefix("/stream") {
         if rest.trim().is_empty() {
             return Submission::ShowStream;
@@ -821,7 +902,7 @@ struct Command {
     usage: Option<&'static str>,
 }
 
-const COMMANDS: [Command; 20] = [
+const COMMANDS: [Command; 21] = [
     Command {
         word: "help",
         syntax: "/help",
@@ -869,6 +950,12 @@ const COMMANDS: [Command; 20] = [
         syntax: "/tools [on|off | <ask|allow|never> <target>]",
         blurb: "Show what each tool may do, or change it",
         usage: Some("/tools on|off | <ask|allow|never> <tool|category|all>"),
+    },
+    Command {
+        word: "mcp",
+        syntax: "/mcp [reconnect]",
+        blurb: "Show the MCP servers, or restart them to pick up changes",
+        usage: Some("/mcp | /mcp reconnect"),
     },
     Command {
         word: "sandbox",
@@ -1656,6 +1743,10 @@ mod tests {
 
         // Bare — with or without trailing whitespace — lists them.
         assert_eq!(classify("/tools"), Submission::ShowTools);
+        assert_eq!(classify("/mcp"), Submission::ShowMcp);
+        assert_eq!(classify("  /mcp  "), Submission::ShowMcp);
+        assert_eq!(classify("/mcp reconnect"), Submission::ReconnectMcp);
+        assert_eq!(classify("/mcp   reconnect  "), Submission::ReconnectMcp);
         assert_eq!(classify("  /tools   "), Submission::ShowTools);
     }
 
@@ -2181,5 +2272,69 @@ mod tests {
             !fields.iter().any(|(key, _)| key == "working_dir"),
             "{fields:?}"
         );
+    }
+    #[test]
+    fn mcp_rows_separate_configured_from_running() {
+        let servers = vec![
+            crate::config::McpServerConfig {
+                name: "gj".to_string(),
+                command: "/bin/gj".to_string(),
+                args: vec!["mcp".to_string()],
+                env: Vec::new(),
+            },
+            crate::config::McpServerConfig {
+                name: "dead".to_string(),
+                command: "nope".to_string(),
+                args: Vec::new(),
+                env: Vec::new(),
+            },
+        ];
+        let rows = mcp_rows(&servers, &[("gj".to_string(), 10)]);
+
+        assert_eq!(rows[0].0, "gj");
+        assert!(
+            rows[0].1.starts_with("10 tools · /bin/gj mcp"),
+            "{:?}",
+            rows[0].1
+        );
+        // A configured server that did not come up has to say so, not be
+        // left looking the same as one offering nothing.
+        assert_eq!(rows[1].0, "dead");
+        assert!(rows[1].1.starts_with("not connected"), "{:?}", rows[1].1);
+    }
+
+    #[test]
+    fn mcp_rows_say_how_to_add_one_when_there_are_none() {
+        let rows = mcp_rows(&[], &[]);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].1.contains("clank mcp add"), "{:?}", rows[0].1);
+    }
+
+    #[test]
+    fn a_reconnect_says_what_changed_not_just_what_is_there() {
+        // The reason to type it is a server that was rebuilt, and "9 tools"
+        // says nothing unless you remember it was 10.
+        let notice = mcp_reconnected_notice(
+            &[("gj".to_string(), 10), ("old".to_string(), 3)],
+            &[("gj".to_string(), 12), ("new".to_string(), 1)],
+        );
+        assert!(notice.contains("gj 10→12"), "{notice}");
+        assert!(notice.contains("new 1, new"), "{notice}");
+        assert!(notice.contains("old gone"), "{notice}");
+        // And that it reached more than the clanker it was typed in.
+        assert!(notice.contains("every clanker in this window"), "{notice}");
+    }
+
+    #[test]
+    fn a_reconnect_that_brought_nothing_up_says_so() {
+        let notice = mcp_reconnected_notice(&[("gj".to_string(), 10)], &[]);
+        assert!(notice.contains("No MCP server came up"), "{notice}");
+    }
+
+    #[test]
+    fn an_unchanged_server_is_reported_without_an_arrow() {
+        let notice = mcp_reconnected_notice(&[("gj".to_string(), 10)], &[("gj".to_string(), 10)]);
+        assert!(notice.contains("gj 10"), "{notice}");
+        assert!(!notice.contains("→"), "{notice}");
     }
 }
