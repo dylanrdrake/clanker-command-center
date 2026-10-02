@@ -108,6 +108,27 @@ pub struct ToolAccessSettings {
 /// provider's own rule is enforced — so nothing can ever be called `*`.
 const EVERYTHING_ELSE: &str = "*";
 
+/// The key under which "and anything else from this server" is stored:
+/// `gj__*`, which is also what you can type to name it.
+///
+/// The same idea as [`EVERYTHING_ELSE`], one level down, and for the same
+/// reason. A server is a program somebody rebuilds, so "none of gj's tools"
+/// that held only for the tools gj had when you typed it would stop holding
+/// the next time it grew one. Safe from collision for the same reason too:
+/// no tool name can hold a `*`.
+fn server_key(server: &str) -> String {
+    format!("{server}{}*", crate::mcp::SEPARATOR)
+}
+
+/// The server a tool name belongs to, if it is a namespaced one.
+///
+/// Read off the name rather than carried beside it: `ServerSpec::new`
+/// refuses a server name holding the separator, which is what makes the
+/// first `__` an unambiguous place to cut, and no built-in has one.
+fn server_of(tool_name: &str) -> Option<&str> {
+    crate::mcp::route(tool_name).map(|(server, _)| server)
+}
+
 /// What a tool does when nothing has been said about it.
 ///
 /// The shell is off. It is the one tool whose blast radius is everything the
@@ -143,9 +164,13 @@ impl ToolAccessSettings {
 
     /// What a tool with nothing said about it gets: the standing policy if
     /// one is set, otherwise the tool's own default.
+    ///
+    /// The narrower policy wins: a standing policy for the tool's own
+    /// server, then the one for everything, then the default.
     fn fallback(&self, tool_name: &str) -> ToolAccess {
-        self.overrides
-            .get(EVERYTHING_ELSE)
+        server_of(tool_name)
+            .and_then(|server| self.overrides.get(&server_key(server)))
+            .or_else(|| self.overrides.get(EVERYTHING_ELSE))
             .copied()
             .unwrap_or_else(|| default_access(tool_name))
     }
@@ -185,7 +210,8 @@ impl ToolAccessSettings {
     }
 
     /// A copy with `target` set to `access`. `target` is a tool's name, a
-    /// category (`read`/`write`/`terminal`/`web`), or `all`. `None` for a
+    /// category (`read`/`write`/`terminal`/`web`), `all`, or an MCP server —
+    /// by its name or as `server__*`. `None` for a
     /// word that names none of those, so a caller can report the typo rather
     /// than silently changing nothing.
     pub fn with(&self, target: &str, access: ToolAccess) -> Option<Self> {
@@ -223,35 +249,98 @@ impl ToolAccessSettings {
             return Some(updated);
         }
 
-        let matched: Vec<String> = tools
+        let by_name_or_category: Vec<String> = tools
             .iter()
             .filter(|tool| target == "all" || tool.name == target || tool.category == target)
+            .map(|tool| tool.name.to_string())
+            .collect();
+
+        // A server is the last thing a target can mean, so a server that
+        // happens to be called `read` or `all` is still reachable — as
+        // `read__*`, which no tool or category can be.
+        if by_name_or_category.is_empty() {
+            let server = target
+                .strip_suffix(&format!("{}*", crate::mcp::SEPARATOR))
+                .unwrap_or(target);
+            return self.with_server_in(tools, server, access);
+        }
+
+        let mut updated = self.clone();
+        if target == "all" {
+            // Otherwise a standing `never` would outlive the `allow all`
+            // that was meant to lift it, and every tool added afterwards
+            // would still arrive off. That goes for a server's as much as
+            // for the global one.
+            updated.overrides.retain(|key, _| !key.ends_with('*'));
+        }
+        for name in by_name_or_category {
+            updated.set_one(name, access);
+        }
+        Some(updated)
+    }
+
+    /// `self` with every tool of `server` set to `access`, or `None` if no
+    /// connected server has that name.
+    ///
+    /// `never` is a standing policy and the others are a list, for the
+    /// reason given in [`Self::with_in`]: a tool the server grows later
+    /// should arrive off, and must not arrive unattended.
+    ///
+    /// `None` also for a server that is configured but did not connect,
+    /// because this only sees tools. That is a limit rather than a choice —
+    /// a server that is down has nothing to name — and it is why a typo is
+    /// still reported instead of quietly stored.
+    fn with_server_in(
+        &self,
+        tools: &[crate::tools::ToolInfo],
+        server: &str,
+        access: ToolAccess,
+    ) -> Option<Self> {
+        let matched: Vec<String> = tools
+            .iter()
+            .filter(|tool| server_of(&tool.name) == Some(server))
             .map(|tool| tool.name.to_string())
             .collect();
         if matched.is_empty() {
             return None;
         }
         let mut updated = self.clone();
-        if target == "all" {
-            // Otherwise a standing `never` would outlive the `allow all`
-            // that was meant to lift it, and every tool added afterwards
-            // would still arrive off.
-            updated.overrides.remove(EVERYTHING_ELSE);
-        }
-        for name in matched {
-            // Held only while it differs from the default, so "set it back
-            // to what it would have been" and "never mentioned it" store the
-            // same thing — and a later change of default reaches both.
-            // Compared against the effective default rather than the
-            // tool's own, so setting a tool to what the standing policy
-            // already says stores nothing instead of a redundant row.
-            if access == updated.fallback(&name) {
-                updated.overrides.remove(&name);
-            } else {
-                updated.overrides.insert(name, access);
+        // Whatever was said about this server before is replaced rather than
+        // layered on: the specific entries are what a more targeted earlier
+        // command left, and the one just typed is about the whole server. The
+        // prefix is cleared by key rather than by the tools matched, so a
+        // tool the server has since dropped does not leave an entry behind.
+        let prefix = format!("{server}{}", crate::mcp::SEPARATOR);
+        updated.overrides.retain(|key, _| !key.starts_with(&prefix));
+
+        if access == ToolAccess::Never {
+            // Redundant under a global `never`, and left out for the same
+            // reason a tool set to its default is.
+            if updated.overrides.get(EVERYTHING_ELSE) != Some(&ToolAccess::Never) {
+                updated.overrides.insert(server_key(server), access);
+            }
+        } else {
+            for name in matched {
+                updated.set_one(name, access);
             }
         }
         Some(updated)
+    }
+
+    /// Records `access` for one tool, held only while it differs from what
+    /// the tool would get anyway.
+    ///
+    /// So "set it back to what it would have been" and "never mentioned it"
+    /// store the same thing — and a later change of default reaches both.
+    /// Compared against the effective fallback rather than the tool's own
+    /// default, so setting a tool to what a standing policy already says
+    /// stores nothing instead of a redundant row.
+    fn set_one(&mut self, name: String, access: ToolAccess) {
+        if access == self.fallback(&name) {
+            self.overrides.remove(&name);
+        } else {
+            self.overrides.insert(name, access);
+        }
     }
 
     /// Every tool back to its default: what `tools on` means.
@@ -998,6 +1087,181 @@ mod tests {
         assert_eq!(off_except_one.access("read_file"), ToolAccess::Allow);
         assert_eq!(off_except_one.access("list_files"), ToolAccess::Never);
         assert_eq!(off_except_one.access("anything_new"), ToolAccess::Never);
+    }
+
+    /// Two servers and the built-ins, as `tools::merge` would build them
+    /// without writing to the process-wide registry.
+    fn two_servers() -> Vec<crate::tools::ToolInfo> {
+        let tool = |name: &str, category: &str| {
+            crate::tools::ToolInfo::new(
+                name,
+                category,
+                "x",
+                serde_json::json!({
+                    "type": "function",
+                    "function": {"name": name, "parameters": {"type": "object"}}
+                }),
+            )
+            .unwrap()
+        };
+        crate::tools::merge(&[
+            tool("gj__find", "read"),
+            tool("gj__delete", "write"),
+            tool("fs__read_text_file", "read"),
+            tool("fs__write_file", "write"),
+        ])
+    }
+
+    #[test]
+    fn a_server_can_be_switched_off_by_name_or_as_a_glob() {
+        let all = two_servers();
+        for target in ["gj", "gj__*"] {
+            let off = ToolAccessSettings::default()
+                .with_in(&all, target, ToolAccess::Never)
+                .unwrap_or_else(|| panic!("{target} names a connected server"));
+            assert_eq!(off.access("gj__find"), ToolAccess::Never, "{target}");
+            assert_eq!(off.access("gj__delete"), ToolAccess::Never, "{target}");
+            // Only that server: not the other one, and not the built-ins —
+            // which `never write` could not manage, since it takes
+            // `write_file` along with every server's writers.
+            assert_eq!(off.access("fs__write_file"), ToolAccess::Ask, "{target}");
+            assert_eq!(off.access("write_file"), ToolAccess::Ask, "{target}");
+        }
+    }
+
+    #[test]
+    fn a_server_switched_off_stays_off_when_it_grows_a_tool() {
+        // The reason it is a standing policy: a server is a program that
+        // gets rebuilt, and "none of gj" has to survive that.
+        let off = ToolAccessSettings::default()
+            .with_in(&two_servers(), "gj", ToolAccess::Never)
+            .unwrap();
+        assert_eq!(off.access("gj__added_in_the_next_build"), ToolAccess::Never);
+        assert_eq!(off.access("fs__added_in_the_next_build"), ToolAccess::Ask);
+        // And it is one entry, not one per tool.
+        assert_eq!(serde_json::to_string(&off).unwrap(), r#"{"gj__*":"never"}"#);
+    }
+
+    #[test]
+    fn a_server_allowed_is_a_claim_about_the_tools_in_front_of_you() {
+        // The asymmetry again: only `never` holds for a tool nobody has
+        // seen. `allow gj` must not wave through whatever gj grows next.
+        let all = two_servers();
+        let allowed = ToolAccessSettings::default()
+            .with_in(&all, "gj", ToolAccess::Allow)
+            .unwrap();
+        assert_eq!(allowed.access("gj__find"), ToolAccess::Allow);
+        assert_eq!(allowed.access("gj__delete"), ToolAccess::Allow);
+        assert_eq!(
+            allowed.access("gj__added_in_the_next_build"),
+            ToolAccess::Ask
+        );
+        assert_eq!(allowed.access("fs__read_text_file"), ToolAccess::Ask);
+    }
+
+    #[test]
+    fn one_tool_can_be_switched_back_on_under_a_server_never() {
+        let all = two_servers();
+        let settings = ToolAccessSettings::default()
+            .with_in(&all, "gj", ToolAccess::Never)
+            .unwrap()
+            .with_in(&all, "gj__find", ToolAccess::Allow)
+            .unwrap();
+        assert_eq!(settings.access("gj__find"), ToolAccess::Allow);
+        assert_eq!(settings.access("gj__delete"), ToolAccess::Never);
+        assert_eq!(settings.access("gj__new"), ToolAccess::Never);
+    }
+
+    #[test]
+    fn a_server_command_replaces_what_was_said_about_that_server_before() {
+        let all = two_servers();
+        let settings = ToolAccessSettings::default()
+            .with_in(&all, "gj__find", ToolAccess::Allow)
+            .unwrap()
+            .with_in(&all, "fs__write_file", ToolAccess::Allow)
+            .unwrap()
+            .with_in(&all, "gj", ToolAccess::Never)
+            .unwrap();
+        // The earlier, narrower `allow` on gj is gone rather than punching
+        // a hole in "all of gj off" — and the other server's is untouched.
+        assert_eq!(settings.access("gj__find"), ToolAccess::Never);
+        assert_eq!(settings.access("fs__write_file"), ToolAccess::Allow);
+
+        // Lifting it: back to the ordinary default, standing entry gone.
+        let lifted = settings.with_in(&all, "gj", ToolAccess::Ask).unwrap();
+        assert_eq!(lifted.access("gj__find"), ToolAccess::Ask);
+        assert_eq!(lifted.access("gj__new"), ToolAccess::Ask);
+        assert_eq!(lifted.access("fs__write_file"), ToolAccess::Allow);
+    }
+
+    #[test]
+    fn allow_all_lifts_a_server_never_too() {
+        let all = two_servers();
+        let off = ToolAccessSettings::default()
+            .with_in(&all, "gj", ToolAccess::Never)
+            .unwrap();
+        let back = off.with_in(&all, "all", ToolAccess::Allow).unwrap();
+        assert_eq!(back.access("gj__find"), ToolAccess::Allow);
+        assert_eq!(back.access("gj__new"), ToolAccess::Ask);
+
+        // And `off` swallows it: one policy, nothing left over.
+        let none = off.with_in(&all, "all", ToolAccess::Never).unwrap();
+        assert_eq!(serde_json::to_string(&none).unwrap(), r#"{"*":"never"}"#);
+    }
+
+    #[test]
+    fn a_server_never_under_a_global_never_stores_nothing_extra() {
+        let all = two_servers();
+        let settings = ToolAccessSettings::none()
+            .with_in(&all, "gj", ToolAccess::Never)
+            .unwrap();
+        assert_eq!(
+            serde_json::to_string(&settings).unwrap(),
+            r#"{"*":"never"}"#
+        );
+    }
+
+    #[test]
+    fn a_name_that_is_a_tool_or_category_is_not_read_as_a_server() {
+        // A server called `read` is reachable, but only spelled out — the
+        // bare word keeps meaning the category it always meant.
+        let mut all = two_servers();
+        all.push(
+            crate::tools::ToolInfo::new(
+                "read__thing",
+                "write",
+                "x",
+                serde_json::json!({
+                    "type": "function",
+                    "function": {"name": "read__thing", "parameters": {"type": "object"}}
+                }),
+            )
+            .unwrap(),
+        );
+        let by_category = ToolAccessSettings::default()
+            .with_in(&all, "read", ToolAccess::Never)
+            .unwrap();
+        assert_eq!(by_category.access("read_file"), ToolAccess::Never);
+        assert_eq!(by_category.access("read__thing"), ToolAccess::Ask);
+
+        let by_server = ToolAccessSettings::default()
+            .with_in(&all, "read__*", ToolAccess::Never)
+            .unwrap();
+        assert_eq!(by_server.access("read__thing"), ToolAccess::Never);
+        assert_eq!(by_server.access("read_file"), ToolAccess::Ask);
+    }
+
+    #[test]
+    fn a_server_that_is_not_there_is_reported_not_stored() {
+        let all = two_servers();
+        for target in ["nonesuch", "nonesuch__*", "gj__", "__*", ""] {
+            assert!(
+                ToolAccessSettings::default()
+                    .with_in(&all, target, ToolAccess::Never)
+                    .is_none(),
+                "{target:?}"
+            );
+        }
     }
 
     #[test]

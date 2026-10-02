@@ -84,7 +84,7 @@ pub enum Command {
     /// that concrete value to the session now (`/max-iterations default`),
     /// distinct from [`Command::SetMaxIterations`]`(None)`.
     ResetMaxIterations,
-    /// Switch what a tool, a category, or everything may do
+    /// Switch what a tool, a category, a server, or everything may do
     /// for subsequent turns. A turn already running keeps the gates it
     /// started with.
     SetToolAccess {
@@ -1352,7 +1352,7 @@ impl Worker {
     fn set_tool_access(&mut self, target: &str, access: ToolAccess) {
         let Some(updated) = self.session.tool_access().with(target, access) else {
             let _ = self.events.send(Event::Agent(AgentEvent::Error {
-                message: format!("No tool or category called {target}"),
+                message: format!("No tool, category or server called {target}"),
             }));
             return;
         };

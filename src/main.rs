@@ -166,7 +166,7 @@ enum Commands {
         /// `ask`, `allow`, `never` — or `on`/`off` for every tool at once.
         /// Omit to list them.
         state: Option<String>,
-        /// A tool's name, a category (read/write/terminal/web), or `all`.
+        /// A tool's name, a category (read/write/terminal/web), an MCP server's name (or `server__*`), or `all`.
         target: Option<String>,
     },
 
@@ -1008,7 +1008,7 @@ async fn cmd_tools(state: Option<String>, target: Option<String>) -> Result<()> 
         (None, _) => {
             print_tools(&config.tool_access());
             println!("\n{}", "Usage:".bright_black());
-            println!("  clank tools <ask|allow|never> <tool|category|all>");
+            println!("  clank tools <ask|allow|never> <tool|category|server|all>");
             println!("  clank tools on                 Every tool back to its default");
             println!("  clank tools off                Every tool off");
             return Ok(());
@@ -1025,10 +1025,12 @@ async fn cmd_tools(state: Option<String>, target: Option<String>) -> Result<()> 
             config
                 .tool_access()
                 .with(target, access)
-                .ok_or_else(|| anyhow::anyhow!("No tool or category called '{target}'."))?
+                .ok_or_else(|| anyhow::anyhow!("No tool, category or server called '{target}'."))?
         }
         (Some(state), None) => {
-            anyhow::bail!("'{state}' needs something to act on: a tool, a category, or all.")
+            anyhow::bail!(
+                "'{state}' needs something to act on: a tool, a category, a server, or all."
+            )
         }
     };
 
@@ -1830,7 +1832,7 @@ fn apply_submission(
         }
         ui::Submission::SetToolAccess { target, access } => {
             let Some(updated) = session.tool_access().with(&target, access) else {
-                println!("{} No tool or category called '{target}'.", "✗".red());
+                println!("{} No tool, category or server called '{target}'.", "✗".red());
                 return Ok(());
             };
             let changed = updated != *session.tool_access();

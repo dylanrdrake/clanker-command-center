@@ -958,7 +958,7 @@ const COMMANDS: [Command; 21] = [
         word: "tools",
         syntax: "/tools [on|off | <ask|allow|never> <target>]",
         blurb: "Show what each tool may do, or change it",
-        usage: Some("/tools on|off | <ask|allow|never> <tool|category|all>"),
+        usage: Some("/tools on|off | <ask|allow|never> <tool|category|server|all>"),
     },
     Command {
         word: "mcp",
@@ -1736,7 +1736,7 @@ mod tests {
         // An unknown state, or the wrong number of words, is a failed
         // command rather than text sent to the model.
         let usage = "Unrecognized /tools usage. Usage: \
-            /tools on|off | <ask|allow|never> <tool|category|all>";
+            /tools on|off | <ask|allow|never> <tool|category|server|all>";
         assert_eq!(
             classify("/tools maybe read"),
             Submission::UnknownCommand(usage.to_string())
@@ -2118,7 +2118,7 @@ mod tests {
             classify("/tolos allow read"),
             Submission::UnknownCommand(
                 "Unrecognized command /tolos. Did you mean /tools? \
-                 Usage: /tools on|off | <ask|allow|never> <tool|category|all>"
+                 Usage: /tools on|off | <ask|allow|never> <tool|category|server|all>"
                     .to_string()
             )
         );

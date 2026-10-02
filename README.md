@@ -547,6 +547,29 @@ clank tools allow read                 # every read tool, built-in or not
 clank tools never write                # sweeps the server's writers too
 ```
 
+**A whole server at once.** Name it, bare or as `server__*`:
+
+```bash
+clank tools never fs                   # none of fs's tools, offered or callable
+clank tools never fs__*                # the same; quote it in zsh, which
+                                       # treats an unmatched * as an error
+❯ /tools never fs                      # or just this clanker
+```
+
+`never` here is a standing policy, like `off`: it keeps holding for a tool
+the server grows after you typed it, so a rebuilt server doesn't come back
+armed. It's stored as one `fs__*` entry rather than a row per tool. The
+other two states are lists, as with a category — `allow fs` covers the tools
+`fs` has now, not whatever it adds next. Naming a server replaces anything
+set on its individual tools before, and a single tool can still be switched
+back on afterwards (`clank tools allow fs__read_text_file`). A tool set to
+`never` is never sent to the model, so this is also how a clanker stops
+paying for a server's schemas.
+
+A server called `read` (or any other category word) keeps meaning the
+category; reach the server as `read__*`. Only a server that is connected can
+be named, so a typo is reported instead of stored.
+
 **Secrets stay out of `config.json`.** The file holds variable *names*; the
 values live in your OS keychain next to your API key. At startup each name is
 looked up in the keychain first and then in the environment CCC is running

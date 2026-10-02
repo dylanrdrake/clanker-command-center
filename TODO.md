@@ -29,12 +29,13 @@ NEXT:
     ~911 for all seven built-ins. But `agent::offered_tools` already drops
     a tool set to `never` from the request entirely, so a clanker can stop
     paying for a server today — the schemas genuinely do not go on the
-    wire. The capability is there; what is missing is three smaller things:
-    - A per-*server* switch. Excluding gj from one clanker means naming all
-      ten of its tools, and there is no glob. The category shortcuts are no
-      help: `never write` takes `write_file` and `replace_in_file` with it.
-      A `gj__*` target, or a server name as a bulk target, would get most
-      of this for a fraction of what per-clanker servers cost.
+    wire. The capability is there; what was missing is three smaller things, the first now done:
+    - ~~A per-*server* switch~~ — done: `clank tools never gj` (or `gj__*`)
+      is one standing entry that also holds for tools the server grows
+      later. Only a *connected* server can be named, so a configured one
+      that failed to start can't be switched off by name; that is the same
+      gap as the next item, and goes away when gating no longer needs the
+      connection.
     - Not spawning the process at all. Gating happens after connecting, so
       every invocation that can run a tool starts every server and stops it
       again — 0.30s for gj, ~0.9s warm and ~4s cold for anything behind
