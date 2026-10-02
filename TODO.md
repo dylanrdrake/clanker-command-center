@@ -21,14 +21,37 @@ NEXT:
   `server__tool`, land in a category from its `readOnlyHint`, and are
   governed by the same gates as the built-ins with no new policy. What is
   not done, roughly in the order it will be missed:
-  - **Per-clanker servers.** The one that matters. Servers are global, so
-    every clanker with tools carries every connected server's schemas, and
-    they are not small: the reference filesystem server's 14 tools cost
-    ~2,100 tokens against ~900 for all seven built-ins. That is fixed
-    overhead no fold can shrink, so it raises the floor `MIN_COMPACT_AT` is
-    computed against — and a clanker that needs none of a server's tools
-    should not be paying for them. Wants the same global/per-clanker shape
-    as the compactor item below.
+  - **Per-clanker servers**, and the case for this is weaker than it first
+    looks, which is worth writing down because the obvious argument for it
+    is already covered. The obvious argument is tokens: servers are global,
+    so every clanker carries every connected server's schemas, measured at
+    ~1,400 for gj and ~1,930 for the reference filesystem server against
+    ~911 for all seven built-ins. But `agent::offered_tools` already drops
+    a tool set to `never` from the request entirely, so a clanker can stop
+    paying for a server today — the schemas genuinely do not go on the
+    wire. The capability is there; what is missing is three smaller things:
+    - A per-*server* switch. Excluding gj from one clanker means naming all
+      ten of its tools, and there is no glob. The category shortcuts are no
+      help: `never write` takes `write_file` and `replace_in_file` with it.
+      A `gj__*` target, or a server name as a bulk target, would get most
+      of this for a fraction of what per-clanker servers cost.
+    - Not spawning the process at all. Gating happens after connecting, so
+      every invocation that can run a tool starts every server and stops it
+      again — 0.30s for gj, ~0.9s warm and ~4s cold for anything behind
+      `npx`, paid even by a bare `clank tools`.
+    - Tool-list noise. Two servers and the built-ins is 31 tools with real
+      overlap (`read_file` against `fs__read_text_file`), which costs
+      selection quality in a way gating does not fix as cleanly as the
+      server not being there.
+
+    The build cost is also higher than the compactor item below, which it
+    was grouped with: `get_tool_definitions`, `any_tools` and
+    `category_of` are free functions over a process-wide registry, and
+    making the list per-clanker means they have to know which clanker is
+    asking — which the agent loop never tells them. Filtering the global
+    list per session gets the ergonomics; connecting lazily gets the
+    latency too, and has to decide what "connected" means when three
+    clankers share one server.
   - **`notifications/tools/list_changed` is read and ignored.** A server
     that gains or loses a tool mid-session is not re-read; restart picks it
     up. Acting on it means rebuilding the whole registered set from every

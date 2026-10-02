@@ -152,6 +152,83 @@ fn called_path(call: &ToolCall) -> Option<String> {
     Some(same_file(arguments.get("filepath")?.as_str()?))
 }
 
+/// The built-in tools that are known to change nothing on disk.
+///
+/// The list is deliberately of the *safe* ones rather than the dangerous
+/// ones, because that is the direction the unknown falls on. Anything not
+/// named here — the built-in writers, the shell, and every tool from a
+/// server — is treated as something that may have changed whatever path it
+/// mentions. A tool from a server does say whether it only reads, and
+/// [`crate::tools::category_of`] already knows, but a *hint supplied by the
+/// server* is the wrong thing to rest staleness on: believing it wrongly
+/// means carrying code the file no longer agrees with, which is the one
+/// outcome worse than carrying nothing.
+const KNOWN_HARMLESS: [&str; 4] = ["read_file", "list_files", "search_files", "web_fetch"];
+
+/// A path long enough that it is content rather than a filename.
+///
+/// Walking a call's arguments for paths means walking `write_file`'s
+/// `content` too, which can be a whole file. Nothing is lost by skipping
+/// the long ones: a path this size is not a path.
+const LONGEST_PATH: usize = 512;
+
+/// Every path a call may have changed.
+///
+/// Compared by equality on each discrete string in the arguments, which is
+/// how a tool from a server passes a path — `path`, `filepath`, `source`,
+/// `destination`, or nested inside a payload. Deliberately not substring
+/// matching: `write_file`'s own `content` would then invalidate every file
+/// whose name happened to appear inside what was being written.
+fn mutated_paths(call: &ToolCall) -> Vec<String> {
+    if KNOWN_HARMLESS.contains(&call.function.name.as_str()) {
+        return Vec::new();
+    }
+    let Ok(arguments) = serde_json::from_str::<serde_json::Value>(&call.function.arguments) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    collect_strings(&arguments, &mut found);
+    found
+}
+
+fn collect_strings(value: &serde_json::Value, into: &mut Vec<String>) {
+    match value {
+        serde_json::Value::String(text) if text.len() <= LONGEST_PATH => into.push(same_file(text)),
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_strings(item, into);
+            }
+        }
+        serde_json::Value::Object(fields) => {
+            for field in fields.values() {
+                collect_strings(field, into);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A shell command's text, for a call that is one.
+///
+/// The shell is the one tool whose arguments cannot be read as paths: it
+/// takes one string, and the file it rewrites is a word inside it. So its
+/// words are normalised individually and compared — not the whole string by
+/// containment, which would never match: a carried path is absolute and a
+/// command says `src/x.rs`.
+///
+/// This over-invalidates, and that is the right way round. `cat src/x.rs`
+/// changes nothing and still drops the carried copy, but a command naming a
+/// file is a good sign the model is working on it — where a re-read costs a
+/// tool call and carrying a stale copy costs an edit against code that is
+/// not there.
+fn shell_text(call: &ToolCall) -> Option<String> {
+    if call.function.name != "run_terminal_command" {
+        return None;
+    }
+    let arguments: serde_json::Value = serde_json::from_str(&call.function.arguments).ok()?;
+    Some(arguments.get("command")?.as_str()?.to_string())
+}
+
 /// What a `read_file` result is worth carrying: the text it returned, and
 /// how much of the file that was when it wasn't all of it.
 fn read_result(result: &str) -> Option<(String, Option<String>)> {
@@ -203,6 +280,9 @@ pub fn carried(messages: &[ChatMessage], seam: usize, compact_at: Option<u64>) -
     // The most recent read of each path, and the most recent write to it.
     let mut reads: HashMap<String, usize> = HashMap::new();
     let mut writes: HashMap<String, usize> = HashMap::new();
+    // Shell commands, kept whole because the path inside one is a word in a
+    // string rather than an argument — see `shell_text`.
+    let mut commands: Vec<(usize, String)> = Vec::new();
 
     for (at, message) in messages.iter().enumerate() {
         // Writes are collected from the whole history, not just the folded
@@ -211,13 +291,17 @@ pub fn carried(messages: &[ChatMessage], seam: usize, compact_at: Option<u64>) -
         // invalidates it is not in the folded span at all.
         if let Some(calls) = &message.tool_calls {
             for call in calls {
-                if matches!(
-                    call.function.name.as_str(),
-                    "write_file" | "replace_in_file"
-                ) {
-                    if let Some(path) = called_path(call) {
-                        writes.insert(path, at);
-                    }
+                // Every call that is not known harmless, rather than the
+                // two built-in writers this used to name. A server's
+                // `fs__write_file` changed the file just as much, and
+                // matching on built-in names missed it entirely — as did
+                // `called_path`, which reads the `filepath` argument while
+                // the reference filesystem server calls it `path`.
+                for path in mutated_paths(call) {
+                    writes.insert(path, at);
+                }
+                if let Some(command) = shell_text(call) {
+                    commands.push((at, command));
                 }
             }
         }
@@ -304,10 +388,17 @@ pub fn carried(messages: &[ChatMessage], seam: usize, compact_at: Option<u64>) -
         let Some(path) = carried.path.clone() else {
             continue;
         };
-        if writes
+        let written_since = writes
             .get(&path)
-            .is_some_and(|written| *written > carried.at)
-        {
+            .is_some_and(|written| *written > carried.at);
+        let named_in_a_command_since = commands.iter().any(|(at, command)| {
+            *at > carried.at
+                && command
+                    .split_whitespace()
+                    .map(|word| word.trim_matches(['\'', '"', '`', '(', ')', ';', ',']))
+                    .any(|word| !word.is_empty() && same_file(word) == path)
+        });
+        if written_since || named_in_a_command_since {
             carried.label = None;
             carried.body = format!(
                 "[{path} was read earlier and written to since, so what it said then is \
@@ -844,6 +935,135 @@ mod tests {
 
     fn bodies(carried: &[Carried]) -> Vec<&str> {
         carried.iter().map(|item| item.body.as_str()).collect()
+    }
+
+    /// A call shaped the way a server's is: a path in a discretely-named
+    /// argument that isn't `filepath`.
+    fn server_call(id: &str, name: &str, path: &str) -> ChatMessage {
+        ChatMessage {
+            role: "assistant".to_string(),
+            tool_calls: Some(vec![ToolCall {
+                id: id.to_string(),
+                call_type: "function".to_string(),
+                function: crate::client::FunctionCall {
+                    name: name.to_string(),
+                    // What the reference filesystem server actually calls it.
+                    arguments: serde_json::json!({ "path": path }).to_string(),
+                },
+            }]),
+            ..Default::default()
+        }
+    }
+
+    fn shell_call(id: &str, command: &str) -> ChatMessage {
+        ChatMessage {
+            role: "assistant".to_string(),
+            tool_calls: Some(vec![ToolCall {
+                id: id.to_string(),
+                call_type: "function".to_string(),
+                function: crate::client::FunctionCall {
+                    name: "run_terminal_command".to_string(),
+                    arguments: serde_json::json!({ "command": command }).to_string(),
+                },
+            }]),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_servers_write_makes_a_carried_read_a_pointer() {
+        // The bug MCP reopened. Writes used to be recognised by the two
+        // built-in names, so `fs__write_file` changed the file and the
+        // verbatim copy carried past the seam went on claiming otherwise —
+        // which is worse than carrying nothing, because an edit made
+        // against it lands on code that is no longer there.
+        let folded = [
+            tool_call("c1", "read_file", "src/parser.rs"),
+            read_back("c1", "STALE: what the file said before"),
+            message("user", "now change it"),
+            server_call("c2", "fs__write_file", "src/parser.rs"),
+            message("tool", "File written"),
+        ];
+
+        let kept = carried(&folded, 3, None);
+        assert_eq!(kept.len(), 1);
+        assert!(
+            !kept[0].body.contains("STALE"),
+            "the carried copy survived a server's write: {:?}",
+            kept[0].body
+        );
+        assert!(kept[0].body.contains("Read it again"), "{:?}", kept[0].body);
+    }
+
+    #[test]
+    fn a_shell_command_naming_the_file_makes_it_a_pointer_too() {
+        // A hole that predates MCP: the shell was never in the list of
+        // writers either, and it is the likeliest thing of all to rewrite a
+        // file. Its path is a word inside one string rather than an
+        // argument, so the words are normalised and compared individually.
+        let folded = [
+            tool_call("c1", "read_file", "src/parser.rs"),
+            read_back("c1", "STALE: what the file said before"),
+            message("user", "patch it"),
+            shell_call("c2", "sed -i 's/a/b/' src/parser.rs"),
+            message("tool", "done"),
+        ];
+
+        let kept = carried(&folded, 3, None);
+        assert_eq!(kept.len(), 1);
+        assert!(!kept[0].body.contains("STALE"), "{:?}", kept[0].body);
+    }
+
+    #[test]
+    fn a_command_that_names_nothing_leaves_a_carried_read_alone() {
+        // The other side of over-invalidating: it has to be the file, not
+        // merely a command having run.
+        let folded = [
+            tool_call("c1", "read_file", "src/parser.rs"),
+            read_back("c1", "fn parse() { todo!() }"),
+            message("user", "run the tests"),
+            shell_call("c2", "cargo test --all"),
+            message("tool", "ok"),
+        ];
+
+        let kept = carried(&folded, 3, None);
+        assert_eq!(bodies(&kept), vec!["fn parse() { todo!() }"]);
+    }
+
+    #[test]
+    fn a_servers_read_of_another_file_leaves_a_carried_read_alone() {
+        // `KNOWN_HARMLESS` names the built-ins that change nothing, so a
+        // server's tools all count as possible writers — but one reading a
+        // *different* file must not invalidate this one.
+        let folded = [
+            tool_call("c1", "read_file", "src/parser.rs"),
+            read_back("c1", "fn parse() { todo!() }"),
+            message("user", "and the lexer?"),
+            server_call("c2", "fs__read_text_file", "src/lexer.rs"),
+            message("tool", "lexer text"),
+        ];
+
+        let kept = carried(&folded, 3, None);
+        assert_eq!(bodies(&kept), vec!["fn parse() { todo!() }"]);
+    }
+
+    #[test]
+    fn a_long_argument_is_not_treated_as_a_path() {
+        // `write_file`'s `content` can be a whole file, and walking a
+        // call's arguments for paths walks that too. Nothing is lost by
+        // skipping it: a path that size is not a path.
+        let content = "x".repeat(LONGEST_PATH + 1);
+        let call = ToolCall {
+            id: "c1".to_string(),
+            call_type: "function".to_string(),
+            function: crate::client::FunctionCall {
+                name: "fs__write_file".to_string(),
+                arguments: serde_json::json!({"path": "a.rs", "content": content}).to_string(),
+            },
+        };
+        let paths = mutated_paths(&call);
+        assert_eq!(paths.len(), 1, "only the path, not the payload");
+        assert!(paths[0].ends_with("a.rs"), "{paths:?}");
     }
 
     #[test]
