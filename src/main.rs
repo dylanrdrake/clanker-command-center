@@ -1488,14 +1488,16 @@ async fn cmd_compact_at(value: Option<u64>, clear: bool) -> Result<()> {
 
     match value {
         Some(0) => anyhow::bail!(
-            "A threshold of 0 would compact before every turn. Give a token count,              or --clear to turn automatic compaction off."
+            "A threshold of 0 would compact before every turn. Give a token count, \
+             or --clear to turn automatic compaction off."
         ),
         Some(value) if value < config::MIN_COMPACT_AT => anyhow::bail!(
             "A threshold of {value} is below the {} minimum. The system prompt and tool \
              schemas ride every request whatever is folded away, and the summary and \
              kept tail take about half the threshold on top, so a compacted request \
              could not get back under it. Give a larger token count, or --clear to turn \
-             automatic compaction off.",
+             automatic compaction off. (With MCP servers connected the real minimum is \
+             higher, since their tool schemas ride every request too.)",
             config::MIN_COMPACT_AT
         ),
         Some(value) => {

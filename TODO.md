@@ -263,13 +263,12 @@ NEXT:
     between refusing the file and clamping the value, and refusing is the
     behaviour that file already has for anything it can't read.
 
-    MCP changed the arithmetic under this one, which is the part worth
-    revisiting first. The constant was derived from a fixed ~1k tokens of
-    system prompt and tool schemas; connect one ordinary server and that
-    becomes ~3k, so the floor a compacted request cannot get under is no
-    longer a constant at all — it is a function of how many servers are up.
-    Either the minimum is computed from the live tool surface, or it stays a
-    constant and stops meaning what its comment claims.
+    MCP changed the arithmetic under this one: the real floor is a function
+    of how many servers are up (~1k with none, ~3k with one ordinary one).
+    Decided to keep `MIN_COMPACT_AT` a constant and have its comment and the
+    `compact-at` error say so, rather than compute it from the live tool
+    surface. The cost is that raising `compact-at` when adding servers is
+    left to the user.
   - The guard isn't persisted, so a reopened clanker spends one compaction
     re-learning its floor. Left deliberately — a floor is a fact about a
     threshold and a system prompt a new process may not share, and a stale

@@ -423,18 +423,23 @@ pub const DEFAULT_MODEL: &str = "openrouter/auto";
 /// leaves `/compact` as the only way in.
 pub const DEFAULT_COMPACT_AT: u64 = 60_000;
 
-/// The lowest `compact-at` accepted.
+/// The lowest `compact-at` accepted — a fixed guard rail, not the real floor.
 ///
-/// Two things a compaction cannot shrink set this. The system prompt and the
-/// tool schemas ride every request whatever is folded away — about a
-/// thousand tokens together — and the three compaction budgets together
-/// (`TAIL_FRACTION`, `SUMMARY_FRACTION` and `EXEMPT_FRACTION`: a quarter, an
-/// eighth and a sixth) claim roughly half the threshold by construction. The
-/// two meet somewhere near 2k, below which a compacted request cannot get
-/// back under the line and every turn would compact again.
+/// Two things a compaction cannot shrink set the real one. The system prompt
+/// and the tool schemas ride every request whatever is folded away, and the
+/// three compaction budgets together (`TAIL_FRACTION`, `SUMMARY_FRACTION` and
+/// `EXEMPT_FRACTION`: a quarter, an eighth and a sixth) claim roughly half
+/// the threshold by construction. A threshold the fixed part plus that half
+/// can't fit under means every turn compacts again.
 ///
-/// 4k rather than that break-even point, so the smallest usable threshold
-/// still leaves something for the message you are about to send.
+/// The fixed part is not a constant. It was about a thousand tokens with only
+/// the built-in tools; each connected MCP server adds its tool schemas, so
+/// one ordinary server makes it around 3k and several make it more. 4k is
+/// what suits a clanker with no servers, and nothing here knows how many are
+/// up. With servers connected, raise `compact-at` accordingly — and again
+/// when adding more of them. Neither this check nor a hand-edited
+/// `config.json` accounts for it; the compaction guard only stops the
+/// resulting loop from running on every turn.
 pub const MIN_COMPACT_AT: u64 = 4_000;
 
 /// One MCP server to start, as `config.json` holds it.
