@@ -405,7 +405,7 @@ fn builtin_schemas() -> Vec<serde_json::Value> {
             "type": "function",
             "function": {
                 "name": "replace_in_file",
-                "description": "Replace text content in a file",
+                "description": "Replace text in a file. The search text must match exactly one place, unless replace_all is set; include enough surrounding lines to make it unique",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -415,11 +415,15 @@ fn builtin_schemas() -> Vec<serde_json::Value> {
                         },
                         "search": {
                             "type": "string",
-                            "description": "Text to search for"
+                            "description": "Exact text to find, matching one place in the file"
                         },
                         "replace": {
                             "type": "string",
                             "description": "Text to replace with"
+                        },
+                        "replace_all": {
+                            "type": "boolean",
+                            "description": "Replace every match instead of requiring exactly one (default false)"
                         }
                     },
                     "required": ["filepath", "search", "replace"]
@@ -767,8 +771,12 @@ pub async fn execute_tool(
                 .get("replace")
                 .and_then(|v| v.as_str())
                 .ok_or(anyhow!("Missing replace"))?;
+            let replace_all = args
+                .get("replace_all")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
 
-            replace_in_file(filepath, search, replace, sandbox)
+            replace_in_file(filepath, search, replace, replace_all, sandbox)
         }
         "run_terminal_command" => {
             let command = args
@@ -1404,6 +1412,7 @@ fn replace_in_file(
     filepath: &str,
     search: &str,
     replace: &str,
+    replace_all: bool,
     sandbox: bool,
 ) -> Result<serde_json::Value> {
     // The bound comes before the existence check, so a path outside the
@@ -1423,10 +1432,32 @@ fn replace_in_file(
 
     let mut content = fs::read_to_string(&path)?;
 
-    if !content.contains(search) {
+    // An empty search matches between every character, and `replace` would
+    // splice the replacement in at all of them.
+    if search.is_empty() {
+        return Ok(json!({
+            "success": false,
+            "error": "Search string is empty"
+        }));
+    }
+
+    // One match unless asked otherwise: a search that also matches somewhere
+    // the model never looked would otherwise edit that too, and report
+    // success. Refusing says how many, so it can widen the search to one.
+    let matches = content.matches(search).count();
+    if matches == 0 {
         return Ok(json!({
             "success": false,
             "error": "Search string not found in file"
+        }));
+    }
+    if matches > 1 && !replace_all {
+        return Ok(json!({
+            "success": false,
+            "error": format!(
+                "Search string found {matches} times; include more surrounding text \
+                 so it matches one place, or set replace_all to change every one"
+            )
         }));
     }
 
@@ -1435,7 +1466,11 @@ fn replace_in_file(
 
     Ok(json!({
         "success": true,
-        "message": "File updated"
+        "message": if matches == 1 {
+            "File updated".to_string()
+        } else {
+            format!("File updated in {matches} places")
+        }
     }))
 }
 
@@ -2257,7 +2292,7 @@ mod tests {
         // The gap this closes: `replace_in_file` had no bound at all, so it
         // could rewrite any existing file the process could open, while
         // `write_file` beside it was checked.
-        let result = replace_in_file(&outside_the_sandbox(), "a", "b", true).unwrap();
+        let result = replace_in_file(&outside_the_sandbox(), "a", "b", false, true).unwrap();
 
         assert_eq!(result["success"], false);
         assert!(
@@ -2271,7 +2306,7 @@ mod tests {
         // With the sandbox off the same path gets past the bound and fails
         // on its own terms, which is how this knows the refusal above came
         // from the bound rather than from the file simply being missing.
-        let result = replace_in_file(&outside_the_sandbox(), "a", "b", false).unwrap();
+        let result = replace_in_file(&outside_the_sandbox(), "a", "b", false, false).unwrap();
 
         assert_eq!(result["success"], false);
         assert!(
@@ -2285,10 +2320,48 @@ mod tests {
         let name = format!("clank-sandbox-test-{}-replace.txt", std::process::id());
         fs::write(&name, "before").unwrap();
 
-        let result = replace_in_file(&name, "before", "after", true).unwrap();
+        let result = replace_in_file(&name, "before", "after", false, true).unwrap();
 
         assert_eq!(result["success"], true, "{result}");
         assert_eq!(fs::read_to_string(&name).unwrap(), "after");
+        fs::remove_file(&name).ok();
+    }
+
+    #[test]
+    fn replace_in_file_changes_one_place_unless_told_every_one() {
+        let name = format!("clank-replace-test-{}-unique.txt", std::process::id());
+        fs::write(&name, "let x = 1;\nlet y = 1;\n").unwrap();
+
+        // Matching twice is refused, says so, and leaves the file alone.
+        let refused = replace_in_file(&name, "= 1", "= 2", false, true).unwrap();
+        assert_eq!(refused["success"], false, "{refused}");
+        assert!(
+            refused["error"].as_str().unwrap().contains("found 2 times"),
+            "{refused}"
+        );
+        assert_eq!(
+            fs::read_to_string(&name).unwrap(),
+            "let x = 1;\nlet y = 1;\n"
+        );
+
+        // Widened to one place, it goes through.
+        let one = replace_in_file(&name, "y = 1", "y = 2", false, true).unwrap();
+        assert_eq!(one["success"], true, "{one}");
+        assert_eq!(
+            fs::read_to_string(&name).unwrap(),
+            "let x = 1;\nlet y = 2;\n"
+        );
+
+        // Asked for every one, it changes every one and counts them.
+        fs::write(&name, "a a a").unwrap();
+        let all = replace_in_file(&name, "a", "b", true, true).unwrap();
+        assert_eq!(all["message"], "File updated in 3 places", "{all}");
+        assert_eq!(fs::read_to_string(&name).unwrap(), "b b b");
+
+        // An empty search would match everywhere; it is refused.
+        let empty = replace_in_file(&name, "", "x", true, true).unwrap();
+        assert_eq!(empty["success"], false, "{empty}");
+        assert_eq!(fs::read_to_string(&name).unwrap(), "b b b");
         fs::remove_file(&name).ok();
     }
 

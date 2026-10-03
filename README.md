@@ -1418,6 +1418,12 @@ and the file ceiling ends that directly.
 ### `replace_in_file`
 Replace text in an existing file.
 
+The search text has to match exactly one place. A search that also matches
+somewhere the model never looked would otherwise change that too and report
+success, so more than one match is refused with the count, and the model
+widens the search until it is unique. `replace_all` changes every match when
+that is what's meant, and an empty search is refused outright.
+
 ### `run_terminal_command`
 Execute a shell command and return the output. Supports custom working directory and timeout.
 

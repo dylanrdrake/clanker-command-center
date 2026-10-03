@@ -1,5 +1,23 @@
 
 **TODOs**
+* TOP PRIORITY: agent accuracy, the gaps against Claude Code that matter
+  most, in order of payoff per effort:
+  1. ~~`replace_in_file` replaced every occurrence~~ — done: anything but a
+     unique match is refused with the count, `replace_all` opts in to every
+     one, and an empty search is refused.
+  2. The agent system prompt says nothing about how to work: read before
+     editing, find with `search_files`, run the tests when the terminal is
+     on, and say plainly when something failed or wasn't checked.
+  3. Load `AGENTS.md` (or `CLAUDE.md`) from the clanker's directory into the
+     system prompt, so a repo's conventions reach every turn — the open
+     convention, so repos set up for other agents work here too.
+  4. A build/test loop by default. `run_terminal_command` is `never` until
+     enabled, so a default clanker can edit code but never compile or test
+     it. Something like a per-clanker allowlist (`cargo test`, `npm test`).
+  5. Refuse a write or replace on a file the session hasn't read, unless the
+     write creates it.
+  After those: task lists, plan mode, memory across clankers.
+
 * connect providers directly, like Anthropic, OpenAI, etc..
 
 * Tutorial option on the picker screen. Last only because it is undefined.
