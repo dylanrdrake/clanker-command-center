@@ -10,7 +10,7 @@
 //! [`Activation`] returned when a row is chosen.
 
 use super::render::{band, draw_rule, home_relative, identicon, pad_to};
-use crate::glyphs::{DASH, DOT};
+use crate::glyphs::{DASH, DOT, DOWN, ELLIPSIS, LEFT, RIGHT, UP};
 use crate::store::{mode_label, Activity, LastMessage, LastState, SessionSummary, KIND_AGENT_CHAT};
 use ratatui::prelude::*;
 use ratatui::widgets::Paragraph;
@@ -612,7 +612,7 @@ pub fn draw(
         Line::from(vec![
             Span::styled(
                 format!(
-                    " {} is gone ‒ resume here instead? ",
+                    " {} is gone {DASH} resume here instead? ",
                     home_relative(missing)
                 ),
                 Style::new().yellow().bold(),
@@ -985,7 +985,7 @@ pub fn draw_deployment(frame: &mut Frame, deployment: &Deployment) {
     let hint = match &deployment.error {
         Some(error) => Line::from(Span::styled(format!(" {error}"), Style::new().red().bold())),
         None => Line::from(Span::styled(
-            " ↑/↓ move ∙ ←/→ change ∙ Tab reroll ∙ Enter deploy ∙ Esc cancel",
+            format!(" {UP}/{DOWN} move {DOT} {LEFT}/{RIGHT} change {DOT} Tab reroll {DOT} Enter deploy {DOT} Esc cancel"),
             Style::new().dark_gray(),
         )),
     };
@@ -1037,7 +1037,7 @@ fn field_row(deployment: &Deployment, field: Field, label: &str, indent: usize) 
             Style::new(),
         ),
         Field::Orders if deployment.orders.is_empty() && !focused => (
-            "none ‒ it opens waiting for you".to_string(),
+            format!("none {DASH} it opens waiting for you"),
             Style::new().dark_gray(),
         ),
         Field::Orders => (deployment.orders.clone(), Style::new()),
@@ -1088,7 +1088,10 @@ fn truncate(text: &str, max: usize) -> String {
     }
     match max {
         0 => String::new(),
-        _ => format!("{}…", flat.chars().take(max - 1).collect::<String>()),
+        _ => format!(
+            "{}{ELLIPSIS}",
+            flat.chars().take(max - 1).collect::<String>()
+        ),
     }
 }
 
@@ -1136,10 +1139,10 @@ mod tests {
         // used to be enough to wrap a row whose preview was sized to the
         // space left on the line.
         assert_eq!(truncate("abcdefgh", 4).chars().count(), 4);
-        assert_eq!(truncate("abcdefgh", 4), "abc…");
+        assert_eq!(truncate("abcdefgh", 4), "abc⋯");
         assert_eq!(truncate("abcd", 4), "abcd");
         assert_eq!(truncate("abc", 4), "abc");
-        assert_eq!(truncate("abc", 1), "…");
+        assert_eq!(truncate("abc", 1), "⋯");
         assert_eq!(truncate("abc", 0), "");
     }
 

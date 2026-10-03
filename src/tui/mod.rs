@@ -30,7 +30,7 @@ pub(crate) use render::{busy_frame, identicon_mark};
 use crate::client::Client;
 use crate::config::ToolAccessSettings;
 use crate::conversation::{command_for, Command, Conversation};
-use crate::glyphs::DASH;
+use crate::glyphs::{DASH, DOT, DOWN, UP};
 use crate::session::{self, ChatSession};
 use crate::store::{self, SessionSummary, StoredMessage, KIND_AGENT_CHAT, KIND_CHAT};
 use crate::ui::response_label;
@@ -236,7 +236,7 @@ fn open_resumed(context: &Context, summary: &SessionSummary) -> Result<Chat> {
         session::EnteredDir::Unchanged => {}
         session::EnteredDir::Missing(dir) => {
             chat.app.transcript.push(TranscriptItem::Error(format!(
-                "This clanker was started in {dir}, which no longer exists — \
+                "This clanker was started in {dir}, which no longer exists {DASH} \
                  it is running in the current directory instead, so its sandbox \
                  and relative paths point somewhere else than when it was saved."
             )))
@@ -508,7 +508,9 @@ fn draw(terminal: &mut Tui, screen: &mut Screen, tick: usize, selection: bool) -
             "CLANKER COMMAND CENTER",
             current_dir().as_deref(),
             selection,
-            "↑/↓ move ∙ Enter open ∙ r rename ∙ d delete ∙ q quit",
+            &format!(
+                "{UP}/{DOWN} move {DOT} Enter open {DOT} r rename {DOT} d delete {DOT} q quit"
+            ),
             tick,
         ),
         Screen::Deploy(deployment) => picker::draw_deployment(frame, deployment),
@@ -1096,9 +1098,9 @@ fn dispatch_submission(app: &mut App, text: &str, send: &mut impl FnMut(Command)
     if matches!(submission, app::Submission::Shell(_))
         && matches!(app.pending_shell, Some(ShellState::Running { .. }))
     {
-        app.transcript.push(TranscriptItem::Notice(
-            "A command is still running ‒ wait for it to finish".to_string(),
-        ));
+        app.transcript.push(TranscriptItem::Notice(format!(
+            "A command is still running {DASH} wait for it to finish"
+        )));
         return false;
     }
 

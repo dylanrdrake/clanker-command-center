@@ -223,13 +223,14 @@ NEXT:
   and there's no indication they exist. The two blank lines between sections
   cost two more rows. Wants a scroll offset that follows the selection, and
   probably some hint that the list continues past the edge.
-* East Asian Width Ambiguous glyphs, mostly done. `·` and `—` are fixed in the
-  TUI's rendered strings via `src/glyphs.rs`, and the reply avatar was already
-  fixed by moving to braille. Still Ambiguous and still width-sensitive: the
-  horizontal rules, built from `─` (U+2500) with `"─".repeat(width)` — a
-  terminal that draws it two cells wide overshoots by one per character and the
-  rule wraps. Needs a Neutral glyph that still joins seamlessly, which is why
-  it was left.
+* East Asian Width Ambiguous glyphs, mostly done. `·`, `—`, `…`, the arrow
+  keys' `↑↓←→`, `→` and `▲▼` are fixed in the TUI's rendered strings via
+  `src/glyphs.rs`, and the reply avatar was already fixed by moving to
+  braille. Still Ambiguous and still width-sensitive: the box drawing — the
+  horizontal rules, built from `─` (U+2500) with `"─".repeat(width)`, and the
+  `│` borders. A terminal that draws `─` two cells wide overshoots by one per
+  character and the rule wraps. Needs a Neutral glyph that still joins
+  seamlessly, which is why it was left.
 * `clank login` reads the API key with echo on — a plain `read_line` on
   stdin — so the key renders as you type it and then lives in the terminal's
   scrollback, in a tmux buffer, and in anything recording the session. Where

@@ -16,6 +16,7 @@
 use crate::agent::{self, Steering};
 use crate::client::Client;
 use crate::config::{SessionGates, ToolAccess, ToolAccessSettings};
+use crate::glyphs::DASH;
 use crate::session::ChatSession;
 use crate::store::Activity;
 use crate::ui::{AgentEvent, AgentUi, ApprovalRequest, Submission};
@@ -841,8 +842,7 @@ impl Worker {
                         // says "not now" and can be retyped.
                         Some(Command::Compact) => {
                             let _ = self.events.send(Event::CompactionSkipped {
-                                reason: "A turn is running ‒ compact once it has finished"
-                                    .to_string(),
+                                reason: format!("A turn is running {DASH} compact once it has finished"),
                             });
                         }
                         // Same reasoning, one layer out: restarting a
@@ -852,8 +852,7 @@ impl Worker {
                         // its output" — a confusing way to be told.
                         Some(Command::ReconnectMcp) => {
                             let _ = self.events.send(Event::McpReconnected {
-                                summary: "A turn is running ‒ reconnect once it has finished"
-                                    .to_string(),
+                                summary: format!("A turn is running {DASH} reconnect once it has finished"),
                             });
                         }
                     }

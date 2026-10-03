@@ -12,7 +12,7 @@
 //! ever waits on a subprocess.
 
 use super::app::{App, TranscriptItem};
-use crate::glyphs::{DASH, DOT};
+use crate::glyphs::{ARROW, DASH, DOT, DOWN, ELLIPSIS, UP};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph};
 use std::cell::Cell;
@@ -412,8 +412,9 @@ impl Shown {
             if let Some(run) = self.runs.last_mut() {
                 run.end = run.end.min(MAX_LINES);
             }
-            self.lines
-                .push(Row::note(format!("… stopped at {MAX_LINES} lines")));
+            self.lines.push(Row::note(format!(
+                "{ELLIPSIS} stopped at {MAX_LINES} lines"
+            )));
             changed = true;
         }
         if let Some(counted) = self.counting.as_mut().and_then(Counter::take) {
@@ -1291,7 +1292,8 @@ fn read_line_capped(reader: &mut impl BufRead) -> Option<String> {
     }
     let mut text = String::from_utf8_lossy(&line).into_owned();
     if clipped {
-        text.push_str(" …");
+        text.push(' ');
+        text.push(ELLIPSIS);
     }
     Some(expand_tabs(&text))
 }
@@ -1569,10 +1571,10 @@ pub fn draw(frame: &mut Frame, area: Rect, pane: &GitPane, tick: usize) {
     // far end; the keys to go to them are on the row below.
     let mut counts = String::new();
     if above > 0 {
-        counts.push_str(&format!(" ▲ {above}"));
+        counts.push_str(&format!(" {UP} {above}"));
     }
     if below > 0 {
-        counts.push_str(&format!(" ▼ {below}"));
+        counts.push_str(&format!(" {DOWN} {below}"));
     }
     if !counts.is_empty() {
         counts.push(' ');
@@ -1600,7 +1602,7 @@ pub fn draw(frame: &mut Frame, area: Rect, pane: &GitPane, tick: usize) {
 
     match &pane.shown {
         Some(shown) if opening => {
-            let mut finding = " finding the first change…".to_string();
+            let mut finding = format!(" finding the first change{ELLIPSIS}");
             if !shown.lines.is_empty() {
                 finding.push_str(&format!(" {} lines in", shown.lines.len()));
             }
@@ -1611,7 +1613,10 @@ pub fn draw(frame: &mut Frame, area: Rect, pane: &GitPane, tick: usize) {
         }
         Some(shown) if shown.lines.is_empty() && shown.loading() => {
             frame.render_widget(
-                Paragraph::new(Line::styled(" loading…", Style::new().dark_gray().italic())),
+                Paragraph::new(Line::styled(
+                    format!(" loading{ELLIPSIS}"),
+                    Style::new().dark_gray().italic(),
+                )),
                 diff_area,
             );
         }
@@ -1658,7 +1663,7 @@ fn clip_start(text: &str, width: usize) -> String {
         return text.to_string();
     }
     let mut kept = String::new();
-    let mut used = 1; // the `…`
+    let mut used = 1; // the ellipsis
     for c in text.chars().rev() {
         used += c.to_string().width();
         if used > width {
@@ -1666,7 +1671,7 @@ fn clip_start(text: &str, width: usize) -> String {
         }
         kept.insert(0, c);
     }
-    format!("…{kept}")
+    format!("{ELLIPSIS}{kept}")
 }
 
 fn draw_keys(frame: &mut Frame, area: Rect, pane: &GitPane) {
@@ -1676,9 +1681,11 @@ fn draw_keys(frame: &mut Frame, area: Rect, pane: &GitPane) {
     // Only the keys that do something: with no repository there is nothing
     // to move through, view or scroll.
     let keys = if pane.error.is_some() {
-        " r refresh ∙ Tab chat ∙ Esc close"
+        format!(" r refresh {DOT} Tab chat {DOT} Esc close")
     } else {
-        " ↑/↓ file ∙ Enter view ∙ n/N change ∙ PgUp/PgDn J/K scroll ∙ r refresh ∙ Tab chat ∙ Esc close"
+        format!(
+            " {UP}/{DOWN} file {DOT} Enter view {DOT} n/N change {DOT} PgUp/PgDn J/K scroll {DOT} r refresh {DOT} Tab chat {DOT} Esc close"
+        )
     };
     frame.render_widget(
         Paragraph::new(Line::styled(keys, Style::new().dark_gray())),
@@ -1735,7 +1742,7 @@ fn draw_list(frame: &mut Frame, area: Rect, pane: &GitPane, tick: usize) {
             let marker = if open { "▸" } else { " " };
             let mut name = file.path.clone();
             if let Some(orig) = &file.orig {
-                name = format!("{orig} → {name}");
+                name = format!("{orig} {ARROW} {name}");
             }
             let mut line = Line::from(vec![
                 gutter(pane, file, tick),
@@ -2033,8 +2040,8 @@ mod tests {
         let mut reader = std::io::Cursor::new(input.into_bytes());
         assert_eq!(read_line_capped(&mut reader).unwrap(), "short");
         let clipped = read_line_capped(&mut reader).unwrap();
-        assert_eq!(clipped.len(), MAX_LINE_BYTES + " …".len());
-        assert!(clipped.ends_with(" …"));
+        assert_eq!(clipped.len(), MAX_LINE_BYTES + 1 + ELLIPSIS.len_utf8());
+        assert!(clipped.ends_with(&format!(" {ELLIPSIS}")));
         assert_eq!(read_line_capped(&mut reader).unwrap(), "last");
         assert_eq!(read_line_capped(&mut reader), None);
     }
@@ -2177,8 +2184,8 @@ mod tests {
     #[test]
     fn a_long_path_keeps_its_end() {
         assert_eq!(clip_start("src/tui/git.rs", 20), "src/tui/git.rs");
-        assert_eq!(clip_start("src/tui/git.rs", 8), "…/git.rs");
-        assert_eq!(clip_start("src/tui/git.rs", 0), "…");
+        assert_eq!(clip_start("src/tui/git.rs", 8), "⋯/git.rs");
+        assert_eq!(clip_start("src/tui/git.rs", 0), "⋯");
     }
 
     fn tool(name: &str, filepath: &str) -> TranscriptItem {

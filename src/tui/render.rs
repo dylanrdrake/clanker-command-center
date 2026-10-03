@@ -2,7 +2,7 @@
 
 use super::app::{App, CommandHint, ModelBrowser, ShellState, ToolStatus, TranscriptItem};
 use crate::config::ToolAccess;
-use crate::glyphs::{DASH, DOT};
+use crate::glyphs::{DASH, DOT, DOWN, ELLIPSIS, UP};
 use crate::ui::{json_fields, summarize, tool_call_fields, ApprovalRequest};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
@@ -306,7 +306,7 @@ fn draw_shell(frame: &mut Frame, area: Rect, shell: &ShellState, tick: usize) {
                 text => lines.extend(text.lines().map(|line| Line::raw(line.to_string()))),
             }
             (
-                " Ctrl-S send with next message ∙ Ctrl-D discard ".to_string(),
+                format!(" Ctrl-S send with next message {DOT} Ctrl-D discard "),
                 lines,
             )
         }
@@ -390,7 +390,10 @@ fn clip(text: &str, width: usize) -> String {
     }
     match width {
         0 => String::new(),
-        _ => format!("{}…", flat.chars().take(width - 1).collect::<String>()),
+        _ => format!(
+            "{}{ELLIPSIS}",
+            flat.chars().take(width - 1).collect::<String>()
+        ),
     }
 }
 
@@ -703,7 +706,7 @@ fn draw_model_browser(
         ModelBrowser::Failed(_) => (" models ".to_string(), String::new()),
         ModelBrowser::Ready { all, .. } => (
             format!(" models  {} of {} ", matches.len(), all.len()),
-            " ↑↓ move ∙ Enter set ∙ Esc cancel ".to_string(),
+            format!(" {UP}{DOWN} move {DOT} Enter set {DOT} Esc cancel "),
         ),
     };
 
@@ -720,7 +723,7 @@ fn draw_model_browser(
 
     let lines: Vec<Line> = match browser {
         ModelBrowser::Loading => vec![Line::from(Span::styled(
-            format!("{} Fetching models…", busy_frame(tick)),
+            format!("{} Fetching models{ELLIPSIS}", busy_frame(tick)),
             Style::new().yellow(),
         ))],
         ModelBrowser::Failed(why) => vec![Line::from(Span::styled(
@@ -787,7 +790,7 @@ fn push_row_block(
     content_width: usize,
 ) {
     lines.push(Line::from(vec![
-        Span::styled("‒ ", Style::new().dark_gray().italic()),
+        Span::styled(format!("{DASH} "), Style::new().dark_gray().italic()),
         Span::styled(heading.to_string(), Style::new().dark_gray().italic()),
     ]));
     let width = rows
@@ -856,12 +859,14 @@ fn render_item(
                     // then the absence of a reply looks like a fault.
                     Span::styled(
                         match (sent, exit_code) {
-                            (true, 0) => "  sent ‒ goes with your next message".to_string(),
+                            (true, 0) => format!("  sent {DASH} goes with your next message"),
                             (true, code) => {
-                                format!("  exit {code} ∙ sent ‒ goes with your next message")
+                                format!(
+                                    "  exit {code} {DOT} sent {DASH} goes with your next message"
+                                )
                             }
                             (false, 0) => "  not sent".to_string(),
-                            (false, code) => format!("  exit {code} ∙ not sent"),
+                            (false, code) => format!("  exit {code} {DOT} not sent"),
                         },
                         Style::new().dark_gray().italic(),
                     ),
@@ -1029,7 +1034,7 @@ fn render_item(
         TranscriptItem::Notice(message) => {
             push_rendered(
                 &mut lines,
-                Span::styled("‒ ", Style::new().dark_gray().italic()),
+                Span::styled(format!("{DASH} "), Style::new().dark_gray().italic()),
                 vec![Line::from(Span::styled(
                     message.clone(),
                     Style::new().dark_gray().italic(),
@@ -1050,7 +1055,7 @@ fn render_item(
         }
         TranscriptItem::ToolStatus { access, changed } => {
             lines.push(Line::from(vec![
-                Span::styled("‒ ", Style::new().dark_gray().italic()),
+                Span::styled(format!("{DASH} "), Style::new().dark_gray().italic()),
                 Span::styled(
                     format!("Tools {}:", if *changed { "set to" } else { "are" }),
                     Style::new().dark_gray().italic(),
@@ -1209,7 +1214,7 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App, scrolled: bool) {
     if scrolled {
         block = block.title(
             Line::from(Span::styled(
-                " scrolled ‒ End to follow ",
+                format!(" scrolled {DASH} End to follow "),
                 Style::new().yellow(),
             ))
             .right_aligned(),
@@ -1449,16 +1454,16 @@ fn draw_keybindings(frame: &mut Frame, area: Rect, app: &App, completing: bool) 
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             if app.pending_approval.is_some() {
-                " Ctrl-Y allow ∙ Ctrl-N deny ∙ Enter send ∙ Esc cancel ∙ Ctrl-B back ∙ Ctrl-C quit"
+                format!(" Ctrl-Y allow {DOT} Ctrl-N deny {DOT} Enter send {DOT} Esc cancel {DOT} Ctrl-B back {DOT} Ctrl-C quit")
             } else if matches!(app.pending_shell, Some(ShellState::Finished { .. })) {
-                " Ctrl-S send with next message ∙ Ctrl-D discard ∙ Ctrl-B back ∙ Ctrl-C quit"
+                format!(" Ctrl-S send with next message {DOT} Ctrl-D discard {DOT} Ctrl-B back {DOT} Ctrl-C quit")
             } else if completing {
                 // Scrolling gives up its place rather than the row wrapping:
                 // the keys worth naming are the ones for what is on screen
                 // right now, and the list above is what that is.
-                " Tab complete ∙ Enter send ∙ Esc cancel ∙ Ctrl-B back ∙ Ctrl-C quit"
+                format!(" Tab complete {DOT} Enter send {DOT} Esc cancel {DOT} Ctrl-B back {DOT} Ctrl-C quit")
             } else {
-                " Enter send ∙ Esc cancel ∙ PgUp/PgDn scroll ∙ Ctrl-G changes ∙ Ctrl-B back ∙ Ctrl-C quit"
+                format!(" Enter send {DOT} Esc cancel {DOT} PgUp/PgDn scroll {DOT} Ctrl-G changes {DOT} Ctrl-B back {DOT} Ctrl-C quit")
             },
             Style::new().fg(KEYBIND_GRAY).dim(),
         ))),
@@ -3289,7 +3294,7 @@ mod tests {
     #[test]
     fn a_waiting_message_is_one_row_however_it_was_typed() {
         assert_eq!(clip("two\nlines", 20), "two lines");
-        assert_eq!(clip("abcdefgh", 4), "abc…");
+        assert_eq!(clip("abcdefgh", 4), "abc⋯");
         assert_eq!(clip("abcd", 4), "abcd");
         assert_eq!(clip("abc", 0), "");
     }
@@ -3740,7 +3745,7 @@ mod tests {
     #[test]
     fn summarize_flattens_and_truncates() {
         assert_eq!(summarize("a\nb\tc", 10), "a b c");
-        assert_eq!(summarize(&"x".repeat(20), 5), "xxxxx…");
+        assert_eq!(summarize(&"x".repeat(20), 5), "xxxxx⋯");
         assert_eq!(summarize("  padded  ", 20), "padded");
     }
 

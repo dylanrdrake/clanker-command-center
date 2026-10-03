@@ -10,7 +10,7 @@
 //! trait instead. [`crate::terminal_ui`] is the CLI's implementation.
 
 use crate::config::{ToolAccess, ToolAccessSettings};
-use crate::glyphs::{DASH, DOT, SEP};
+use crate::glyphs::{ARROW, DASH, DOT, ELLIPSIS, SEP};
 use anyhow::Result;
 use std::future::Future;
 
@@ -47,7 +47,7 @@ pub fn summarize(text: &str, max: usize) -> String {
     let flat = flat.trim();
     if flat.chars().count() > max {
         let kept: String = flat.chars().take(max).collect();
-        format!("{kept}…")
+        format!("{kept}{ELLIPSIS}")
     } else {
         flat.to_string()
     }
@@ -399,7 +399,7 @@ pub fn tool_rows(access: &ToolAccessSettings) -> Vec<(String, String)> {
             (
                 tool.name.to_string(),
                 format!(
-                    "{:<6} {:<8} · {}",
+                    "{:<6} {:<8} {DOT} {}",
                     access.access(&tool.name).label(),
                     tool.category,
                     tool.summary
@@ -467,7 +467,7 @@ pub fn mcp_reconnected_notice(before: &[(String, usize)], after: &[(String, usiz
         let was = before.iter().find(|(had, _)| had == name).map(|(_, n)| *n);
         parts.push(match was {
             Some(was) if was == *count => format!("{name} {count}"),
-            Some(was) => format!("{name} {was}→{count}"),
+            Some(was) => format!("{name} {was}{ARROW}{count}"),
             None => format!("{name} {count}, new"),
         });
     }
@@ -582,7 +582,7 @@ pub fn compacting_notice(model: &str) -> String {
 pub fn compacted_notice(folded: usize) -> String {
     let plural = if folded == 1 { "message" } else { "messages" };
     format!(
-        "Compacted {DASH} the first {folded} {plural} are now sent as a summary.          They are still here to scroll back through."
+        "Compacted {DASH} the first {folded} {plural} are now sent as a summary. They are still here to scroll back through."
     )
 }
 
@@ -2349,7 +2349,7 @@ mod tests {
             &[("gj".to_string(), 10), ("old".to_string(), 3)],
             &[("gj".to_string(), 12), ("new".to_string(), 1)],
         );
-        assert!(notice.contains("gj 10→12"), "{notice}");
+        assert!(notice.contains("gj 10➔12"), "{notice}");
         assert!(notice.contains("new 1, new"), "{notice}");
         assert!(notice.contains("old gone"), "{notice}");
         // And how far it reached. Process-wide, not clanker-wide like
@@ -2371,6 +2371,6 @@ mod tests {
     fn an_unchanged_server_is_reported_without_an_arrow() {
         let notice = mcp_reconnected_notice(&[("gj".to_string(), 10)], &[("gj".to_string(), 10)]);
         assert!(notice.contains("gj 10"), "{notice}");
-        assert!(!notice.contains("→"), "{notice}");
+        assert!(!notice.contains(ARROW), "{notice}");
     }
 }
