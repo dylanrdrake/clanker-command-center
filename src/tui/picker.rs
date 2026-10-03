@@ -10,6 +10,7 @@
 //! [`Activation`] returned when a row is chosen.
 
 use super::render::{band, draw_rule, home_relative, identicon, pad_to};
+use crate::glyphs::{DASH, DOT};
 use crate::store::{mode_label, Activity, LastMessage, LastState, SessionSummary, KIND_AGENT_CHAT};
 use ratatui::prelude::*;
 use ratatui::widgets::Paragraph;
@@ -118,7 +119,7 @@ impl SessionRow {
     pub fn preview(&self) -> Option<String> {
         if self.activity == Some(Activity::AwaitingApproval) {
             if let Some(detail) = &self.activity_detail {
-                return Some(format!("needs approval — {detail}"));
+                return Some(format!("needs approval {DASH} {detail}"));
             }
         }
         self.last
@@ -611,7 +612,7 @@ pub fn draw(
         Line::from(vec![
             Span::styled(
                 format!(
-                    " {} is gone — resume here instead? ",
+                    " {} is gone ‒ resume here instead? ",
                     home_relative(missing)
                 ),
                 Style::new().yellow().bold(),
@@ -657,7 +658,7 @@ pub fn draw(
         (0, 0) => None,
         (0, below) => Some(format!("{below} more below ")),
         (above, 0) => Some(format!("{above} more above ")),
-        (above, below) => Some(format!("{above} above · {below} below ")),
+        (above, below) => Some(format!("{above} above {DOT} {below} below ")),
     };
 
     frame.render_widget(Paragraph::new(Line::from(heading)), areas[0]);
@@ -984,7 +985,7 @@ pub fn draw_deployment(frame: &mut Frame, deployment: &Deployment) {
     let hint = match &deployment.error {
         Some(error) => Line::from(Span::styled(format!(" {error}"), Style::new().red().bold())),
         None => Line::from(Span::styled(
-            " ↑/↓ move · ←/→ change · Tab reroll · Enter deploy · Esc cancel",
+            " ↑/↓ move ∙ ←/→ change ∙ Tab reroll ∙ Enter deploy ∙ Esc cancel",
             Style::new().dark_gray(),
         )),
     };
@@ -1036,7 +1037,7 @@ fn field_row(deployment: &Deployment, field: Field, label: &str, indent: usize) 
             Style::new(),
         ),
         Field::Orders if deployment.orders.is_empty() && !focused => (
-            "none — it opens waiting for you".to_string(),
+            "none ‒ it opens waiting for you".to_string(),
             Style::new().dark_gray(),
         ),
         Field::Orders => (deployment.orders.clone(), Style::new()),
@@ -1461,7 +1462,7 @@ mod tests {
         let out = deployment_to_string(&form, 60, 20);
         assert!(out.contains("default"), "an unset effort: {out}");
         assert!(out.contains("none sent"), "an emptied temperature: {out}");
-        assert!(out.contains("none —"), "no orders: {out}");
+        assert!(out.contains("none ‒"), "no orders: {out}");
     }
 
     #[test]
@@ -1743,7 +1744,7 @@ mod tests {
         row.activity_detail = Some("run_terminal_command: rm -rf build".to_string());
         assert_eq!(
             row.preview().as_deref(),
-            Some("needs approval — run_terminal_command: rm -rf build")
+            Some("needs approval ‒ run_terminal_command: rm -rf build")
         );
         assert_eq!(row.last_state(), LastState::AwaitingApproval);
     }

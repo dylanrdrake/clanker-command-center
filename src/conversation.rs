@@ -841,7 +841,7 @@ impl Worker {
                         // says "not now" and can be retyped.
                         Some(Command::Compact) => {
                             let _ = self.events.send(Event::CompactionSkipped {
-                                reason: "A turn is running — compact once it has finished"
+                                reason: "A turn is running ‒ compact once it has finished"
                                     .to_string(),
                             });
                         }
@@ -852,7 +852,7 @@ impl Worker {
                         // its output" — a confusing way to be told.
                         Some(Command::ReconnectMcp) => {
                             let _ = self.events.send(Event::McpReconnected {
-                                summary: "A turn is running — reconnect once it has finished"
+                                summary: "A turn is running ‒ reconnect once it has finished"
                                     .to_string(),
                             });
                         }

@@ -30,6 +30,7 @@ pub(crate) use render::{busy_frame, identicon_mark};
 use crate::client::Client;
 use crate::config::ToolAccessSettings;
 use crate::conversation::{command_for, Command, Conversation};
+use crate::glyphs::DASH;
 use crate::session::{self, ChatSession};
 use crate::store::{self, SessionSummary, StoredMessage, KIND_AGENT_CHAT, KIND_CHAT};
 use crate::ui::response_label;
@@ -305,7 +306,7 @@ fn start_chat(
         // reason. Both causes are named because they read as different
         // problems: someone else has it, or you left a turn running in it.
         anyhow::bail!(
-            "Clanker {} is in use — another terminal, or a turn still finishing",
+            "Clanker {} is in use {DASH} another terminal, or a turn still finishing",
             &session.id()[..8]
         );
     };
@@ -507,7 +508,7 @@ fn draw(terminal: &mut Tui, screen: &mut Screen, tick: usize, selection: bool) -
             "CLANKER COMMAND CENTER",
             current_dir().as_deref(),
             selection,
-            "↑/↓ move · Enter open · r rename · d delete · q quit",
+            "↑/↓ move ∙ Enter open ∙ r rename ∙ d delete ∙ q quit",
             tick,
         ),
         Screen::Deploy(deployment) => picker::draw_deployment(frame, deployment),
@@ -871,7 +872,7 @@ async fn handle_picker_key(
             // under one leaves it writing into nothing.
             if parked.iter().any(|chat| chat.app.session_id == row.id) {
                 p.notice = Some(format!(
-                    "Clanker {} is still working — it can be deleted once it stops",
+                    "Clanker {} is still working {DASH} it can be deleted once it stops",
                     &row.id[..8]
                 ));
             } else {
@@ -1096,7 +1097,7 @@ fn dispatch_submission(app: &mut App, text: &str, send: &mut impl FnMut(Command)
         && matches!(app.pending_shell, Some(ShellState::Running { .. }))
     {
         app.transcript.push(TranscriptItem::Notice(
-            "A command is still running — wait for it to finish".to_string(),
+            "A command is still running ‒ wait for it to finish".to_string(),
         ));
         return false;
     }

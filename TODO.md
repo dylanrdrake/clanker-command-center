@@ -223,18 +223,13 @@ NEXT:
   and there's no indication they exist. The two blank lines between sections
   cost two more rows. Wants a scroll offset that follows the selection, and
   probably some hint that the list continues past the edge.
-* East Asian Width Ambiguous glyphs, part done. The transcript's reply
-  avatar was `●` (U+25CF), which some terminals draw two cells wide, shifting
-  every wrapped line under it out of line with the gutter. Both front ends now
-  draw the session's braille mark instead — braille is the one block where
-  every pattern is Neutral — so the avatar is fixed. Still Ambiguous and still
-  unfixed: `—` on notices and `·` in the settings bar. Safe replacements are
-  ✦ ⏺ ◉ ✻ ❖ ⟡ ✧ ❉ ✱ ⌾ ⬤, or anything in the braille block.
-* the client's timeouts are hardcoded in client.rs and can't be configured:
-  CONNECT_TIMEOUT 20s, REQUEST_TIMEOUT 300s, STREAM_IDLE_TIMEOUT 90s, plus
-  tools.rs's 30s default for a terminal command when the model doesn't give one.
-  The 90s stream idle one has stalled real turns twice. Would follow the same
-  shape as sandbox/verbose: seeded config fields, `clank <name> <value>`.
+* East Asian Width Ambiguous glyphs, mostly done. `·` and `—` are fixed in the
+  TUI's rendered strings via `src/glyphs.rs`, and the reply avatar was already
+  fixed by moving to braille. Still Ambiguous and still width-sensitive: the
+  horizontal rules, built from `─` (U+2500) with `"─".repeat(width)` — a
+  terminal that draws it two cells wide overshoots by one per character and the
+  rule wraps. Needs a Neutral glyph that still joins seamlessly, which is why
+  it was left.
 * `clank login` reads the API key with echo on — a plain `read_line` on
   stdin — so the key renders as you type it and then lives in the terminal's
   scrollback, in a tmux buffer, and in anything recording the session. Where

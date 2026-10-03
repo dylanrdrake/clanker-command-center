@@ -12,6 +12,7 @@
 //! ever waits on a subprocess.
 
 use super::app::{App, TranscriptItem};
+use crate::glyphs::{DASH, DOT};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph};
 use std::cell::Cell;
@@ -302,7 +303,7 @@ impl Shown {
         shown.whole = size <= WHOLE_FILE_MAX_BYTES;
         if !shown.whole {
             shown.lines.push(Row::note(format!(
-                "({} — too large to show whole, so only its changes)",
+                "({} {DASH} too large to show whole, so only its changes)",
                 human_size(size)
             )));
         }
@@ -1530,7 +1531,7 @@ pub fn draw(frame: &mut Frame, area: Rect, pane: &GitPane, tick: usize) {
     }
     if pane.error.is_none() && pane.listed {
         header.push(Span::styled(
-            format!(" · {}", pane.files.len()),
+            format!(" {DOT} {}", pane.files.len()),
             Style::new().dark_gray(),
         ));
     }
@@ -1675,9 +1676,9 @@ fn draw_keys(frame: &mut Frame, area: Rect, pane: &GitPane) {
     // Only the keys that do something: with no repository there is nothing
     // to move through, view or scroll.
     let keys = if pane.error.is_some() {
-        " r refresh · Tab chat · Esc close"
+        " r refresh ∙ Tab chat ∙ Esc close"
     } else {
-        " ↑/↓ file · Enter view · n/N change · PgUp/PgDn J/K scroll · r refresh · Tab chat · Esc close"
+        " ↑/↓ file ∙ Enter view ∙ n/N change ∙ PgUp/PgDn J/K scroll ∙ r refresh ∙ Tab chat ∙ Esc close"
     };
     frame.render_widget(
         Paragraph::new(Line::styled(keys, Style::new().dark_gray())),

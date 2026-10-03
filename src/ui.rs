@@ -10,6 +10,7 @@
 //! trait instead. [`crate::terminal_ui`] is the CLI's implementation.
 
 use crate::config::{ToolAccess, ToolAccessSettings};
+use crate::glyphs::{DASH, DOT, SEP};
 use anyhow::Result;
 use std::future::Future;
 
@@ -312,7 +313,7 @@ pub fn session_settings_rows(settings: &SessionSettings) -> Vec<(String, String)
             if settings.tool_access.any_tools() {
                 "on".to_string()
             } else {
-                "off — nothing is offered to the model".to_string()
+                format!("off {DASH} nothing is offered to the model")
             },
         ),
         ("Model".to_string(), settings.model.to_string()),
@@ -353,7 +354,10 @@ pub fn session_settings_rows(settings: &SessionSettings) -> Vec<(String, String)
                     settings.compactor,
                     format_tokens(threshold as i64)
                 ),
-                None => format!("{} — /compact only, never automatic", settings.compactor),
+                None => format!(
+                    "{} {DASH} /compact only, never automatic",
+                    settings.compactor
+                ),
             },
         ),
         (
@@ -377,7 +381,7 @@ pub fn session_settings_rows(settings: &SessionSettings) -> Vec<(String, String)
                 .iter()
                 .map(|(name, _, access)| format!("{name} {}", access.label()))
                 .collect::<Vec<_>>()
-                .join(" · "),
+                .join(SEP),
         ),
     ]
 }
@@ -426,13 +430,13 @@ pub fn mcp_rows(
         .map(|server| {
             let state = match live.iter().find(|(name, _)| *name == server.name) {
                 Some((_, count)) => format!(
-                    "{count} tool{} · {} {}",
+                    "{count} tool{} {DOT} {} {}",
                     if *count == 1 { "" } else { "s" },
                     server.command,
                     server.args.join(" ")
                 ),
                 None => format!(
-                    "not connected · {} {}",
+                    "not connected {DOT} {} {}",
                     server.command,
                     server.args.join(" ")
                 ),
@@ -473,7 +477,7 @@ pub fn mcp_reconnected_notice(before: &[(String, usize)], after: &[(String, usiz
         }
     }
     format!(
-        "Reconnected every MCP server — {}. Servers belong to this clank rather than \
+        "Reconnected every MCP server {DASH} {}. Servers belong to this clank rather than \
          to one clanker, so another terminal keeps its own.",
         parts.join(", ")
     )
@@ -505,9 +509,9 @@ pub fn title_notice(title: &str, changed: bool) -> String {
 pub fn stream_notice(stream: bool, changed: bool) -> String {
     let verb = if changed { "set to" } else { "is" };
     let state = if stream {
-        "on — replies arrive token by token"
+        format!("on {DASH} replies arrive token by token")
     } else {
-        "off — replies arrive whole"
+        format!("off {DASH} replies arrive whole")
     };
     format!("Streaming {verb} {state}")
 }
@@ -516,9 +520,9 @@ pub fn stream_notice(stream: bool, changed: bool) -> String {
 pub fn verbose_notice(verbose: bool, changed: bool) -> String {
     let verb = if changed { "set to" } else { "is" };
     let state = if verbose {
-        "on — showing tool call detail and the model's thinking"
+        format!("on {DASH} showing tool call detail and the model's thinking")
     } else {
-        "off — showing a one-line notice per tool call"
+        format!("off {DASH} showing a one-line notice per tool call")
     };
     format!("Verbose {verb} {state}")
 }
@@ -537,7 +541,7 @@ pub fn temperature_notice(temperature: Option<f32>, changed: bool) -> String {
     let verb = if changed { "set to" } else { "is" };
     match temperature {
         Some(value) => format!("Temperature {verb} {value}"),
-        None => format!("Temperature {verb} none sent — the provider uses its own default"),
+        None => format!("Temperature {verb} none sent {DASH} the provider uses its own default"),
     }
 }
 
@@ -548,7 +552,7 @@ pub fn effort_notice(effort_level: Option<&str>, changed: bool) -> String {
     let verb = if changed { "set to" } else { "is" };
     match effort_level {
         Some(level) => format!("Effort {verb} {level}"),
-        None => format!("Effort {verb} none sent — the provider uses its own default"),
+        None => format!("Effort {verb} none sent {DASH} the provider uses its own default"),
     }
 }
 
@@ -557,9 +561,9 @@ pub fn effort_notice(effort_level: Option<&str>, changed: bool) -> String {
 pub fn sandbox_notice(sandbox: bool, changed: bool) -> String {
     let verb = if changed { "set to" } else { "is" };
     let state = if sandbox {
-        "on — writes confined to the working directory"
+        format!("on {DASH} writes confined to the working directory")
     } else {
-        "off — writes allowed anywhere"
+        format!("off {DASH} writes allowed anywhere")
     };
     format!("Sandbox {verb} {state}")
 }
@@ -578,7 +582,7 @@ pub fn compacting_notice(model: &str) -> String {
 pub fn compacted_notice(folded: usize) -> String {
     let plural = if folded == 1 { "message" } else { "messages" };
     format!(
-        "Compacted — the first {folded} {plural} are now sent as a summary.          They are still here to scroll back through."
+        "Compacted {DASH} the first {folded} {plural} are now sent as a summary.          They are still here to scroll back through."
     )
 }
 
@@ -1018,7 +1022,7 @@ const COMMANDS: [Command; 21] = [
     Command {
         word: "diff",
         syntax: "/diff",
-        blurb: "Changed files and their diffs, beside the chat (Ctrl-G) — TUI only",
+        blurb: "Changed files and their diffs, beside the chat (Ctrl-G) ‒ TUI only",
         usage: Some("/diff"),
     },
     Command {
@@ -1048,7 +1052,7 @@ const COMMANDS: [Command; 21] = [
     Command {
         word: "back",
         syntax: "/back",
-        blurb: "Return to the launch screen (Ctrl-B) — TUI only",
+        blurb: "Return to the launch screen (Ctrl-B) ‒ TUI only",
         usage: None,
     },
 ];
@@ -1790,7 +1794,7 @@ mod tests {
         assert_eq!(temperature_notice(Some(0.7), false), "Temperature is 0.7");
         assert_eq!(
             temperature_notice(None, true),
-            "Temperature set to none sent — the provider uses its own default"
+            "Temperature set to none sent ‒ the provider uses its own default"
         );
     }
 
@@ -1818,19 +1822,19 @@ mod tests {
         // what the setting will actually do.
         assert_eq!(
             verbose_notice(true, false),
-            "Verbose is on — showing tool call detail and the model's thinking"
+            "Verbose is on ‒ showing tool call detail and the model's thinking"
         );
         assert_eq!(
             verbose_notice(false, true),
-            "Verbose set to off — showing a one-line notice per tool call"
+            "Verbose set to off ‒ showing a one-line notice per tool call"
         );
         assert_eq!(
             stream_notice(true, false),
-            "Streaming is on — replies arrive token by token"
+            "Streaming is on ‒ replies arrive token by token"
         );
         assert_eq!(
             stream_notice(false, true),
-            "Streaming set to off — replies arrive whole"
+            "Streaming set to off ‒ replies arrive whole"
         );
     }
 
@@ -1970,8 +1974,8 @@ mod tests {
         assert_eq!(value("Sandbox"), "on");
         assert_eq!(
             value("Each tool"),
-            "read_file ask · list_files ask · search_files ask · web_fetch allow \
-             · write_file ask · replace_in_file ask · run_terminal_command never"
+            "read_file ask ∙ list_files ask ∙ search_files ask ∙ web_fetch allow \
+             ∙ write_file ask ∙ replace_in_file ask ∙ run_terminal_command never"
         );
         assert_eq!(value("Directory"), "not recorded");
         assert_eq!(value("Tokens"), "🪙 0");
@@ -2015,8 +2019,8 @@ mod tests {
         // anyone is asking here.
         assert_eq!(
             value("Each tool"),
-            "read_file allow · list_files allow · search_files allow · web_fetch allow \
-             · write_file ask · replace_in_file ask · run_terminal_command never"
+            "read_file allow ∙ list_files allow ∙ search_files allow ∙ web_fetch allow \
+             ∙ write_file ask ∙ replace_in_file ask ∙ run_terminal_command never"
         );
         assert_eq!(value("Directory"), "/home/dev/project");
         assert_eq!(value("Tokens"), "🪙 12,345");
@@ -2056,11 +2060,11 @@ mod tests {
     fn sandbox_notice_says_what_changed_and_what_it_means() {
         assert_eq!(
             sandbox_notice(true, true),
-            "Sandbox set to on — writes confined to the working directory"
+            "Sandbox set to on ‒ writes confined to the working directory"
         );
         assert_eq!(
             sandbox_notice(false, false),
-            "Sandbox is off — writes allowed anywhere"
+            "Sandbox is off ‒ writes allowed anywhere"
         );
     }
 
@@ -2320,7 +2324,7 @@ mod tests {
 
         assert_eq!(rows[0].0, "gj");
         assert!(
-            rows[0].1.starts_with("10 tools · /bin/gj mcp"),
+            rows[0].1.starts_with("10 tools ∙ /bin/gj mcp"),
             "{:?}",
             rows[0].1
         );

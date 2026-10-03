@@ -5,6 +5,7 @@ pub mod config;
 pub mod conversation;
 pub mod crypto;
 pub mod error_log;
+pub mod glyphs;
 pub mod mcp;
 pub mod session;
 pub mod spinner;

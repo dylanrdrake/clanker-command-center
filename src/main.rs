@@ -5,6 +5,7 @@ mod config;
 mod conversation;
 mod crypto;
 mod error_log;
+mod glyphs;
 mod mcp;
 mod session;
 mod spinner;
