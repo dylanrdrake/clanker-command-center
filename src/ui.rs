@@ -147,6 +147,9 @@ pub enum Submission {
     /// without this there is no way back to the launch screen from inside a
     /// tmux session.
     Back,
+    /// Opens the changes pane beside the conversation, or closes it. Typed
+    /// form of `Ctrl-G`, and TUI only: it is a split screen.
+    ToggleDiff,
     SetModel(String),
     ShowModel,
     /// `None` nullifies the override (`/effort clear`) — no effort field is
@@ -630,6 +633,11 @@ pub fn classify(text: &str) -> Submission {
     if bare_command(trimmed, "/back") {
         return Submission::Back;
     }
+    if let Some(rest) = trimmed.strip_prefix("/diff") {
+        if rest.trim().is_empty() {
+            return Submission::ToggleDiff;
+        }
+    }
     if bare_command(trimmed, "/send") {
         return Submission::SendShell;
     }
@@ -916,7 +924,7 @@ struct Command {
     usage: Option<&'static str>,
 }
 
-const COMMANDS: [Command; 20] = [
+const COMMANDS: [Command; 21] = [
     Command {
         word: "help",
         syntax: "/help",
@@ -1006,6 +1014,12 @@ const COMMANDS: [Command; 20] = [
         syntax: "/clanker [title <new title>]",
         blurb: "Show every setting this clanker runs with, or rename it",
         usage: Some("/clanker title <new title>"),
+    },
+    Command {
+        word: "diff",
+        syntax: "/diff",
+        blurb: "Changed files and their diffs, beside the chat (Ctrl-G) — TUI only",
+        usage: Some("/diff"),
     },
     Command {
         word: "send",

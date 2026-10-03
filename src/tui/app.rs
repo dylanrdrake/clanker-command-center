@@ -4,6 +4,7 @@
 //! transition, so the interesting behavior (how a stream becomes a transcript
 //! block, what happens to input while busy) is testable without a terminal.
 
+use super::git::GitPane;
 use crate::config::ToolAccessSettings;
 use crate::conversation::Event;
 pub use crate::ui::{classify, Submission};
@@ -162,6 +163,10 @@ pub struct App {
     /// Open while `/models` is being browsed. Takes the keyboard while it
     /// is: it is a cursor in a list, and there is nothing else to type.
     pub model_browser: Option<ModelBrowser>,
+    /// The changes pane, while it is open — see [`super::git`]. Carried
+    /// here so `/diff` opens it through the same dispatch as every other
+    /// command; its I/O is the event loop's to run, never `apply`'s.
+    pub git: Option<GitPane>,
     pub input: String,
     /// Byte index of the cursor within `input`. Kept on a char boundary.
     pub cursor: usize,
@@ -301,6 +306,7 @@ impl App {
         App {
             transcript: Vec::new(),
             model_browser: None,
+            git: None,
             // Overwritten from the configuration by whoever opens the
             // clanker; the fallback here is the same model an unset
             // `compactor` resolves to, so a status readout never says

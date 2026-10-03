@@ -304,6 +304,7 @@ pub fn command_for(submission: &Submission) -> Option<Command> {
         | Submission::AllowTool
         | Submission::DenyTool
         | Submission::Back
+        | Submission::ToggleDiff
         | Submission::UnknownCommand(_) => None,
     }
 }
@@ -1544,6 +1545,7 @@ mod tests {
             Submission::AllowTool,
             Submission::DenyTool,
             Submission::Back,
+            Submission::ToggleDiff,
             Submission::UnknownCommand("nope".to_string()),
         ] {
             assert!(

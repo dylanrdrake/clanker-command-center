@@ -60,6 +60,11 @@ html2text = "0.17.1"
 # one. COLORFGBG is unset on most modern terminals, which is why this
 # needs a real query rather than an environment variable.
 terminal-colorsaurus = "1.0.3"
+# Syntax highlighting in the changes pane. The same crate, with the same
+# default features, that `tui-markdown` highlights the chat's code blocks
+# with — so naming it costs a line rather than a build, and the pane's code
+# is coloured exactly the way the conversation's is.
+syntect = "5.3.0"
 
 # `killpg`, for stopping an MCP server *and the processes it started*. A
 # server launched through a runner like `npx` is a grandchild, so killing

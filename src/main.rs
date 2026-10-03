@@ -1706,6 +1706,8 @@ fn apply_submission(
         // A cursor moving through a list of 400 names, which a blocking
         // prompt has nowhere to draw. `clank models` lists them here.
         | ui::Submission::BrowseModels
+        // A pane beside the conversation; `git diff` is right there instead.
+        | ui::Submission::ToggleDiff
         | ui::Submission::Back => {
             println!(
                 "{} that's a TUI command (`clank tui`), not available here",

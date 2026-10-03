@@ -490,6 +490,7 @@ dependencies = [
  "rustyline",
  "serde",
  "serde_json",
+ "syntect",
  "terminal-colorsaurus",
  "textwrap",
  "thiserror 1.0.69",

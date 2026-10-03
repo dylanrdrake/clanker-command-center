@@ -21,6 +21,7 @@
 //! with the process.
 
 mod app;
+mod git;
 mod picker;
 mod render;
 /// The session mark, so the CLI can draw the same one the TUI does.
@@ -510,7 +511,20 @@ fn draw(terminal: &mut Tui, screen: &mut Screen, tick: usize, selection: bool) -
             tick,
         ),
         Screen::Deploy(deployment) => picker::draw_deployment(frame, deployment),
-        Screen::Chat(chat) => render::draw(frame, &chat.app, &mut chat.transcript_cache, tick),
+        Screen::Chat(chat) => match &chat.app.git {
+            Some(pane) => {
+                let (left, right) = git::split(frame.area());
+                render::draw(frame, left, &chat.app, &mut chat.transcript_cache, tick);
+                git::draw(frame, right, pane, tick);
+            }
+            None => render::draw(
+                frame,
+                frame.area(),
+                &chat.app,
+                &mut chat.transcript_cache,
+                tick,
+            ),
+        },
     })?;
     Ok(())
 }
@@ -574,7 +588,12 @@ async fn run_screens(
                 last_key_at = Some(now);
 
                 match screen {
-                    Screen::Chat(chat) if is_pasted_newline(&key, since_previous) => {
+                    // Not while the changes pane has the keyboard: the
+                    // newline would land in an input box nobody is typing in.
+                    Screen::Chat(chat)
+                        if is_pasted_newline(&key, since_previous)
+                            && !chat.app.git.as_ref().is_some_and(|pane| pane.focused) =>
+                    {
                         chat.app.insert_char('\n');
                     }
                     _ => quit = handle_key(context, screen, parked, key).await?,
@@ -590,13 +609,45 @@ async fn run_screens(
             Wake::Key(TermEvent::Resize(_, _)) => dirty = true,
             Wake::Key(TermEvent::Mouse(mouse)) => {
                 if let Screen::Chat(chat) = screen {
-                    handle_mouse_scroll(&mut chat.app, mouse);
+                    // The wheel scrolls whichever side it is turned over.
+                    let pane_x = terminal.size().ok().map(|size| {
+                        git::split(ratatui::layout::Rect::new(0, 0, size.width, size.height))
+                            .1
+                            .x
+                    });
+                    match chat.app.git.as_mut() {
+                        Some(pane) if pane_x.is_some_and(|x| mouse.column >= x) => {
+                            match mouse.kind {
+                                MouseEventKind::ScrollUp => {
+                                    pane.scroll(-(MOUSE_SCROLL_STEP as isize))
+                                }
+                                MouseEventKind::ScrollDown => {
+                                    pane.scroll(MOUSE_SCROLL_STEP as isize)
+                                }
+                                _ => {}
+                            }
+                        }
+                        _ => handle_mouse_scroll(&mut chat.app, mouse),
+                    }
                     dirty = true;
                 }
             }
             Wake::Key(_) => {}
             Wake::Conversation(Some(event)) => {
                 if let Screen::Chat(chat) = screen {
+                    // A tool that just finished may have just written a file,
+                    // so the changes pane re-reads now rather than on its
+                    // next interval.
+                    if matches!(
+                        event,
+                        crate::conversation::Event::Agent(
+                            crate::ui::AgentEvent::ToolCallCompleted { .. }
+                        )
+                    ) {
+                        if let Some(pane) = chat.app.git.as_mut() {
+                            pane.invalidate();
+                        }
+                    }
                     chat.app.apply(event);
                 }
                 stale = true;
@@ -659,6 +710,28 @@ async fn run_screens(
                             dirty = true;
                         }
                     }
+                }
+            }
+        }
+
+        // Whatever woke the loop, an open changes pane that is due a re-read
+        // gets one — including straight after `/diff` or Ctrl-G opened it.
+        if let Screen::Chat(chat) = screen {
+            let activity = git::activity(&chat.app);
+            if let Some(pane) = chat.app.git.as_mut() {
+                // Where the agent is at work, for the list's gutter; asked
+                // every pass because a tool call starting is what moves it.
+                let moved = pane.set_activity(activity);
+                // A due refresh pumps too, so it's one or the other. The
+                // pump is what brings a loading diff's lines in while
+                // nothing else is happening.
+                let changed = if pane.due() {
+                    pane.refresh()
+                } else {
+                    pane.pump()
+                };
+                if changed || moved {
+                    dirty = true;
                 }
             }
         }
@@ -969,6 +1042,17 @@ fn is_pasted_newline(key: &KeyEvent, since_previous: Option<Duration>) -> bool {
         && since_previous.is_some_and(|gap| gap < PASTE_BURST)
 }
 
+/// Where the changes pane asks git from: the clanker's own directory, or
+/// the one the process is in when that has gone.
+fn git_dir(app: &App) -> std::path::PathBuf {
+    app.working_dir
+        .as_deref()
+        .map(std::path::PathBuf::from)
+        .filter(|dir| dir.is_dir())
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+}
+
 /// Answers a pending approval. Shared by the chord and by `/allow`, `/deny` —
 /// the typed forms exist because a terminal that claims `Ctrl-Y` would
 /// otherwise leave a turn waiting on a decision with no way to give it.
@@ -1147,6 +1231,12 @@ fn dispatch_submission(app: &mut App, text: &str, send: &mut impl FnMut(Command)
                 app::Submission::AllowTool => answer_approval(app, send, true),
                 app::Submission::DenyTool => answer_approval(app, send, false),
                 app::Submission::Back => return true,
+                app::Submission::ToggleDiff => {
+                    app.git = match app.git {
+                        Some(_) => None,
+                        None => Some(git::GitPane::new(git_dir(app))),
+                    }
+                }
                 app::Submission::UnknownCommand(message) => {
                     app.transcript.push(TranscriptItem::Error(message));
                 }
@@ -1203,6 +1293,50 @@ fn handle_chat_key(app: &mut App, conversation: &Conversation, key: KeyEvent) ->
             _ => {}
         }
         return false;
+    }
+
+    // Ctrl-G opens the changes pane, takes focus back to it, or — when it
+    // already has focus — closes it.
+    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('g')) {
+        match &mut app.git {
+            None => app.git = Some(git::GitPane::new(git_dir(app))),
+            Some(pane) if !pane.focused => pane.focused = true,
+            Some(_) => app.git = None,
+        }
+        return false;
+    }
+
+    // The pane holds the keyboard while it has focus, the way the model
+    // browser does — except for Ctrl-letter chords, which fall through so an
+    // approval or a `$` command can still be answered without leaving it.
+    // Only letters: Ctrl-Enter or Ctrl-Backspace falling through would send
+    // or edit a draft in a box you can't see the cursor of.
+    if let Some(pane) = app.git.as_mut().filter(|pane| pane.focused) {
+        let chord = key.modifiers.contains(KeyModifiers::CONTROL);
+        if chord && !matches!(key.code, KeyCode::Char(_)) {
+            return false;
+        }
+        if !chord {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => app.git = None,
+                // Back to the input box, leaving the pane open to watch.
+                KeyCode::Tab => pane.focused = false,
+                KeyCode::Up | KeyCode::Char('k') => pane.move_cursor(false),
+                KeyCode::Down | KeyCode::Char('j') => pane.move_cursor(true),
+                KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => pane.select(),
+                KeyCode::Char('K') => pane.scroll(-1),
+                KeyCode::Char('J') => pane.scroll(1),
+                KeyCode::PageUp => pane.scroll(-pane.page()),
+                KeyCode::PageDown | KeyCode::Char(' ') => pane.scroll(pane.page()),
+                KeyCode::Home | KeyCode::Char('g') => pane.scroll_to(false),
+                KeyCode::End | KeyCode::Char('G') => pane.scroll_to(true),
+                KeyCode::Char('n') | KeyCode::Char(']') => pane.jump(true),
+                KeyCode::Char('N') | KeyCode::Char('[') => pane.jump(false),
+                KeyCode::Char('r') => pane.invalidate(),
+                _ => {}
+            }
+            return false;
+        }
     }
 
     // Ctrl-B backs out to the launch screen; plain Esc stays reserved for

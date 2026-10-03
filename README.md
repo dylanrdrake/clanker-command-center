@@ -1,4 +1,6 @@
-# ⣕⢛ Clanker Command Center (WIP)
+# ⣕⣪ Clanker Command Center (WIP)
+
+test UPDATE
 
 An OpenAI-compatible CLI frontend for any LLM provider, with agentic tool capabilities, written in Rust. Defaults to OpenRouter, but works with any OpenAI-compatible service (OrcaRouter, Together, Groq, self-hosted gateways, etc) via `clank endpoint` — see [Using other providers](#using-other-providers).
 
@@ -698,6 +700,7 @@ exactly:
 | `/send`, `/discard` | Answer the `$` command box — the same as `Ctrl-S` and `Ctrl-D`. Typed forms exist because terminals claim chords: Zed's takes `Ctrl-S` |
 | `/allow`, `/deny` | Answer a tool approval — the same as `Ctrl-Y` and `Ctrl-N`. Without a way to answer, a turn waits on a decision it can never be given |
 | `/back` | Return to the launch screen — the same as `Ctrl-B`, which tmux claims as its own prefix |
+| `/diff` | Open the changes pane beside the conversation (see `Ctrl-G`), or close it if it's open. TUI only |
 
 A mistyped invocation of one of these (`/effort` with no value, `/tools
 bogus off`), or a misspelled command name (`/mode` for `/model`), is
@@ -889,6 +892,7 @@ the current one instead, repointing the clanker there — the same thing
 | `PgUp` / `PgDn` / `End` | Scroll the transcript; `End` re-pins to the newest |
 | Mouse wheel | Also scrolls the transcript — `↑`/`↓` stay dedicated to prompt history |
 | `Ctrl-Shift-V` / `Shift-Insert` / middle-click | Paste, using your terminal's own paste binding. Multi-line pastes land in the input box as text rather than sending a message per line. `Ctrl-V` is **not** a paste key in most terminals — it never reaches your clipboard |
+| `Ctrl-G` | The changes pane: every file modified, added, deleted, renamed or untracked in the clanker's repository, in a split on the right, with the diff of whichever one you pick against the last commit (staged and unstaged together): the whole file, numbered, with code coloured the way the chat colours it and added and removed lines on a green or red ground. A file over 16 MB shows only its changes, and at most 200,000 lines of any file are held. The file the agent is editing carries the chat's yellow `working` animation in the list's left gutter (a `?` while the edit waits on an approval), from the write until the agent's next step, whatever that is, and for at least a second so it can be seen. It opens at the first change; the rule above the diff counts the changes above (`▲`) and below (`▼`) the view. Re-reads every two seconds and whenever a tool finishes, so you can watch an agent's edits land, without taking git's index lock. While it has focus: `↑`/`↓` (or `j`/`k`) move, `Enter` (or `→`/`l`) shows a file's diff, `n`/`N` (or `]`/`[`) go to the next and previous change, `PgUp`/`PgDn`, `Space` and `J`/`K` scroll it, `Home`/`End` (or `g`/`G`) go to its top and end, `r` re-reads, `Tab` hands the keyboard back to the prompt with the pane left open, `Esc` (or `q`) closes it. The mouse wheel scrolls whichever side it's over. `Ctrl-G` again refocuses it, and closes it once focused. Outside a repository it says so. `/diff` opens it too |
 | `Ctrl-B` | Back to the launch screen (the clanker is saved). A turn still running is **not** cancelled — it keeps working, shows as `working` in the list, and Enter on its row puts you back in it where it got to. Use `Esc` first if you meant to stop it. `/back` does the same — tmux takes `Ctrl-B` as its own prefix |
 | `Ctrl-C` | Quit. This ends a running turn: the work happens inside this process, so nothing survives it leaving |
 

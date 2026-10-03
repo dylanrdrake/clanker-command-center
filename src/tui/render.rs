@@ -118,24 +118,24 @@ pub(super) fn identicon(seed: &str) -> (String, Style) {
     (identicon_mark(seed), Style::new().fg(Color::Indexed(fg)))
 }
 
-pub fn draw(frame: &mut Frame, app: &App, cache: &mut TranscriptCache, tick: usize) {
+pub fn draw(frame: &mut Frame, area: Rect, app: &App, cache: &mut TranscriptCache, tick: usize) {
     // The message box grows with what's been typed into it, and with nothing
     // else. An approval used to take the box over — borrowing the input as
     // its answer buffer — so a decision arriving mid-sentence displaced what
     // you were writing and answering it consumed the draft. It has its own
     // box now.
-    let content_rows = input_lines(&app.input, frame.area().width.saturating_sub(2)).len() as u16;
+    let content_rows = input_lines(&app.input, area.width.saturating_sub(2)).len() as u16;
     // Messages waiting to be sent get a box of their own above the prompt,
     // and no space at all when nothing is waiting.
     let pending_rows = pending_height(app.pending.len());
     // Nearest the transcript, above anything to do with what you're typing:
     // it is the thing waiting on you, not the thing you are writing.
     let approval_rows = match &app.pending_approval {
-        Some(request) => approval_height(request, frame.area().width),
+        Some(request) => approval_height(request, area.width),
         None => 0,
     };
     let shell_rows = match &app.pending_shell {
-        Some(shell) => shell_height(shell, frame.area().width),
+        Some(shell) => shell_height(shell, area.width),
         None => 0,
     };
     let browser_rows = match &app.model_browser {
@@ -155,9 +155,7 @@ pub fn draw(frame: &mut Frame, app: &App, cache: &mut TranscriptCache, tick: usi
         // own two border rows, the settings/key-binding rows below it, and
         // whatever the pending and approval boxes are using.
         .min(
-            frame
-                .area()
-                .height
+            area.height
                 .saturating_sub(
                     7 + pending_rows + approval_rows + shell_rows + browser_rows + hint_rows,
                 )
@@ -177,7 +175,7 @@ pub fn draw(frame: &mut Frame, app: &App, cache: &mut TranscriptCache, tick: usi
         Constraint::Length(1),              // settings: ask/agent, model, effort, temp, verbose
         Constraint::Length(1),              // key bindings
     ])
-    .split(frame.area());
+    .split(area);
 
     draw_title(frame, areas[0], app);
     draw_rule(frame, areas[1], None);
@@ -1224,6 +1222,11 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App, scrolled: bool) {
         .scroll((scroll, 0));
     frame.render_widget(paragraph, area);
 
+    // Typing goes to the changes pane while it has focus, so the cursor
+    // stays out of a box that isn't listening.
+    if app.git.as_ref().is_some_and(|pane| pane.focused) {
+        return;
+    }
     frame.set_cursor_position((
         area.x + 1 + cursor_col,
         area.y + 1 + cursor_row.saturating_sub(scroll),
@@ -1454,7 +1457,7 @@ fn draw_keybindings(frame: &mut Frame, area: Rect, app: &App, completing: bool) 
                 // right now, and the list above is what that is.
                 " Tab complete · Enter send · Esc cancel · Ctrl-B back · Ctrl-C quit"
             } else {
-                " Enter send · Esc cancel · PgUp/PgDn scroll · Ctrl-B back · Ctrl-C quit"
+                " Enter send · Esc cancel · PgUp/PgDn scroll · Ctrl-G changes · Ctrl-B back · Ctrl-C quit"
             },
             Style::new().fg(KEYBIND_GRAY).dim(),
         ))),
@@ -1585,6 +1588,17 @@ fn markdown_lines(text: &str) -> Vec<Line<'static>> {
 /// heavy bar on a light theme, which is the opposite of subtle.
 static BAND: std::sync::OnceLock<Style> = std::sync::OnceLock::new();
 
+/// The terminal's background and its perceived lightness, when it said.
+/// Kept for the changes pane, which tints added and removed lines toward
+/// green and red from wherever the background actually is.
+static BACKGROUND: std::sync::OnceLock<((u8, u8, u8), f32)> = std::sync::OnceLock::new();
+
+/// See [`BACKGROUND`]. `None` when the terminal never answered — and as with
+/// the band, a caller should do without rather than guess.
+pub(super) fn background() -> Option<((u8, u8, u8), f32)> {
+    BACKGROUND.get().copied()
+}
+
 /// Asks the terminal what colour it actually is, once, and remembers the
 /// band derived from it.
 ///
@@ -1594,6 +1608,14 @@ static BAND: std::sync::OnceLock<Style> = std::sync::OnceLock::new();
 pub(super) fn detect_band() {
     use terminal_colorsaurus::{background_color, QueryOptions};
     if let Ok(background) = background_color(QueryOptions::default()) {
+        let _ = BACKGROUND.set((
+            (
+                scale(background.r),
+                scale(background.g),
+                scale(background.b),
+            ),
+            background.perceived_lightness(),
+        ));
         let _ = BAND.set(band_for(
             background.perceived_lightness(),
             (
@@ -2179,7 +2201,7 @@ mod tests {
     fn colour_of(app: &App, width: u16, height: u16, needle: &str) -> Color {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
-            .draw(|frame| draw(frame, app, &mut TranscriptCache::default(), 0))
+            .draw(|frame| draw(frame, frame.area(), app, &mut TranscriptCache::default(), 0))
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
         for y in 0..buffer.area.height {
@@ -2242,7 +2264,7 @@ mod tests {
     fn command_coloured_row(app: &App, width: u16, height: u16, needle: &str) -> String {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
-            .draw(|frame| draw(frame, app, &mut TranscriptCache::default(), 0))
+            .draw(|frame| draw(frame, frame.area(), app, &mut TranscriptCache::default(), 0))
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
         for y in 0..buffer.area.height {
@@ -2390,7 +2412,7 @@ mod tests {
     ) -> String {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
-            .draw(|frame| draw(frame, app, cache, tick))
+            .draw(|frame| draw(frame, frame.area(), app, cache, tick))
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
         (0..buffer.area.height)
@@ -2760,12 +2782,16 @@ mod tests {
         // The first frame renders every block, and is not what is measured:
         // the claim is about the steady state, which is where the ten frames
         // a second are spent.
-        terminal.draw(|f| draw(f, &app, &mut cache, 0)).unwrap();
+        terminal
+            .draw(|f| draw(f, f.area(), &app, &mut cache, 0))
+            .unwrap();
 
         let frames = 20;
         let start = Instant::now();
         for _ in 0..frames {
-            terminal.draw(|f| draw(f, &app, &mut cache, 0)).unwrap();
+            terminal
+                .draw(|f| draw(f, f.area(), &app, &mut cache, 0))
+                .unwrap();
         }
         let per_frame = start.elapsed() / frames;
 
