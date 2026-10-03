@@ -9,13 +9,48 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 /// Seeds a continuous agent-chat session so the model treats the growing
-/// transcript as history to build on, not a backlog of tasks to redo.
+/// transcript as history to build on, not a backlog of tasks to redo, and
+/// says how to work: look before changing, keep the change small, check it,
+/// and report what actually happened. Most of what goes wrong in an agentic
+/// turn is a confident guess about code it never read, or a "done" it never
+/// checked, and both are cheaper to ask against than to catch afterwards.
+///
+/// Static, whichever tools are on, so it caches as one prefix: a line about
+/// a tool this clanker hasn't got is conditional ("if you can run
+/// commands") rather than left out.
 pub const AGENT_CHAT_SYSTEM_PROMPT: &str = "You are a coding agent operating in a continuous \
 interactive chat session. The conversation history may contain earlier user requests that you \
 already completed, along with your replies and any tool calls/results for them. Treat each new \
 user message as the only request currently being asked of you - use earlier turns purely as \
 background context. Do not restate, re-summarize, or redo work from earlier turns unless the \
-user explicitly asks you to.";
+user explicitly asks you to.
+
+How to work:
+- Look before you change anything. Read a file before editing it, and find code with \
+search_files rather than reading whole files or guessing at names, paths and APIs.
+- Make the smallest change that does what was asked, in the style of the code around it. Don't \
+refactor, reformat or add things nobody asked for.
+- Edit existing files with replace_in_file. Its search must match exactly one place, so include \
+enough surrounding lines to make it unique. Use write_file for new files or whole rewrites.
+- If you can run commands, check your work: build and run the relevant tests after changing \
+code, and fix what fails.
+- When a tool call fails, read its error and change your approach rather than repeating the \
+same call.
+- Report what actually happened. Say what you changed, and say plainly if something failed, was \
+skipped, or wasn't checked. Never claim a build or test passed that you didn't run.
+- If the request is genuinely ambiguous, or the change would destroy something, ask first. \
+Otherwise get on with it.";
+
+/// Every earlier wording of [`AGENT_CHAT_SYSTEM_PROMPT`]. Sessions from
+/// before the prompt was prepended per request have one stored in their
+/// history, and it is recognised by its exact text, so a wording that has
+/// been replaced still has to be known to be stripped.
+const PREVIOUS_AGENT_CHAT_SYSTEM_PROMPTS: [&str; 1] = ["You are a coding agent operating in a \
+continuous interactive chat session. The conversation history may contain earlier user requests \
+that you already completed, along with your replies and any tool calls/results for them. Treat \
+each new user message as the only request currently being asked of you - use earlier turns \
+purely as background context. Do not restate, re-summarize, or redo work from earlier turns \
+unless the user explicitly asks you to."];
 
 /// The tools this run may offer the model.
 ///
@@ -176,7 +211,10 @@ async fn request_turn(
 /// reasoning content, without needing to touch what's actually persisted.
 fn normalize_system_prompt(messages: &mut Vec<ChatMessage>, agentic: bool) {
     messages.retain(|m| {
-        !(m.role == "system" && m.content.as_deref() == Some(AGENT_CHAT_SYSTEM_PROMPT))
+        let ours = |text: &str| {
+            text == AGENT_CHAT_SYSTEM_PROMPT || PREVIOUS_AGENT_CHAT_SYSTEM_PROMPTS.contains(&text)
+        };
+        !(m.role == "system" && m.content.as_deref().is_some_and(ours))
     });
     if agentic {
         messages.insert(
@@ -1000,5 +1038,25 @@ mod tests {
         // stray one left in place.
         assert_eq!(messages.iter().filter(|m| m.role == "system").count(), 1);
         assert_eq!(messages[0].role, "system");
+    }
+
+    #[test]
+    fn normalize_system_prompt_strips_an_earlier_wording_too() {
+        // A session stored before the prompt was reworded carries the old
+        // text, which must not ride along beside the new one.
+        let old = ChatMessage {
+            role: "system".to_string(),
+            content: Some(PREVIOUS_AGENT_CHAT_SYSTEM_PROMPTS[0].to_string()),
+            ..Default::default()
+        };
+        let mut messages = vec![old, user("hi")];
+        normalize_system_prompt(&mut messages, true);
+        let system: Vec<_> = messages.iter().filter(|m| m.role == "system").collect();
+        assert_eq!(system.len(), 1);
+        assert_eq!(system[0].content.as_deref(), Some(AGENT_CHAT_SYSTEM_PROMPT));
+        assert_ne!(
+            PREVIOUS_AGENT_CHAT_SYSTEM_PROMPTS[0],
+            AGENT_CHAT_SYSTEM_PROMPT
+        );
     }
 }

@@ -5,9 +5,10 @@
   1. ~~`replace_in_file` replaced every occurrence~~ — done: anything but a
      unique match is refused with the count, `replace_all` opts in to every
      one, and an empty search is refused.
-  2. The agent system prompt says nothing about how to work: read before
-     editing, find with `search_files`, run the tests when the terminal is
-     on, and say plainly when something failed or wasn't checked.
+  2. ~~The agent system prompt said nothing about how to work~~ — done: read
+     before editing, find with `search_files`, keep changes small, unique
+     `replace_in_file` searches, test when the terminal is on, and report
+     failures and unchecked work plainly.
   3. Load `AGENTS.md` (or `CLAUDE.md`) from the clanker's directory into the
      system prompt, so a repo's conventions reach every turn — the open
      convention, so repos set up for other agents work here too.
