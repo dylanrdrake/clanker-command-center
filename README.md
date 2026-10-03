@@ -1380,6 +1380,10 @@ A run with tools — `clank "..." --tools`, or a clanker that has them — gives
 ### `write_file`
 Write or append content to a file.
 
+Overwriting a file that already exists needs it read first — see
+[Read before changing](#read-before-changing). Creating a file and appending
+to one don't.
+
 ### `read_file`
 Read the contents of a file, or a range of its lines.
 
@@ -1443,6 +1447,22 @@ somewhere the model never looked would otherwise change that too and report
 success, so more than one match is refused with the count, and the model
 widens the search until it is unique. `replace_all` changes every match when
 that is what's meant, and an empty search is refused outright.
+
+### Read before changing
+`write_file` overwriting an existing file and `replace_in_file` are both
+refused on a file this session hasn't read with `read_file`, and on one that
+has changed on disk since it was read — edited by you, a formatter, or another
+clanker in the same directory. The refusal says which, and the model reads the
+file and tries again. Without it, a model that assumed what a file held, or
+last saw it several edits ago, overwrites whatever it didn't know was there and
+reports success.
+
+A read of part of a file counts, and so do the session's own writes, so it can
+keep editing what it just wrote. Whether a file changed is judged by its
+contents, not its modification time, so saving it unchanged doesn't call for
+another read. The record lives only as long as the process and is cleared on
+compaction, when the files' text leaves the conversation, so a resumed or
+compacted clanker reads again before it edits.
 
 ### `run_terminal_command`
 Execute a shell command and return the output. Supports custom working directory and timeout.

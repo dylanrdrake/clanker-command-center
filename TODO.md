@@ -19,8 +19,10 @@
   4. A build/test loop by default. `run_terminal_command` is `never` until
      enabled, so a default clanker can edit code but never compile or test
      it. Something like a per-clanker allowlist (`cargo test`, `npm test`).
-  5. Refuse a write or replace on a file the session hasn't read, unless the
-     write creates it.
+  5. ~~Refuse a write or replace on a file the session hasn't read~~ —
+     done: also refused when the file changed since the read (by content
+     hash), creating and appending exempt, the session's own writes count
+     as reads, forgotten on compaction.
   After those: task lists, plan mode, memory across clankers.
 
 * connect providers directly, like Anthropic, OpenAI, etc..

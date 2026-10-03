@@ -1958,6 +1958,7 @@ async fn compact_cli(
     model: &str,
     compact_at: Option<u64>,
     guard: &mut compact::CompactionGuard,
+    reads: &tools::FileReads,
     forced: bool,
 ) -> Result<()> {
     let from = session.compacted_seq();
@@ -1988,6 +1989,9 @@ async fn compact_cli(
     }
     session.set_compaction(cut, compacted.summary)?;
     guard.compacted();
+    // The files' text went with what was folded, so a change needs a fresh
+    // read.
+    reads.forget();
     println!("{}", ui::compacted_notice(cut).blue());
     Ok(())
 }
@@ -2165,6 +2169,9 @@ async fn cmd_clanker(
         Err(e) => anyhow::bail!("Could not claim clanker {}: {e}", session.short_id()),
     }
 
+    // Outlives the gates, which are built afresh each turn: a file read in
+    // one turn can be edited in the next.
+    let reads = tools::FileReads::default();
     loop {
         let readline = rl.readline(&format!("{} ", "❯".green().bold()));
 
@@ -2207,6 +2214,7 @@ async fn cmd_clanker(
                     &compactor,
                     compact_at,
                     &mut guard,
+                    &reads,
                     true,
                 )
                 .await
@@ -2229,6 +2237,7 @@ async fn cmd_clanker(
                         &compactor,
                         compact_at,
                         &mut guard,
+                        &reads,
                         false,
                     )
                     .await
@@ -2266,7 +2275,8 @@ async fn cmd_clanker(
                         session.tool_access().clone(),
                         session.sandbox(),
                         client.command_timeout(),
-                    );
+                    )
+                    .with_reads(reads.clone());
                     agent::run_agent_turn(
                         &client,
                         &mut ui,

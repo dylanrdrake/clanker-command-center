@@ -1084,6 +1084,9 @@ impl Worker {
                             match self.session.set_compaction(cut, compacted.summary) {
                                 Ok(()) => {
                                     self.compaction_guard.compacted();
+                                    // The files' text went with what was
+                                    // folded, so a change needs a fresh read.
+                                    self.gates.reads().forget();
                                     let _ = self.events.send(Event::Compacted { folded: cut });
                                 }
                                 // The summary exists but couldn't be saved.

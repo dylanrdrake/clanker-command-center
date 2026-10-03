@@ -583,6 +583,7 @@ pub async fn run_agent_turn(
                         tool_name,
                         &tool_call.function.arguments,
                         gates.sandbox(),
+                        gates.reads(),
                         gates.command_timeout(),
                     )
                     .await;

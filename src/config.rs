@@ -936,6 +936,10 @@ pub struct SessionGates {
     /// model names none. Fixed for the run, unlike the two above, which
     /// `/tools` and `/sandbox` can change partway through a turn.
     command_timeout: u64,
+    /// The files this session has read, which an overwrite or a replace
+    /// needs first. Kept with the gates because it outlives a turn, as they
+    /// do, and decides what a write tool may do, as they do.
+    reads: crate::tools::FileReads,
 }
 
 impl SessionGates {
@@ -944,7 +948,20 @@ impl SessionGates {
             access: Arc::new(Mutex::new(access)),
             sandbox: Arc::new(AtomicBool::new(sandbox)),
             command_timeout,
+            reads: crate::tools::FileReads::default(),
         }
+    }
+
+    /// The same gates sharing an existing record of reads, for a caller that
+    /// builds them afresh each turn but runs one session across them.
+    pub fn with_reads(mut self, reads: crate::tools::FileReads) -> Self {
+        self.reads = reads;
+        self
+    }
+
+    /// What this session has read, shared with every clone.
+    pub fn reads(&self) -> &crate::tools::FileReads {
+        &self.reads
     }
 
     /// How long a terminal command may run when the call does not say.

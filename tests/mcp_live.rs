@@ -162,6 +162,7 @@ async fn a_registered_tool_is_callable_by_the_name_the_model_sees() {
         "fs__read_text_file",
         &json!({"path": dir.join("note.txt").to_str().unwrap()}).to_string(),
         true,
+        &tools::FileReads::default(),
         30,
     )
     .await
@@ -179,6 +180,7 @@ async fn a_registered_tool_is_callable_by_the_name_the_model_sees() {
         "fs__read_text_file",
         &json!({"path": "/etc/shadow"}).to_string(),
         true,
+        &tools::FileReads::default(),
         30,
     )
     .await
@@ -186,7 +188,7 @@ async fn a_registered_tool_is_callable_by_the_name_the_model_sees() {
     println!("execute_tool refusal: {refused}");
 
     // And a name that looks namespaced but belongs to nobody.
-    let nobody = tools::execute_tool("ghost__tool", "{}", true, 30)
+    let nobody = tools::execute_tool("ghost__tool", "{}", true, &tools::FileReads::default(), 30)
         .await
         .expect_err("no such tool");
     assert!(nobody.to_string().contains("Unknown tool"), "{nobody}");

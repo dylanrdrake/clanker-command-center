@@ -1,9 +1,11 @@
 use anyhow::{anyhow, Result};
 use serde_json::json;
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
-use std::sync::{LazyLock, RwLock};
+use std::hash::{Hash, Hasher};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
 
 /// One tool, as everything that isn't the model needs to see it: what it is
 /// called, which bucket it falls in for bulk settings, and a line a person
@@ -299,7 +301,7 @@ fn builtin_schemas() -> Vec<serde_json::Value> {
             "type": "function",
             "function": {
                 "name": "write_file",
-                "description": "Write or update a local file with code or text content",
+                "description": "Write or update a local file with code or text content. Overwriting a file that already exists requires reading it with read_file first; prefer replace_in_file for changing part of one",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -405,7 +407,7 @@ fn builtin_schemas() -> Vec<serde_json::Value> {
             "type": "function",
             "function": {
                 "name": "replace_in_file",
-                "description": "Replace text in a file. The search text must match exactly one place, unless replace_all is set; include enough surrounding lines to make it unique",
+                "description": "Replace text in a file you have read with read_file. The search text must match exactly one place, unless replace_all is set; include enough surrounding lines to make it unique",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -705,6 +707,7 @@ pub async fn execute_tool(
     name: &str,
     arguments: &str,
     sandbox: bool,
+    reads: &FileReads,
     command_timeout: u64,
 ) -> Result<serde_json::Value> {
     let args: serde_json::Value = serde_json::from_str(arguments)?;
@@ -721,7 +724,7 @@ pub async fn execute_tool(
                 .ok_or(anyhow!("Missing content"))?;
             let mode = args.get("mode").and_then(|v| v.as_str()).unwrap_or("write");
 
-            write_file(filepath, content, mode, sandbox)
+            write_file(filepath, content, mode, sandbox, reads)
         }
         "read_file" => {
             let filepath = args
@@ -737,7 +740,7 @@ pub async fn execute_tool(
                 .and_then(|v| v.as_u64())
                 .map(|n| n as usize);
 
-            read_file(filepath, offset, limit)
+            read_file(filepath, offset, limit, reads)
         }
         "list_files" => {
             let dirpath = args.get("dirpath").and_then(|v| v.as_str()).unwrap_or(".");
@@ -776,7 +779,7 @@ pub async fn execute_tool(
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
 
-            replace_in_file(filepath, search, replace, replace_all, sandbox)
+            replace_in_file(filepath, search, replace, replace_all, sandbox, reads)
         }
         "run_terminal_command" => {
             let command = args
@@ -906,11 +909,78 @@ fn sandbox_refusal(path: &Path, sandbox: bool) -> Option<serde_json::Value> {
     }))
 }
 
+/// The files a session has read, and what each held at the time.
+///
+/// An overwrite or a replace on a file the model never looked at is it
+/// writing from a guess — a file it assumed the shape of, or one it last saw
+/// several edits ago — and the overwrite silently drops whatever it didn't
+/// know was there. So both are refused until the file has been read, and
+/// again if it has changed on disk since: edited by the person, a formatter,
+/// or another clanker in the same directory. Creating a file is never
+/// refused; there is nothing in it to lose.
+///
+/// Kept as a hash of the whole file rather than a modification time, so a
+/// file touched without being changed — a checkout, a save with no edits —
+/// doesn't call for a second read. A partial read counts: the model read the
+/// part it meant to change, and `read_file` tells it when there is more.
+///
+/// The agent's own successful writes count as reads, since it knows what it
+/// just wrote. Forgotten on compaction, when the file's text leaves the
+/// context, and never stored, so a resumed clanker reads again first.
+///
+/// Cheap to clone: every clone shares the same record.
+#[derive(Clone, Debug, Default)]
+pub struct FileReads(Arc<Mutex<HashMap<PathBuf, u64>>>);
+
+impl FileReads {
+    fn fingerprint(bytes: &[u8]) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        bytes.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<PathBuf, u64>> {
+        // A panic mid-insert leaves a map that is still a valid map.
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Records that `path`, resolved as [`resolve_for_sandbox`] resolves it,
+    /// was seen holding `bytes`.
+    fn saw(&self, path: PathBuf, bytes: &[u8]) {
+        self.lock().insert(path, Self::fingerprint(bytes));
+    }
+
+    /// Clears the record, for when the files' text has left the context.
+    pub fn forget(&self) {
+        self.lock().clear();
+    }
+
+    /// The refusal for changing the existing file at `path`, which holds
+    /// `bytes` now, or `None` when it was read and is unchanged since.
+    fn refusal(&self, path: &Path, bytes: &[u8]) -> Option<serde_json::Value> {
+        let error = match self.lock().get(path) {
+            Some(&seen) if seen == Self::fingerprint(bytes) => return None,
+            // The reason first and no path: the call already names the file,
+            // and an absolute path ahead of the reason pushes it off the end
+            // of a `/verbose` row.
+            Some(_) => "This file has changed since you read it. Read it again before changing it.",
+            None => {
+                "This file exists and hasn't been read in this session. Read it with \
+                 read_file before changing it, so the change is based on what it holds."
+            }
+        };
+        Some(json!({ "success": false, "error": error }))
+    }
+}
+
 fn write_file(
     filepath: &str,
     content: &str,
     mode: &str,
     sandbox: bool,
+    reads: &FileReads,
 ) -> Result<serde_json::Value> {
     let cwd = std::env::current_dir()?;
 
@@ -930,8 +1000,16 @@ fn write_file(
 
     // Judged before anything is created, so a refused write leaves nothing
     // behind — not even the directories it would have needed.
-    if let Some(refusal) = sandbox_refusal(&resolve_for_sandbox(filepath)?, sandbox) {
+    let resolved = resolve_for_sandbox(filepath)?;
+    if let Some(refusal) = sandbox_refusal(&resolved, sandbox) {
         return Ok(refusal);
+    }
+    // An append keeps everything already there, so it needs no read; an
+    // overwrite replaces it, and does.
+    if mode != "append" && resolved.is_file() {
+        if let Some(refusal) = reads.refusal(&resolved, &fs::read(&resolved)?) {
+            return Ok(refusal);
+        }
     }
 
     fs::create_dir_all(parent)?;
@@ -943,8 +1021,10 @@ fn write_file(
             .append(true)
             .open(&path)?;
         std::io::Write::write_all(&mut file, content.as_bytes())?;
+        reads.saw(resolve_for_sandbox(filepath)?, &fs::read(&path)?);
     } else {
         fs::write(&path, content)?;
+        reads.saw(resolve_for_sandbox(filepath)?, content.as_bytes());
     }
 
     // The path is not repeated in the message: `filepath` beside it already
@@ -1002,6 +1082,7 @@ fn read_file(
     filepath: &str,
     offset: Option<usize>,
     limit: Option<usize>,
+    reads: &FileReads,
 ) -> Result<serde_json::Value> {
     let path = std::path::Path::new(filepath);
 
@@ -1030,6 +1111,7 @@ fn read_file(
     // here to catch. An empty file comes through here too, which is why the
     // offset check below can assume there is a line to be past.
     if offset == 1 && total <= limit && content.len() <= MAX_READ_BYTES {
+        reads.saw(resolve_for_sandbox(filepath)?, content.as_bytes());
         return Ok(json!({
             "success": true,
             "content": content,
@@ -1051,6 +1133,9 @@ fn read_file(
         }));
     }
 
+    // Part of the file counts as reading it — see [`FileReads`] — but the
+    // hash is of all of it, so a change anywhere still calls for a reread.
+    reads.saw(resolve_for_sandbox(filepath)?, content.as_bytes());
     let kept: Vec<&str> = content.lines().skip(offset - 1).take(limit).collect();
 
     // Whole lines for as long as they fit, so `last_line` keeps meaning what
@@ -1414,6 +1499,7 @@ fn replace_in_file(
     replace: &str,
     replace_all: bool,
     sandbox: bool,
+    reads: &FileReads,
 ) -> Result<serde_json::Value> {
     // The bound comes before the existence check, so a path outside the
     // sandbox is refused on its own terms rather than reporting whether a
@@ -1431,6 +1517,9 @@ fn replace_in_file(
     }
 
     let mut content = fs::read_to_string(&path)?;
+    if let Some(refusal) = reads.refusal(&path, content.as_bytes()) {
+        return Ok(refusal);
+    }
 
     // An empty search matches between every character, and `replace` would
     // splice the replacement in at all of them.
@@ -1462,7 +1551,8 @@ fn replace_in_file(
     }
 
     content = content.replace(search, replace);
-    fs::write(&path, content)?;
+    fs::write(&path, &content)?;
+    reads.saw(path, content.as_bytes());
 
     Ok(json!({
         "success": true,
@@ -1957,12 +2047,20 @@ mod tests {
         name
     }
 
+    /// A record of a session that has read `name`, as a change to it needs.
+    fn read_first(name: &str) -> FileReads {
+        let reads = FileReads::default();
+        let read = read_file(name, None, None, &reads).unwrap();
+        assert_eq!(read["success"], true, "{read}");
+        reads
+    }
+
     #[test]
     fn a_file_under_the_limit_comes_back_exactly_as_it_sits_on_disk() {
         // The guard on the rejoin: a turn that reads a file and writes it
         // back must not lose its trailing newline on the way through.
         let name = scratch("whole", "one\ntwo\nthree\n");
-        let result = read_file(&name, None, None).unwrap();
+        let result = read_file(&name, None, None, &FileReads::default()).unwrap();
         fs::remove_file(&name).ok();
 
         assert_eq!(result["success"], true, "{result}");
@@ -1979,7 +2077,7 @@ mod tests {
         // every request for the rest of the conversation.
         let body: String = (1..=50).map(|n| format!("line {n}\n")).collect();
         let name = scratch("cut", &body);
-        let result = read_file(&name, None, Some(10)).unwrap();
+        let result = read_file(&name, None, Some(10), &FileReads::default()).unwrap();
         fs::remove_file(&name).ok();
 
         assert_eq!(result["success"], true, "{result}");
@@ -2003,7 +2101,7 @@ mod tests {
             .collect();
         assert!(body.len() > MAX_READ_BYTES);
         let name = scratch("bytes", &body);
-        let result = read_file(&name, None, None).unwrap();
+        let result = read_file(&name, None, None, &FileReads::default()).unwrap();
         fs::remove_file(&name).ok();
 
         let content = result["content"].as_str().unwrap();
@@ -2030,7 +2128,7 @@ mod tests {
         // single line of megabytes, and is under every line limit there is.
         let body = "a".repeat(300_000);
         let name = scratch("minified", &body);
-        let result = read_file(&name, None, None).unwrap();
+        let result = read_file(&name, None, None, &FileReads::default()).unwrap();
         fs::remove_file(&name).ok();
 
         assert_eq!(result["success"], true, "{result}");
@@ -2049,7 +2147,7 @@ mod tests {
         // offset, so the ceiling lands mid-character and has to walk back.
         let body = format!("x{}", "é".repeat(200_000));
         let name = scratch("wide", &body);
-        let result = read_file(&name, None, None).unwrap();
+        let result = read_file(&name, None, None, &FileReads::default()).unwrap();
         fs::remove_file(&name).ok();
 
         let content = result["content"].as_str().unwrap();
@@ -2065,9 +2163,9 @@ mod tests {
     fn offset_carries_on_from_where_the_last_read_stopped() {
         let body: String = (1..=50).map(|n| format!("line {n}\n")).collect();
         let name = scratch("page", &body);
-        let first = read_file(&name, None, Some(10)).unwrap();
+        let first = read_file(&name, None, Some(10), &FileReads::default()).unwrap();
         let last = first["last_line"].as_u64().unwrap() as usize;
-        let second = read_file(&name, Some(last + 1), Some(10)).unwrap();
+        let second = read_file(&name, Some(last + 1), Some(10), &FileReads::default()).unwrap();
         fs::remove_file(&name).ok();
 
         assert_eq!(second["offset"], 11);
@@ -2080,7 +2178,7 @@ mod tests {
     fn the_last_page_of_a_file_is_not_marked_truncated() {
         let body: String = (1..=12).map(|n| format!("line {n}\n")).collect();
         let name = scratch("tail", &body);
-        let result = read_file(&name, Some(11), Some(10)).unwrap();
+        let result = read_file(&name, Some(11), Some(10), &FileReads::default()).unwrap();
         fs::remove_file(&name).ok();
 
         assert_eq!(result["lines"], 2);
@@ -2096,7 +2194,7 @@ mod tests {
         // Refused rather than answered with nothing: an empty result reads
         // as an empty file, and the model would move on believing it.
         let name = scratch("past", "one\ntwo\n");
-        let result = read_file(&name, Some(99), None).unwrap();
+        let result = read_file(&name, Some(99), None, &FileReads::default()).unwrap();
         fs::remove_file(&name).ok();
 
         assert_eq!(result["success"], false, "{result}");
@@ -2109,7 +2207,7 @@ mod tests {
     #[test]
     fn an_empty_file_reads_as_empty_rather_than_past_the_end() {
         let name = scratch("empty", "");
-        let result = read_file(&name, None, None).unwrap();
+        let result = read_file(&name, None, None, &FileReads::default()).unwrap();
         fs::remove_file(&name).ok();
 
         assert_eq!(result["success"], true, "{result}");
@@ -2122,7 +2220,7 @@ mod tests {
         // Zero is the off-by-one a model reaching for an array index makes,
         // and answering it would silently hand back the wrong line.
         let name = scratch("zero", "one\ntwo\n");
-        let result = read_file(&name, Some(0), None).unwrap();
+        let result = read_file(&name, Some(0), None, &FileReads::default()).unwrap();
         fs::remove_file(&name).ok();
 
         assert_eq!(result["success"], false, "{result}");
@@ -2292,7 +2390,15 @@ mod tests {
         // The gap this closes: `replace_in_file` had no bound at all, so it
         // could rewrite any existing file the process could open, while
         // `write_file` beside it was checked.
-        let result = replace_in_file(&outside_the_sandbox(), "a", "b", false, true).unwrap();
+        let result = replace_in_file(
+            &outside_the_sandbox(),
+            "a",
+            "b",
+            false,
+            true,
+            &FileReads::default(),
+        )
+        .unwrap();
 
         assert_eq!(result["success"], false);
         assert!(
@@ -2306,7 +2412,15 @@ mod tests {
         // With the sandbox off the same path gets past the bound and fails
         // on its own terms, which is how this knows the refusal above came
         // from the bound rather than from the file simply being missing.
-        let result = replace_in_file(&outside_the_sandbox(), "a", "b", false, false).unwrap();
+        let result = replace_in_file(
+            &outside_the_sandbox(),
+            "a",
+            "b",
+            false,
+            false,
+            &FileReads::default(),
+        )
+        .unwrap();
 
         assert_eq!(result["success"], false);
         assert!(
@@ -2319,8 +2433,9 @@ mod tests {
     fn replace_in_file_rewrites_a_file_inside_the_workspace() {
         let name = format!("clank-sandbox-test-{}-replace.txt", std::process::id());
         fs::write(&name, "before").unwrap();
+        let reads = read_first(&name);
 
-        let result = replace_in_file(&name, "before", "after", false, true).unwrap();
+        let result = replace_in_file(&name, "before", "after", false, true, &reads).unwrap();
 
         assert_eq!(result["success"], true, "{result}");
         assert_eq!(fs::read_to_string(&name).unwrap(), "after");
@@ -2331,9 +2446,10 @@ mod tests {
     fn replace_in_file_changes_one_place_unless_told_every_one() {
         let name = format!("clank-replace-test-{}-unique.txt", std::process::id());
         fs::write(&name, "let x = 1;\nlet y = 1;\n").unwrap();
+        let reads = read_first(&name);
 
         // Matching twice is refused, says so, and leaves the file alone.
-        let refused = replace_in_file(&name, "= 1", "= 2", false, true).unwrap();
+        let refused = replace_in_file(&name, "= 1", "= 2", false, true, &reads).unwrap();
         assert_eq!(refused["success"], false, "{refused}");
         assert!(
             refused["error"].as_str().unwrap().contains("found 2 times"),
@@ -2345,7 +2461,7 @@ mod tests {
         );
 
         // Widened to one place, it goes through.
-        let one = replace_in_file(&name, "y = 1", "y = 2", false, true).unwrap();
+        let one = replace_in_file(&name, "y = 1", "y = 2", false, true, &reads).unwrap();
         assert_eq!(one["success"], true, "{one}");
         assert_eq!(
             fs::read_to_string(&name).unwrap(),
@@ -2354,21 +2470,99 @@ mod tests {
 
         // Asked for every one, it changes every one and counts them.
         fs::write(&name, "a a a").unwrap();
-        let all = replace_in_file(&name, "a", "b", true, true).unwrap();
+        let reads = read_first(&name);
+        let all = replace_in_file(&name, "a", "b", true, true, &reads).unwrap();
         assert_eq!(all["message"], "File updated in 3 places", "{all}");
         assert_eq!(fs::read_to_string(&name).unwrap(), "b b b");
 
         // An empty search would match everywhere; it is refused.
-        let empty = replace_in_file(&name, "", "x", true, true).unwrap();
+        let empty = replace_in_file(&name, "", "x", true, true, &reads).unwrap();
         assert_eq!(empty["success"], false, "{empty}");
         assert_eq!(fs::read_to_string(&name).unwrap(), "b b b");
         fs::remove_file(&name).ok();
     }
 
     #[test]
+    fn an_existing_file_is_changed_only_after_it_has_been_read() {
+        let name = scratch("unread", "kept\n");
+        let reads = FileReads::default();
+
+        // Neither an overwrite nor a replace touches a file never read.
+        let overwrite = write_file(&name, "guess\n", "write", true, &reads).unwrap();
+        let replace = replace_in_file(&name, "kept", "guess", false, true, &reads).unwrap();
+        for refused in [&overwrite, &replace] {
+            assert_eq!(refused["success"], false, "{refused}");
+            assert!(
+                refused["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("hasn't been read"),
+                "{refused}"
+            );
+        }
+        assert_eq!(fs::read_to_string(&name).unwrap(), "kept\n");
+
+        // An append loses nothing, so it needs no read.
+        let append = write_file(&name, "more\n", "append", true, &reads).unwrap();
+        assert_eq!(append["success"], true, "{append}");
+
+        // Part of a file is enough, and the session's own writes count as
+        // reads, so it can go on editing what it just wrote.
+        let part = read_file(&name, Some(2), Some(1), &reads).unwrap();
+        assert_eq!(part["content"], "more", "{part}");
+        let first = replace_in_file(&name, "kept", "edited", false, true, &reads).unwrap();
+        assert_eq!(first["success"], true, "{first}");
+        let second = write_file(&name, "rewritten\n", "write", true, &reads).unwrap();
+        assert_eq!(second["success"], true, "{second}");
+
+        // A new file needs no read: there is nothing in it to lose.
+        let fresh = format!("clank-read-test-{}-fresh.txt", std::process::id());
+        let created = write_file(&fresh, "new\n", "write", true, &FileReads::default()).unwrap();
+        assert_eq!(created["success"], true, "{created}");
+
+        // Forgotten, as on compaction, the read is needed again.
+        reads.forget();
+        let after = replace_in_file(&name, "rewritten", "x", false, true, &reads).unwrap();
+        assert_eq!(after["success"], false, "{after}");
+
+        fs::remove_file(&name).ok();
+        fs::remove_file(&fresh).ok();
+    }
+
+    #[test]
+    fn a_file_changed_since_it_was_read_is_read_again_first() {
+        let name = scratch("changed", "one\n");
+        let reads = read_first(&name);
+
+        // Someone else edits it.
+        fs::write(&name, "two\n").unwrap();
+        let replace = replace_in_file(&name, "two", "three", false, true, &reads).unwrap();
+        let overwrite = write_file(&name, "three\n", "write", true, &reads).unwrap();
+        for refused in [&replace, &overwrite] {
+            assert_eq!(refused["success"], false, "{refused}");
+            assert!(
+                refused["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("changed since you read it"),
+                "{refused}"
+            );
+        }
+        assert_eq!(fs::read_to_string(&name).unwrap(), "two\n");
+
+        // Rewritten with the same text is not a change: no reread needed.
+        let reads = read_first(&name);
+        fs::write(&name, "two\n").unwrap();
+        let same = replace_in_file(&name, "two", "three", false, true, &reads).unwrap();
+        assert_eq!(same["success"], true, "{same}");
+
+        fs::remove_file(&name).ok();
+    }
+
+    #[test]
     fn write_file_refuses_outside_the_sandbox_and_allows_inside_it() {
         let outside = outside_the_sandbox();
-        let refused = write_file(&outside, "x", "write", true).unwrap();
+        let refused = write_file(&outside, "x", "write", true, &FileReads::default()).unwrap();
         assert_eq!(refused["success"], false, "{refused}");
         // Refused before anything was created — not even the directory the
         // write would have needed.
@@ -2377,7 +2571,7 @@ mod tests {
         // A relative path resolves against the working directory, which is
         // inside the bound.
         let inside = format!("clank-sandbox-test-{}-write.txt", std::process::id());
-        let allowed = write_file(&inside, "x", "write", true).unwrap();
+        let allowed = write_file(&inside, "x", "write", true, &FileReads::default()).unwrap();
         assert_eq!(allowed["success"], true, "{allowed}");
         fs::remove_file(&inside).ok();
     }
@@ -2388,7 +2582,7 @@ mod tests {
         // message that restated the path printed it twice under the call
         // that already named it in its header.
         let name = format!("clank-write-test-{}-once.txt", std::process::id());
-        let result = write_file(&name, "x", "write", true).unwrap();
+        let result = write_file(&name, "x", "write", true, &FileReads::default()).unwrap();
         fs::remove_file(&name).ok();
 
         assert_eq!(result["success"], true, "{result}");
@@ -2418,7 +2612,14 @@ mod tests {
         }
 
         let under_home = home.join(format!("clank-sandbox-test-{}-sibling", std::process::id()));
-        let result = write_file(under_home.to_str().unwrap(), "x", "write", true).unwrap();
+        let result = write_file(
+            under_home.to_str().unwrap(),
+            "x",
+            "write",
+            true,
+            &FileReads::default(),
+        )
+        .unwrap();
 
         assert_eq!(result["success"], false, "{result}");
         assert!(!under_home.exists(), "nothing may be created on a refusal");
@@ -2432,7 +2633,7 @@ mod tests {
             "{}/../../../../../../clank-sandbox-should-never-exist",
             std::env::current_dir().unwrap().display()
         );
-        let result = write_file(&escape, "x", "write", true).unwrap();
+        let result = write_file(&escape, "x", "write", true, &FileReads::default()).unwrap();
         assert_eq!(result["success"], false, "{result}");
     }
 
