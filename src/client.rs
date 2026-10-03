@@ -27,6 +27,10 @@ pub(crate) fn sort_model_ids(ids: &mut [String]) {
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
 pub struct ChatMessage {
     pub role: String,
+    /// `None` (a tool-calls-only turn) goes out as `""`, not `null`: Ollama's
+    /// OpenAI shim rejects a null content ("invalid message content type:
+    /// <nil>"), and an empty string is accepted everywhere.
+    #[serde(serialize_with = "serialize_content")]
     pub content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
@@ -60,6 +64,13 @@ pub struct ChatMessage {
     /// nothing changes for them.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_details: Option<Vec<serde_json::Value>>,
+}
+
+fn serialize_content<S: serde::Serializer>(
+    content: &Option<String>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    serializer.serialize_str(content.as_deref().unwrap_or(""))
 }
 
 impl ChatMessage {
