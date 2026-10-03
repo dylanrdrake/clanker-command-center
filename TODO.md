@@ -9,9 +9,13 @@
      before editing, find with `search_files`, keep changes small, unique
      `replace_in_file` searches, test when the terminal is on, and report
      failures and unchecked work plainly.
-  3. Load `AGENTS.md` (or `CLAUDE.md`) from the clanker's directory into the
-     system prompt, so a repo's conventions reach every turn — the open
-     convention, so repos set up for other agents work here too.
+  3. ~~Project instructions~~ — done as `CLANKERS.md`, from the clanker's
+     own directory only, re-read every turn, never truncated (a notice past
+     40,000 characters, as Claude Code does). Possibly later: files in
+     subdirectories delivered when the agent first touches them, a personal
+     `~/.clank/CLANKERS.md`, `@path` imports, reading `AGENTS.md`/`CLAUDE.md`
+     too. And coordinating clankers deployed to one directory, through the
+     database rather than the file.
   4. A build/test loop by default. `run_terminal_command` is `never` until
      enabled, so a default clanker can edit code but never compile or test
      it. Something like a per-clanker allowlist (`cargo test`, `npm test`).

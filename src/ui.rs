@@ -53,6 +53,36 @@ pub fn summarize(text: &str, max: usize) -> String {
     }
 }
 
+/// What to say about CLANKERS.md, given what the last turn found and what
+/// this one did: nothing when that hasn't changed.
+pub fn instructions_notice(
+    before: Option<crate::instructions::Seen>,
+    now: Option<crate::instructions::Seen>,
+) -> Option<String> {
+    use crate::instructions::{FILE, LARGE_CHARS};
+    let size = |seen: crate::instructions::Seen| {
+        let mut size = format!(
+            "{} characters, about {} tokens",
+            format_tokens(seen.chars as i64),
+            format_tokens(seen.chars.div_ceil(4) as i64)
+        );
+        if seen.chars > LARGE_CHARS {
+            size.push_str(&format!(" {DASH} large, and sent whole with every request"));
+        }
+        size
+    };
+    match (before, now) {
+        (before, now) if before == now => None,
+        (None, Some(now)) => Some(format!("Following {FILE} {DOT} {}", size(now))),
+        (Some(_), Some(now)) => Some(format!(
+            "{FILE} changed {DOT} following the new version, {}",
+            size(now)
+        )),
+        (Some(_), None) => Some(format!("{FILE} is gone {DOT} no longer following it")),
+        (None, None) => None,
+    }
+}
+
 /// Whether a tool's result says it failed, though it ran: a built-in's
 /// `"success": false`, or the bare `error` an `Err` or a failing MCP tool
 /// is reported as. Read from the result because the call itself finishing
@@ -1293,6 +1323,12 @@ pub enum AgentEvent {
     Steered { text: String },
     /// The model answered without requesting tools, so the turn is over.
     TurnFinished,
+    /// What the turn found of CLANKERS.md, sent at its start: `None` when
+    /// there is none. Every turn, so a front end can say when it appears,
+    /// changes or goes — see [`instructions_notice`].
+    Instructions {
+        seen: Option<crate::instructions::Seen>,
+    },
 }
 
 /// A tool call waiting on a yes/no decision before it runs.
@@ -1328,6 +1364,32 @@ pub trait AgentUi {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn instructions_are_announced_when_they_appear_change_or_go() {
+        use super::instructions_notice;
+        use crate::instructions::Seen;
+        let small = Seen::of("Use tabs.");
+        let edited = Seen::of("Use spaces.");
+        assert_eq!(
+            instructions_notice(None, Some(small)).as_deref(),
+            Some("Following CLANKERS.md ∙ 9 characters, about 3 tokens")
+        );
+        // The same file turn after turn says nothing.
+        assert_eq!(instructions_notice(Some(small), Some(small)), None);
+        assert!(instructions_notice(Some(small), Some(edited))
+            .unwrap()
+            .starts_with("CLANKERS.md changed"));
+        assert!(instructions_notice(Some(small), None)
+            .unwrap()
+            .starts_with("CLANKERS.md is gone"));
+        assert_eq!(instructions_notice(None, None), None);
+        // Large is said, not acted on: the file is still sent whole.
+        let large = Seen::of(&"x".repeat(40_001));
+        assert!(instructions_notice(None, Some(large))
+            .unwrap()
+            .ends_with("large, and sent whole with every request"));
+    }
 
     #[test]
     fn a_tool_failed_when_its_result_says_so() {

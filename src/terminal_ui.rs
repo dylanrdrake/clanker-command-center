@@ -110,6 +110,9 @@ pub struct TerminalAgentUi {
     /// picker's rows draw. `None` for a one-off run, which has no
     /// session to be identified by; that falls back to a plain marker.
     mark: Option<String>,
+    /// What the last turn found of CLANKERS.md, so a notice is printed only
+    /// when it appears, changes or goes.
+    instructions: Option<crate::instructions::Seen>,
 }
 
 impl TerminalAgentUi {
@@ -132,6 +135,7 @@ impl TerminalAgentUi {
             approval_shown: false,
             activity: None,
             mark: None,
+            instructions: None,
         }
     }
 
@@ -284,6 +288,12 @@ impl TerminalAgentUi {
             AgentEvent::Error { message } => {
                 println!("{} {}", "✗".red(), message);
                 println!();
+            }
+            AgentEvent::Instructions { seen } => {
+                if let Some(notice) = crate::ui::instructions_notice(self.instructions, seen) {
+                    println!("{}", notice.bright_black());
+                }
+                self.instructions = seen;
             }
             AgentEvent::TurnFinished => {
                 if self.verbose {

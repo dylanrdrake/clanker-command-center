@@ -1,5 +1,6 @@
 use crate::client::{ChatMessage, Client, StreamEvent, Usage};
 use crate::config::{SessionGates, ToolAccess, ToolAccessSettings};
+use crate::instructions;
 use crate::tools::{execute_tool, get_tool_definitions};
 use crate::ui::{AgentEvent, AgentUi, ApprovalRequest};
 use anyhow::Result;
@@ -39,7 +40,9 @@ same call.
 - Report what actually happened. Say what you changed, and say plainly if something failed, was \
 skipped, or wasn't checked. Never claim a build or test passed that you didn't run.
 - If the request is genuinely ambiguous, or the change would destroy something, ask first. \
-Otherwise get on with it.";
+Otherwise get on with it.
+- When asked to record instructions for this project, put them in CLANKERS.md in the working \
+directory, which is given to you at the start of every turn.";
 
 /// Every earlier wording of [`AGENT_CHAT_SYSTEM_PROMPT`]. Sessions from
 /// before the prompt was prepended per request have one stored in their
@@ -126,11 +129,12 @@ async fn request_turn(
     model: &str,
     temperature: Option<f32>,
     tools: Option<Vec<serde_json::Value>>,
+    system: Option<&str>,
     effort_level: Option<String>,
     stream: bool,
     usage: &UsageTracker,
 ) -> Result<ChatMessage> {
-    normalize_system_prompt(&mut messages, tools.is_some());
+    normalize_system_prompt(&mut messages, system);
 
     // Passed in rather than read off the client: streaming is a per-session
     // setting now, and one client is shared by every session in a process.
@@ -209,19 +213,21 @@ async fn request_turn(
 /// (`agentic`, i.e. tools are in play). This heals an already-poisoned
 /// session automatically, the same way `strip_dangling_reasoning` does for
 /// reasoning content, without needing to touch what's actually persisted.
-fn normalize_system_prompt(messages: &mut Vec<ChatMessage>, agentic: bool) {
+fn normalize_system_prompt(messages: &mut Vec<ChatMessage>, system: Option<&str>) {
     messages.retain(|m| {
+        // `starts_with`, so a copy with CLANKERS.md after it is ours too.
         let ours = |text: &str| {
-            text == AGENT_CHAT_SYSTEM_PROMPT || PREVIOUS_AGENT_CHAT_SYSTEM_PROMPTS.contains(&text)
+            text.starts_with(AGENT_CHAT_SYSTEM_PROMPT)
+                || PREVIOUS_AGENT_CHAT_SYSTEM_PROMPTS.contains(&text)
         };
         !(m.role == "system" && m.content.as_deref().is_some_and(ours))
     });
-    if agentic {
+    if let Some(system) = system {
         messages.insert(
             0,
             ChatMessage {
                 role: "system".to_string(),
-                content: Some(AGENT_CHAT_SYSTEM_PROMPT.to_string()),
+                content: Some(system.to_string()),
                 ..Default::default()
             },
         );
@@ -266,6 +272,7 @@ pub async fn run_chat_turn(
         messages.clone(),
         model,
         temperature,
+        None,
         None,
         effort_level.clone(),
         stream,
@@ -459,6 +466,19 @@ pub async fn run_agent_turn(
     })?;
 
     let tool_definitions = offered_tools(&gates.access());
+
+    // Read once for the whole turn: an edit reaches the next turn, while
+    // this one's requests keep a single prefix for the cache. From the
+    // process's directory, which is the clanker's, as the tools' paths are.
+    let project = std::env::current_dir()
+        .ok()
+        .and_then(|dir| instructions::load(&dir));
+    ui.event(AgentEvent::Instructions {
+        seen: project.as_deref().map(instructions::Seen::of),
+    })
+    .await;
+    let system = instructions::system_prompt(AGENT_CHAT_SYSTEM_PROMPT, project.as_deref());
+
     let mut iteration = 0;
     let mut final_response = None;
 
@@ -490,6 +510,7 @@ pub async fn run_agent_turn(
             model,
             temperature,
             Some(tool_definitions.clone()),
+            Some(&system),
             effort_level.clone(),
             stream,
             usage,
@@ -988,7 +1009,7 @@ mod tests {
     #[test]
     fn normalize_system_prompt_prepends_it_fresh_for_an_agentic_turn() {
         let mut messages = vec![user("hi"), assistant("hello")];
-        normalize_system_prompt(&mut messages, true);
+        normalize_system_prompt(&mut messages, Some(AGENT_CHAT_SYSTEM_PROMPT));
         assert_eq!(messages[0].role, "system");
         assert_eq!(
             messages[0].content.as_deref(),
@@ -1000,7 +1021,7 @@ mod tests {
     #[test]
     fn normalize_system_prompt_adds_nothing_for_a_plain_turn() {
         let mut messages = vec![user("hi"), assistant("hello")];
-        normalize_system_prompt(&mut messages, false);
+        normalize_system_prompt(&mut messages, None);
         assert_eq!(messages.len(), 2);
         assert!(messages.iter().all(|m| m.role != "system"));
     }
@@ -1019,7 +1040,7 @@ mod tests {
         };
         let mut messages = vec![user("hi"), assistant("hello"), stray, user("again")];
 
-        normalize_system_prompt(&mut messages, false);
+        normalize_system_prompt(&mut messages, None);
         assert!(messages.iter().all(|m| m.role != "system"));
         assert_eq!(messages.len(), 3);
 
@@ -1033,11 +1054,30 @@ mod tests {
             },
             user("again"),
         ];
-        normalize_system_prompt(&mut messages, true);
+        normalize_system_prompt(&mut messages, Some(AGENT_CHAT_SYSTEM_PROMPT));
         // Exactly one copy, and it's the fresh one at the front — not the
         // stray one left in place.
         assert_eq!(messages.iter().filter(|m| m.role == "system").count(), 1);
         assert_eq!(messages[0].role, "system");
+    }
+
+    #[test]
+    fn normalize_system_prompt_strips_a_copy_carrying_clankers_md() {
+        let with_file =
+            crate::instructions::system_prompt(AGENT_CHAT_SYSTEM_PROMPT, Some("Use tabs."));
+        let mut messages = vec![
+            ChatMessage {
+                role: "system".to_string(),
+                content: Some(with_file),
+                ..Default::default()
+            },
+            user("hi"),
+        ];
+        // The file has since gone: the copy that carried it goes too.
+        normalize_system_prompt(&mut messages, Some(AGENT_CHAT_SYSTEM_PROMPT));
+        let system: Vec<_> = messages.iter().filter(|m| m.role == "system").collect();
+        assert_eq!(system.len(), 1);
+        assert_eq!(system[0].content.as_deref(), Some(AGENT_CHAT_SYSTEM_PROMPT));
     }
 
     #[test]
@@ -1050,7 +1090,7 @@ mod tests {
             ..Default::default()
         };
         let mut messages = vec![old, user("hi")];
-        normalize_system_prompt(&mut messages, true);
+        normalize_system_prompt(&mut messages, Some(AGENT_CHAT_SYSTEM_PROMPT));
         let system: Vec<_> = messages.iter().filter(|m| m.role == "system").collect();
         assert_eq!(system.len(), 1);
         assert_eq!(system[0].content.as_deref(), Some(AGENT_CHAT_SYSTEM_PROMPT));

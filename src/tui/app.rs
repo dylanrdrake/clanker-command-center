@@ -167,6 +167,9 @@ pub struct App {
     /// here so `/diff` opens it through the same dispatch as every other
     /// command; its I/O is the event loop's to run, never `apply`'s.
     pub git: Option<GitPane>,
+    /// What the last turn found of CLANKERS.md, so the transcript says so
+    /// only when it appears, changes or goes.
+    instructions: Option<crate::instructions::Seen>,
     pub input: String,
     /// Byte index of the cursor within `input`. Kept on a char boundary.
     pub cursor: usize,
@@ -307,6 +310,7 @@ impl App {
             transcript: Vec::new(),
             model_browser: None,
             git: None,
+            instructions: None,
             // Overwritten from the configuration by whoever opens the
             // clanker; the fallback here is the same model an unset
             // `compactor` resolves to, so a status readout never says
@@ -616,6 +620,12 @@ impl App {
                 self.finish_streaming();
                 self.take_pending(&text);
                 self.transcript.push(TranscriptItem::User(text));
+            }
+            AgentEvent::Instructions { seen } => {
+                if let Some(notice) = crate::ui::instructions_notice(self.instructions, seen) {
+                    self.transcript.push(TranscriptItem::Notice(notice));
+                }
+                self.instructions = seen;
             }
             // Busy state is driven by Event::Busy, which brackets the whole
             // turn rather than each request within it.

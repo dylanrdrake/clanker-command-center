@@ -6,6 +6,7 @@ pub mod conversation;
 pub mod crypto;
 pub mod error_log;
 pub mod glyphs;
+pub mod instructions;
 pub mod mcp;
 pub mod session;
 pub mod spinner;

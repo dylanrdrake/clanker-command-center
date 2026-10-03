@@ -1116,6 +1116,26 @@ two processes from driving one clanker — see the note in TODO.
 working, awaiting approval, failed, or null for "nothing to say, read the
 messages."
 
+### Project instructions: `CLANKERS.md`
+
+A `CLANKERS.md` in the directory a clanker is deployed to is what you tell
+every clanker that works there: how to build and test, the style to keep,
+what not to touch. Plain Markdown, no format to follow.
+
+It goes to the model inside the agent system prompt, after CCC's own
+guidance and ranked above it, though not above what you say in the
+conversation. Only that one file is read: not one in a parent directory,
+and not one in a subdirectory the agent works in. It is read afresh at the
+start of every turn, so an edit reaches the next turn, while a turn's own
+requests share one cached prefix. The transcript says when it is first
+followed, when it changes and when it goes, with its size.
+
+It is never cut short. Over 40,000 characters the notice says it is large,
+because the whole file rides on every request; what to drop from it is
+yours to decide. Only clankers with tools read it, since a plain chat has
+no system prompt. Ask the agent to remember something about the project and
+it writes it there.
+
 ### Running a command yourself
 
 `$ cargo test` runs it here and now, in the clanker's directory, without

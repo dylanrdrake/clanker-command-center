@@ -6,6 +6,7 @@ mod conversation;
 mod crypto;
 mod error_log;
 mod glyphs;
+mod instructions;
 mod mcp;
 mod session;
 mod spinner;
