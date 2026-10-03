@@ -1,10 +1,10 @@
 # ⣕⣪ Clanker Command Center (WIP)
 
-test UPDATE
-
 An OpenAI-compatible CLI frontend for any LLM provider, with agentic tool capabilities, written in Rust. Defaults to OpenRouter, but works with any OpenAI-compatible service (OrcaRouter, Together, Groq, self-hosted gateways, etc) via `clank endpoint` — see [Using other providers](#using-other-providers).
 
 CCC is most stable on Linux at the moment!
+
+Worked usage patterns live in [EXAMPLES.md](EXAMPLES.md).
 
 ## Features
 
@@ -1554,36 +1554,9 @@ between them would eventually delete the wrong conversation.
 
 ## Examples
 
-### Generate and save code
-
-```bash
-clank "Write a function that calculates fibonacci numbers and save it to math.rs" --tools
-```
-
-### Multi-file project setup
-
-```bash
-clank "Create a basic Rust project structure with Cargo.toml, src/main.rs, and src/lib.rs" --tools
-```
-
-### Fix existing code
-
-```bash
-clank "Read main.rs, find any issues, and write a corrected version" --tools
-```
-
-### Using different models
-
-```bash
-# Claude for code review
-clank "Read app.rs and provide detailed code review feedback" --tools -m anthropic/claude-opus-4.5
-
-# GPT-4 for complex logic
-clank "Create an algorithm to solve the traveling salesman problem" --tools -m openai/gpt-4o
-
-# Adaptive routing (default)
-clank "Generate boilerplate code" --tools -m openrouter/auto
-```
+Worked usage patterns — code generation, multi-step workflows, interactive
+chat, model choice, tips — live in [EXAMPLES.md](EXAMPLES.md) to keep this
+reference from burying them.
 
 ## Building for Different Platforms
 
