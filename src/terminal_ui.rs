@@ -270,7 +270,11 @@ impl TerminalAgentUi {
                 // that ran with no prompt at all still needs its own
                 // closing marker.
                 if !self.approval_shown {
-                    self.close_tool_header("✓".green());
+                    self.close_tool_header(if crate::ui::tool_failed(&result) {
+                        "✗".red()
+                    } else {
+                        "✓".green()
+                    });
                 }
                 if self.verbose {
                     print_fields(&json_fields(&result));

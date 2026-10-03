@@ -53,6 +53,20 @@ pub fn summarize(text: &str, max: usize) -> String {
     }
 }
 
+/// Whether a tool's result says it failed, though it ran: a built-in's
+/// `"success": false`, or the bare `error` an `Err` or a failing MCP tool
+/// is reported as. Read from the result because the call itself finishing
+/// says nothing about whether it did what it was asked.
+pub fn tool_failed(result: &str) -> bool {
+    let Ok(serde_json::Value::Object(fields)) = serde_json::from_str(result) else {
+        return false;
+    };
+    match fields.get("success") {
+        Some(success) => success == false,
+        None => fields.contains_key("error"),
+    }
+}
+
 /// Splits a tool call's JSON arguments/result into `(field, value)` pairs,
 /// each value flattened and truncated for a single display line — the
 /// per-field detail both the approval prompt and verbose tool-call notices
@@ -1314,6 +1328,19 @@ pub trait AgentUi {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_tool_failed_when_its_result_says_so() {
+        use super::tool_failed;
+        assert!(tool_failed(r#"{"success":false,"error":"found 2 times"}"#));
+        assert!(tool_failed(r#"{"error":"User denied permission"}"#));
+        assert!(!tool_failed(r#"{"success":true}"#));
+        // A result that ran fine and happens to report on an error is not
+        // a failure: `success` speaks for it when it is there.
+        assert!(!tool_failed(r#"{"success":true,"error":"none"}"#));
+        // Plain text, which an MCP tool returns, is a result, not a failure.
+        assert!(!tool_failed("all good"));
+    }
 
     #[test]
     fn classify_recognizes_highlight() {

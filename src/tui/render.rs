@@ -951,6 +951,11 @@ fn render_item(
                 ToolStatus::AwaitingApproval => Some(("?", Style::new().yellow())),
                 ToolStatus::Running => None,
                 ToolStatus::Denied => Some(("✗", Style::new().red())),
+                // Ran but didn't do it — a refused edit, a missing file —
+                // which a tick would pass off as having worked.
+                ToolStatus::Done { result } if crate::ui::tool_failed(result) => {
+                    Some(("✗", Style::new().red()))
+                }
                 ToolStatus::Done { .. } => Some(("✓", Style::new().green())),
             };
             let mut header = vec![Span::styled(name.clone(), Style::new().bold())];
@@ -1080,7 +1085,9 @@ fn render_item(
                     ToolAccess::Never => ("✗", Style::new().dark_gray()),
                 };
                 lines.push(Line::from(vec![
-                    Span::styled(format!("      {name:<width$}"), Style::new().dark_gray()),
+                    // A space after the column, so the longest name doesn't
+                    // run into its mark.
+                    Span::styled(format!("      {name:<width$} "), Style::new().dark_gray()),
                     Span::styled(format!("{mark} {}", state.label()), style),
                 ]));
             }
@@ -3409,6 +3416,21 @@ mod tests {
     }
 
     #[test]
+    fn a_tool_call_that_ran_but_failed_is_not_ticked() {
+        let mut app = App::new("m".to_string(), None, "id".to_string());
+        app.transcript.push(TranscriptItem::ToolCall {
+            name: "replace_in_file".into(),
+            arguments: r#"{"filepath":"a.rs"}"#.into(),
+            status: ToolStatus::Done {
+                result: r#"{"success":false,"error":"found 2 times"}"#.into(),
+            },
+        });
+        let out = render_to_string(&app, 70, 12);
+        assert!(out.contains('✗'), "{out}");
+        assert!(!out.contains('✓'), "{out}");
+    }
+
+    #[test]
     fn tool_call_gutter_is_generic_and_status_trails_the_line() {
         let mut app = App::new("m".to_string(), None, "id".to_string());
         app.transcript.push(TranscriptItem::ToolCall {
@@ -3517,6 +3539,8 @@ mod tests {
         assert!(out.contains("! allow"), "{out}");
         assert!(out.contains("✓ ask"), "{out}");
         assert!(out.contains("✗ never"), "{out}");
+        // The longest name still keeps a space before its mark.
+        assert!(out.contains("run_terminal_command ✗"), "{out}");
     }
 
     #[test]
