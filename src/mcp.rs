@@ -517,6 +517,7 @@ pub struct StdioServer {
     child: Mutex<Option<tokio::process::Child>>,
     /// The child's process group, when it could be put in one of its own.
     /// `None` on platforms where that isn't how processes are grouped.
+    #[cfg_attr(not(unix), allow(dead_code))]
     group: Option<u32>,
 }
 
