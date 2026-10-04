@@ -9,8 +9,8 @@
 //! Kept free of I/O: the caller loads sessions and acts on the
 //! [`Activation`] returned when a row is chosen.
 
-use super::render::{band, draw_rule, home_relative, identicon, pad_to};
-use crate::glyphs::{DASH, DOT, DOWN, ELLIPSIS, LEFT, RIGHT, UP};
+use super::render::{band, clip, display_width, draw_rule, home_relative, identicon, pad_to};
+use crate::glyphs::{DASH, DOT, DOWN, LEFT, RIGHT, UP};
 use crate::store::{mode_label, Activity, LastMessage, LastState, SessionSummary, KIND_AGENT_CHAT};
 use ratatui::prelude::*;
 use ratatui::widgets::Paragraph;
@@ -175,18 +175,13 @@ fn state_badge(state: LastState, held: bool, tick: usize) -> (String, Style) {
 
 // Fixed columns, so the preview can be given whatever the line has left.
 const MARK_WIDTH: usize = 2 + ICON_WIDTH + 1; // selection marker, mark, gap
-                                              // One glyph and a gutter. `mode_label` returns a two-column emoji that
-                                              // `column` pads as one `char`, so the cell draws a column wider than this
-                                              // says — harmlessly, since every row carries one and they stay aligned with
-                                              // each other.
-const KIND_WIDTH: usize = 3;
+/// One glyph and a gutter: `mode_label` returns a two-cell emoji.
+const KIND_WIDTH: usize = 4;
 const TITLE_WIDTH: usize = 24;
 const DIR_WIDTH: usize = 24;
 const WHEN_WIDTH: usize = 8;
-/// Same misalignment tradeoff as `KIND_WIDTH`: `🪙 ` is a two-column glyph
-/// that `column` pads as one `char`, drawing a column wider than this says —
-/// harmless, since every row carries exactly one.
-const TOKENS_WIDTH: usize = 9;
+/// `🪙 12.3k` and a gutter, the coin being two cells.
+const TOKENS_WIDTH: usize = 10;
 
 /// Below this a preview says too little to be worth the clutter.
 const MIN_PREVIEW: usize = 12;
@@ -480,10 +475,10 @@ pub fn draw(
                     const LABEL: &str = " to: ";
                     spans.push(Span::styled(LABEL, base.green()));
                     spans.push(Span::styled(
-                        truncate(
+                        clip(
                             &home_relative(dir),
                             width.saturating_sub(
-                                marker.len() + "Deploy clanker".len() + LABEL.len(),
+                                display_width(marker) + "Deploy clanker".len() + LABEL.len(),
                             ),
                         ),
                         Style::new().dark_gray(),
@@ -558,7 +553,7 @@ pub fn draw(
                     let room = width.saturating_sub(used + 2);
                     if room >= MIN_PREVIEW {
                         spans.push(Span::styled(
-                            format!("  {}", truncate(&preview, room)),
+                            format!("  {}", clip(&preview, room)),
                             Style::new().dark_gray().italic(),
                         ));
                     }
@@ -602,7 +597,7 @@ pub fn draw(
                 format!(
                     " delete clanker {} ({})? ",
                     row.short_id(),
-                    truncate(&row.title, 30)
+                    clip(&row.title, 30)
                 ),
                 Style::new().red().bold(),
             ),
@@ -1067,32 +1062,13 @@ fn format_tokens_compact(n: i64) -> String {
     format!("{:.1}M", n as f64 / 1_000_000.0)
 }
 
-/// One cell of the row grid: the text truncated to fit and padded out to
-/// `width`, always leaving a two-space gutter so a full-width value can't
-/// run into the column after it.
+/// One cell of the row grid: the text clipped to fit and padded out to
+/// `width` cells, always leaving a two-space gutter so a full-width value
+/// can't run into the column after it.
 fn column(text: &str, width: usize) -> String {
-    let text = truncate(text, width.saturating_sub(2));
-    format!("{text:<width$}")
-}
-
-/// At most `max` characters, the ellipsis included — it replaces the last
-/// character kept rather than being added past the limit, so a caller that
-/// sized a column or the room left on a line gets something that fits it.
-fn truncate(text: &str, max: usize) -> String {
-    let flat: String = text
-        .chars()
-        .map(|c| if c == '\n' { ' ' } else { c })
-        .collect();
-    if flat.chars().count() <= max {
-        return flat;
-    }
-    match max {
-        0 => String::new(),
-        _ => format!(
-            "{}{ELLIPSIS}",
-            flat.chars().take(max - 1).collect::<String>()
-        ),
-    }
+    let text = clip(text, width.saturating_sub(2));
+    let pad = width.saturating_sub(display_width(&text));
+    format!("{text}{}", " ".repeat(pad))
 }
 
 /// Coarse "how long ago", enough to tell yesterday's work from this
@@ -1134,35 +1110,27 @@ mod tests {
     }
 
     #[test]
-    fn truncate_never_exceeds_its_limit() {
-        // The ellipsis takes the place of a kept character. Returning max + 1
-        // used to be enough to wrap a row whose preview was sized to the
-        // space left on the line.
-        assert_eq!(truncate("abcdefgh", 4).chars().count(), 4);
-        assert_eq!(truncate("abcdefgh", 4), "abc⋯");
-        assert_eq!(truncate("abcd", 4), "abcd");
-        assert_eq!(truncate("abc", 4), "abc");
-        assert_eq!(truncate("abc", 1), "⋯");
-        assert_eq!(truncate("abc", 0), "");
-    }
-
-    #[test]
-    fn truncate_counts_characters_not_bytes() {
-        assert_eq!(truncate("ünïcödé test", 6).chars().count(), 6);
-    }
-
-    #[test]
-    fn truncate_flattens_newlines() {
-        assert_eq!(truncate("two\nlines", 20), "two lines");
-    }
-
-    #[test]
     fn column_pads_short_values_and_keeps_a_gutter() {
         assert_eq!(column("chat", 7), "chat   ");
         // A value wider than its column still can't touch the next one.
         let cell = column("~/code/some/very/long/path", 24);
         assert_eq!(cell.chars().count(), 24);
         assert!(cell.ends_with("  "), "no gutter left in {cell:?}");
+    }
+
+    #[test]
+    fn columns_are_measured_in_cells() {
+        // Two-cell glyphs padded as one character each used to draw the
+        // column wider than its constant, and the preview sized from those
+        // constants ran off the edge.
+        assert_eq!(display_width(&column("🔨", KIND_WIDTH)), KIND_WIDTH);
+        assert_eq!(
+            display_width(&column("🪙 12.3k", TOKENS_WIDTH)),
+            TOKENS_WIDTH
+        );
+        let wide = column("漢字漢字漢字漢字漢字漢字漢字", TITLE_WIDTH);
+        assert_eq!(display_width(&wide), TITLE_WIDTH);
+        assert!(wide.ends_with("  "), "no gutter left in {wide:?}");
     }
     #[test]
     fn a_notice_replaces_the_key_hints() {

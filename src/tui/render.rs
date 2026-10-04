@@ -380,21 +380,34 @@ fn draw_pending(frame: &mut Frame, area: Rect, app: &App) {
 
 /// One row's worth of a message: newlines flattened so a multi-line message
 /// stays one entry, and clipped with an ellipsis to fit.
-fn clip(text: &str, width: usize) -> String {
+///
+/// `width` is in terminal cells, the ellipsis included — it replaces the
+/// last character kept rather than being added past the limit. A wide glyph
+/// that would straddle the edge is dropped whole, so the result can come up
+/// one cell short but never over.
+pub(super) fn clip(text: &str, width: usize) -> String {
     let flat: String = text
         .chars()
         .map(|c| if c == '\n' { ' ' } else { c })
         .collect();
-    if flat.chars().count() <= width {
+    if display_width(&flat) <= width {
         return flat;
     }
-    match width {
-        0 => String::new(),
-        _ => format!(
-            "{}{ELLIPSIS}",
-            flat.chars().take(width - 1).collect::<String>()
-        ),
+    if width == 0 {
+        return String::new();
     }
+    let room = width - UnicodeWidthChar::width(ELLIPSIS).unwrap_or(1);
+    let mut kept = String::new();
+    let mut used = 0;
+    for ch in flat.chars() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + ch_width > room {
+            break;
+        }
+        kept.push(ch);
+        used += ch_width;
+    }
+    format!("{kept}{ELLIPSIS}")
 }
 
 /// The session's title, plain — no border, no "clank -" prefix.
@@ -1272,17 +1285,25 @@ fn input_rows(input: &str, width: u16) -> Vec<(usize, String)> {
         if i > 0 {
             offset += 1;
         }
-        let chars: Vec<char> = segment.chars().collect();
-        if chars.is_empty() {
-            rows.push((offset, String::new()));
-            continue;
+        // Rows fill by cells, not characters: a wide glyph that would
+        // straddle the edge starts the next row instead.
+        let mut row = String::new();
+        let mut row_start = offset;
+        let mut row_width = 0;
+        for ch in segment.chars() {
+            let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if row_width + ch_width > width && !row.is_empty() {
+                rows.push((row_start, std::mem::take(&mut row)));
+                row_start = offset;
+                row_width = 0;
+            }
+            row.push(ch);
+            row_width += ch_width;
+            offset += 1;
         }
-        for chunk in chars.chunks(width) {
-            rows.push((offset, chunk.iter().collect()));
-            offset += chunk.len();
-        }
+        rows.push((row_start, row));
         // A segment filling the last row exactly puts the caret on the next.
-        if chars.len().is_multiple_of(width) {
+        if row_width >= width {
             rows.push((offset, String::new()));
         }
     }
@@ -1334,23 +1355,21 @@ fn command_row(offset: usize, row: String, span: &std::ops::Range<usize>) -> Lin
 }
 
 /// Where the caret sits, in the same rows [`input_lines`] produces.
+///
+/// Read off those rows rather than worked out alongside them, so the two
+/// can't disagree about where a wide glyph wrapped: the caret is on the last
+/// row starting at or before it, as many cells in as that row's text before
+/// it takes up.
 fn input_cursor(input: &str, cursor: usize, width: u16) -> (u16, u16) {
-    let width = width.max(1) as usize;
-    let mut row = 0usize;
-    let mut col = 0usize;
-    for ch in input[..cursor.min(input.len())].chars() {
-        if ch == '\n' {
-            row += 1;
-            col = 0;
-        } else {
-            col += 1;
-            if col == width {
-                row += 1;
-                col = 0;
-            }
-        }
-    }
-    (row as u16, col as u16)
+    let at = input[..cursor.min(input.len())].chars().count();
+    let rows = input_rows(input, width);
+    let row = rows
+        .iter()
+        .rposition(|(offset, _)| *offset <= at)
+        .unwrap_or(0);
+    let (offset, text) = &rows[row];
+    let before: String = text.chars().take(at - offset).collect();
+    (row as u16, display_width(&before) as u16)
 }
 
 /// A muted-to-intense gradient for `low`/`medium`/`high`; unset (following
@@ -1694,8 +1713,6 @@ pub(super) fn highlight_rows(rows: &mut [Line<'static>], width: usize, on: bool)
     }
 }
 
-/// Fills a line out to `width` so a background paints the whole row rather
-/// than stopping where the text does.
 /// How many terminal cells a string occupies.
 ///
 /// Not `chars().count()`: an emoji or a CJK glyph is one character and two
@@ -1704,10 +1721,12 @@ pub(super) fn highlight_rows(rows: &mut [Line<'static>], width: usize, on: bool)
 /// the "wrapped again, out from under the gutter" the gutter widths above
 /// still subtract 1 to work around — but the transcript now renders
 /// unwrapped, where the same row is silently clipped instead.
-fn display_width(text: &str) -> usize {
+pub(super) fn display_width(text: &str) -> usize {
     UnicodeWidthStr::width(text)
 }
 
+/// Fills a line out to `width` so a background paints the whole row rather
+/// than stopping where the text does.
 pub(super) fn pad_to(line: &mut Line<'static>, width: usize) {
     let used: usize = line
         .spans
@@ -3356,6 +3375,12 @@ mod tests {
         assert_eq!(clip("abcdefgh", 4), "abc⋯");
         assert_eq!(clip("abcd", 4), "abcd");
         assert_eq!(clip("abc", 0), "");
+        // Measured in cells: 5 is room for two two-cell glyphs and the
+        // ellipsis, where counting characters kept four and overflowed.
+        assert_eq!(clip("漢字漢字", 5), "漢字⋯");
+        assert_eq!(clip("漢字", 4), "漢字");
+        // A glyph that would straddle the edge is dropped whole.
+        assert_eq!(clip("漢字漢字", 4), "漢⋯");
     }
 
     #[test]
@@ -3785,6 +3810,13 @@ mod tests {
         // A segment that exactly fills a row puts the caret on the next.
         assert_eq!(input_lines("abcd", 4), vec!["abcd", ""]);
         assert_eq!(input_cursor("abcd", 4, 4), (1, 0));
+        // Wide glyphs fill rows by cells: two fill a 4-cell row, and a third
+        // that would straddle the edge of a 5-cell one moves down whole.
+        assert_eq!(input_lines("漢字漢", 4), ["漢字", "漢"]);
+        assert_eq!(input_cursor("漢字漢", "漢字漢".len(), 4), (1, 2));
+        assert_eq!(input_lines("漢字漢", 5), ["漢字", "漢"]);
+        assert_eq!(input_cursor("漢字", "漢字".len(), 4), (1, 0));
+        assert_eq!(input_cursor("漢字", "漢".len(), 4), (0, 2));
     }
 
     #[test]
