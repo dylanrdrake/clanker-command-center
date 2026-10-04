@@ -113,7 +113,6 @@ pub struct SessionSummary {
     /// nothing is running it. See [`heartbeat_is_live`].
     pub heartbeat: Option<i64>,
     /// Not surfaced by the CLI, but kept for sorting and display.
-    #[allow(dead_code)]
     pub created_at: i64,
     /// Drives "12m ago" in the TUI's session lists.
     pub updated_at: i64,
@@ -1244,8 +1243,8 @@ pub fn delete_session(conn: &Connection, session_id: &str) -> Result<bool> {
     Ok(affected > 0)
 }
 
-/// Convenience check for whether a session exists, without loading it.
-#[allow(dead_code)]
+/// Whether a session exists, without loading it. Only the tests ask.
+#[cfg(test)]
 pub fn session_exists(conn: &Connection, session_id: &str) -> Result<bool> {
     let exists: Option<i64> = conn
         .query_row(

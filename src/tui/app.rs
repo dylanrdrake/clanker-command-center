@@ -195,9 +195,6 @@ pub struct App {
     pub model: String,
     /// Changes with `/effort`; `None` means "use the configured default".
     pub effort_level: Option<String>,
-    /// Not shown in the UI, but sessions are worth keeping uniquely
-    /// identifiable regardless.
-    #[allow(dead_code)]
     /// The session's full id. Full, not the short form shown to the user:
     /// the picker hashes the whole id for its mark, and the gutter has to
     /// hash exactly the same string or the two marks disagree. `short_id`

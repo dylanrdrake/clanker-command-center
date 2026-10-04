@@ -1,21 +1,6 @@
-mod agent;
-mod client;
-mod compact;
-mod config;
-mod conversation;
-mod crypto;
-mod error_log;
-mod glyphs;
-mod instructions;
-mod mcp;
-mod session;
-mod spinner;
-mod store;
-mod terminal_ui;
-mod tools;
-mod tui;
-mod ui;
-mod wrap;
+use clanker_command_center::{
+    agent, client, compact, config, mcp, session, spinner, store, terminal_ui, tools, tui, ui, wrap,
+};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};

@@ -1281,7 +1281,6 @@ fn bare_command(trimmed: &str, name: &str) -> bool {
 /// resolve needs the `name` on a denial or a result to match it back to the
 /// call it belongs to, which a purely sequential transcript doesn't.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub enum AgentEvent {
     /// A new pass through the tool-calling loop has begun. 1-based.
     IterationStarted { iteration: usize },

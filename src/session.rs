@@ -752,7 +752,6 @@ impl ChatSession {
 
     /// The full session id. The CLI mostly shows [`ChatSession::short_id`],
     /// but the whole id is what a caller needs to address a session later.
-    #[allow(dead_code)]
     pub fn id(&self) -> &str {
         &self.id
     }
@@ -803,8 +802,8 @@ impl ChatSession {
 
     /// The counterpart to [`ChatSession::push_user`]. The agent loop appends
     /// assistant turns itself through `messages_mut`, so this is for callers
-    /// driving a conversation directly.
-    #[allow(dead_code)]
+    /// driving a conversation directly — which only the tests do.
+    #[cfg(test)]
     pub fn push_assistant(&mut self, text: String) {
         self.push(ChatMessage {
             role: "assistant".to_string(),

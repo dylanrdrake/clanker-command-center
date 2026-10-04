@@ -30,6 +30,10 @@
 * what else could be added to verbose mode?
 * Live raw request/response screen?
 * Skills? implement Agent Skill Standard: agentskills.io
+* A closed stdout panics: `clank tools | head` dies with "failed printing
+  to stdout: Broken pipe", because `println!` panics on EPIPE. Every
+  command's output piped into something that exits early does it. Exit
+  quietly instead.
 
 NEXT:
 * MCP, what is left of it. The client, the config entries, `clank mcp
