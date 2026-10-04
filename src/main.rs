@@ -6,8 +6,10 @@ use clanker_command_center::{
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use colored::*;
+use futures_util::FutureExt;
 use rustyline::DefaultEditor;
 use std::io::{self, Write};
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
 use client::{ChatMessage, Client};
@@ -450,14 +452,60 @@ fn resolve_effort_level(config: &config::Config, cli_value: Option<String>) -> O
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    quiet_on_closed_output();
     let cli = Cli::parse();
-    let outcome = dispatch(cli).await;
+    // Caught so a panic still reaches the shutdown below rather than
+    // unwinding straight past it.
+    let outcome = AssertUnwindSafe(dispatch(cli)).catch_unwind().await;
     // Whatever happened. An MCP server is a child process of this one, and
     // a process that exits without stopping them is the orphan problem by
     // another route — see `mcp::StdioServer::shutdown`. A no-op when
     // nothing connected, which is every command that does not run a tool.
     mcp::shutdown_all().await;
-    outcome
+    match outcome {
+        Ok(result) => result,
+        // What a shell reports for a tool `SIGPIPE` killed, so a pipeline
+        // under `set -o pipefail` sees the same as it would for `cat`.
+        Err(payload) if panic_message(&*payload).is_some_and(is_closed_output) => {
+            std::process::exit(141)
+        }
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
+/// Keeps `clank tools | head` from ending in a panic message.
+///
+/// Rust ignores `SIGPIPE`, so writing to a pipe whose reader has gone is an
+/// error, and `println!` turns that error into a panic. Putting the signal
+/// back to fatal would end such a write quietly, but it would also end the
+/// whole process the moment an MCP server exits with its stdin still open
+/// to us. So the panic happens, this hook says nothing about it, and `main`
+/// turns it into an exit. Any other panic is reported as before.
+fn quiet_on_closed_output() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if !panic_message(info.payload()).is_some_and(is_closed_output) {
+            previous(info);
+        }
+    }));
+}
+
+/// A panic's message, when it has one: `panic!` with arguments carries a
+/// `String`, and with a bare literal a `&str`.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> Option<&str> {
+    payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+}
+
+/// Whether this is std's "failed printing to stdout" (or stderr) panic for a
+/// reader that went away. Matched against the error std itself formats for
+/// `EPIPE` rather than a hard-coded "Broken pipe", so the wording is
+/// whatever this platform's is.
+fn is_closed_output(message: &str) -> bool {
+    let epipe = io::Error::from_raw_os_error(libc::EPIPE).to_string();
+    message.starts_with("failed printing to std") && message.ends_with(&epipe)
 }
 
 /// These servers, resolved for starting, with what could not be resolved
@@ -2358,6 +2406,36 @@ fn cmd_clankers(action: Option<ClankerCommands>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_print_to_a_closed_pipe_counts_as_closed_output() {
+        let epipe = io::Error::from_raw_os_error(libc::EPIPE);
+        assert!(is_closed_output(&format!(
+            "failed printing to stdout: {epipe}"
+        )));
+        assert!(is_closed_output(&format!(
+            "failed printing to stderr: {epipe}"
+        )));
+        // A different write failure is still a panic worth seeing.
+        let full = io::Error::from_raw_os_error(libc::ENOSPC);
+        assert!(!is_closed_output(&format!(
+            "failed printing to stdout: {full}"
+        )));
+        // And so is a broken pipe that something else panicked over.
+        assert!(!is_closed_output(&format!(
+            "writing to the server: {epipe}"
+        )));
+    }
+
+    #[test]
+    fn a_panic_message_is_read_from_either_payload_type() {
+        let owned: Box<dyn std::any::Any + Send> = Box::new(String::from("formatted"));
+        let literal: Box<dyn std::any::Any + Send> = Box::new("literal");
+        let other: Box<dyn std::any::Any + Send> = Box::new(7);
+        assert_eq!(panic_message(&*owned), Some("formatted"));
+        assert_eq!(panic_message(&*literal), Some("literal"));
+        assert_eq!(panic_message(&*other), None);
+    }
 
     fn config_with(
         default_model: Option<&str>,

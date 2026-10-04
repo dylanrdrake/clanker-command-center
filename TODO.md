@@ -37,10 +37,6 @@
   `ChatSession` before handing it over, which an outside program can't;
   the worker should send a snapshot when it starts. After that, a wire
   format: `Command`/`Event` as JSON lines over stdio.
-* A closed stdout panics: `clank tools | head` dies with "failed printing
-  to stdout: Broken pipe", because `println!` panics on EPIPE. Every
-  command's output piped into something that exits early does it. Exit
-  quietly instead.
 
 NEXT:
 * MCP, what is left of it. The client, the config entries, `clank mcp
