@@ -610,8 +610,7 @@ async fn cmd_login() -> Result<()> {
     let api_key = input.trim();
 
     if api_key.is_empty() {
-        eprintln!("{} API key cannot be empty", "✗".red());
-        std::process::exit(1);
+        anyhow::bail!("API key cannot be empty");
     }
 
     set_api_key(api_key)?;
@@ -1137,13 +1136,10 @@ async fn cmd_effort_style(value: Option<String>, clear: bool) -> Result<()> {
         Some(value) => {
             let normalized = value.to_lowercase();
             if !VALID_EFFORT_STYLES.contains(&normalized.as_str()) {
-                eprintln!(
-                    "{} Invalid effort style '{}'. Valid values: {}",
-                    "✗".red(),
-                    value,
+                anyhow::bail!(
+                    "Invalid effort style '{value}'. Valid values: {}",
                     VALID_EFFORT_STYLES.join(", ")
                 );
-                std::process::exit(1);
             }
             config.effort_style = Some(normalized.clone());
             save_config(&config)?;
@@ -1336,10 +1332,7 @@ async fn cmd_max_iterations(value: Option<usize>, clear: bool) -> Result<()> {
     }
 
     match value {
-        Some(0) => {
-            eprintln!("{} max-iterations must be greater than 0", "✗".red());
-            std::process::exit(1);
-        }
+        Some(0) => anyhow::bail!("max-iterations must be greater than 0"),
         Some(value) => {
             config.max_iterations = Some(value);
             save_config(&config)?;
@@ -1375,8 +1368,7 @@ async fn cmd_temperature(value: Option<f32>, clear: bool) -> Result<()> {
 
     match value {
         Some(value) if !(0.0..=2.0).contains(&value) => {
-            eprintln!("{} temperature must be between 0 and 2", "✗".red());
-            std::process::exit(1);
+            anyhow::bail!("temperature must be between 0 and 2")
         }
         Some(value) => {
             config.temperature = Some(value);

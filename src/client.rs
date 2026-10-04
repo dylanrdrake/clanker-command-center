@@ -78,9 +78,14 @@ impl ChatMessage {
     /// providers return `content: ""` instead of `null` when a message
     /// carries no visible text (e.g. a tool-calls-only turn).
     pub fn has_visible_content(&self) -> bool {
-        self.content
-            .as_deref()
-            .is_some_and(|c| !c.trim().is_empty())
+        self.visible_content().is_some()
+    }
+
+    /// The content, when there is any to show — the same test as
+    /// [`Self::has_visible_content`], for a caller that wants the text and
+    /// not only the answer.
+    pub fn visible_content(&self) -> Option<&str> {
+        self.content.as_deref().filter(|c| !c.trim().is_empty())
     }
 
     /// True if `tool_calls` is `Some` *and* actually has an entry in it.

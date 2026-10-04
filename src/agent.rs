@@ -285,8 +285,7 @@ pub async fn run_chat_turn(
     let mut final_response = None;
     // Matches the CLI's long-standing behavior: a reply with nothing visible
     // in it is neither shown nor added to the history.
-    if message.has_visible_content() {
-        let content = message.content.as_deref().unwrap().to_string();
+    if let Some(content) = message.visible_content().map(str::to_string) {
         ui.event(AgentEvent::AssistantMessage {
             model: model.to_string(),
             effort_level,
@@ -522,8 +521,7 @@ pub async fn run_agent_turn(
         let no_tool_calls = !message.has_tool_calls();
 
         // If the LLM generated text, show it
-        if message.has_visible_content() {
-            let content = message.content.as_deref().unwrap();
+        if let Some(content) = message.visible_content() {
             ui.event(AgentEvent::AssistantMessage {
                 model: model.to_string(),
                 effort_level: effort_level.clone(),

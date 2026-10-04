@@ -1823,7 +1823,9 @@ mod tests {
         // Measured, not imagined: the reference filesystem server exports
         // all three of these names.
         for name in ["read_file", "write_file", "search_files"] {
-            let err = validate(&[registered_tool(name, "read")]).expect_err("{name} is a built-in");
+            let Err(err) = validate(&[registered_tool(name, "read")]) else {
+                panic!("{name} is a built-in, and was registered over");
+            };
             assert!(err.to_string().contains("already a built-in"), "{err}");
         }
         assert!(validate(&[registered_tool("fs__read_file", "read")]).is_ok());
