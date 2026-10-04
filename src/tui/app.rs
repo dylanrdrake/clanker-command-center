@@ -6,7 +6,7 @@
 
 use super::git::GitPane;
 use crate::config::ToolAccessSettings;
-use crate::conversation::Event;
+use crate::conversation::{Event, Snapshot};
 pub use crate::ui::{classify, Submission};
 use crate::ui::{AgentEvent, ApprovalRequest};
 use std::collections::VecDeque;
@@ -358,9 +358,43 @@ impl App {
         self.scroll_back == 0
     }
 
+    /// Takes on everything a snapshot says about the session, silently: it
+    /// is what the session already was, not news about it.
+    pub fn adopt(&mut self, snapshot: Snapshot) {
+        let Snapshot {
+            id,
+            title,
+            model,
+            effort_level,
+            temperature,
+            max_iterations,
+            tool_access,
+            verbose,
+            highlight,
+            sandbox,
+            stream,
+            working_dir,
+            total_tokens,
+        } = snapshot;
+        self.session_id = id;
+        self.title = title;
+        self.model = model;
+        self.effort_level = effort_level;
+        self.temperature = temperature;
+        self.max_iterations = max_iterations;
+        self.tool_access = tool_access;
+        self.verbose = verbose;
+        self.highlight = highlight;
+        self.sandbox = sandbox;
+        self.stream = stream;
+        self.working_dir = working_dir;
+        self.total_tokens = total_tokens;
+    }
+
     /// Folds one worker event into the view.
     pub fn apply(&mut self, event: Event) {
         match event {
+            Event::Snapshot(snapshot) => self.adopt(snapshot),
             // Dropped if the browser was closed while the fetch was in
             // flight: the answer to a question nobody is asking any more.
             Event::ModelsListed(all) => {

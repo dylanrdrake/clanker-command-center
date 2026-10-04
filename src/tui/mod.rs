@@ -29,7 +29,7 @@ pub(crate) use render::{busy_frame, identicon_mark};
 
 use crate::client::Client;
 use crate::config::ToolAccessSettings;
-use crate::conversation::{command_for, Command, Conversation};
+use crate::conversation::{command_for, Command, Conversation, Snapshot};
 use crate::glyphs::{DASH, DOT, DOWN, UP};
 use crate::session::{self, ChatSession};
 use crate::store::{self, SessionSummary, StoredMessage, KIND_AGENT_CHAT, KIND_CHAT};
@@ -310,21 +310,17 @@ fn start_chat(
             &session.id()[..8]
         );
     };
+    // The worker sends this same snapshot as its first event, but the first
+    // frame is drawn before that arrives.
+    let snapshot = Snapshot::of(&session);
     let mut app = App::new(
-        session.model().to_string(),
-        session.effort_level().map(str::to_string),
+        snapshot.model.clone(),
+        snapshot.effort_level.clone(),
         // The full id: the mark in the reply gutter hashes it, and the
         // picker hashes the same to draw this session's row.
-        session.id().to_string(),
+        snapshot.id.clone(),
     );
-    app.verbose = session.verbose();
-    app.highlight = session.highlight();
-    app.max_iterations = session.max_iterations();
-    app.temperature = session.temperature();
-    app.total_tokens = session.total_tokens();
-    app.tool_access = session.tool_access().clone();
-    app.sandbox = session.sandbox();
-    app.stream = session.stream();
+    app.adopt(snapshot);
     // Configuration rather than session state, so it comes from the context
     // rather than off the session — see `App::compactor`.
     app.compactor = context
@@ -332,8 +328,6 @@ fn start_chat(
         .clone()
         .unwrap_or_else(|| crate::config::DEFAULT_MODEL.to_string());
     app.compact_at = context.compact_at;
-    app.working_dir = session.working_dir().map(str::to_string);
-    app.title = session.title().to_string();
     seed_transcript(&mut app, &history);
 
     let conversation = Conversation::spawn(

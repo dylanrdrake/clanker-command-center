@@ -32,11 +32,11 @@
 * Skills? implement Agent Skill Standard: agentskills.io
 * Embedding CCC in another program. The conversation worker is already
   the API — commands in, events out, `Event::Ready` when a command is
-  done — and both front ends drive it. First gap: a client cannot ask it
-  for the session's state. The TUI and line mode read it off the
-  `ChatSession` before handing it over, which an outside program can't;
-  the worker should send a snapshot when it starts. After that, a wire
-  format: `Command`/`Event` as JSON lines over stdio.
+  done, `Event::Snapshot` first and on `Command::Snapshot` — and both front
+  ends drive it; line mode knows the session only from what the worker
+  sends. Next gap: a wire format, `Command`/`Event` as JSON lines over
+  stdio. The history is the other thing a client can't get yet — both
+  front ends load it from the store themselves.
 
 NEXT:
 * MCP, what is left of it. The client, the config entries, `clank mcp

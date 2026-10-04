@@ -3,6 +3,7 @@
 //! formatted, so a different front end can present the same events however
 //! it likes without touching the loop itself.
 
+use crate::conversation::Snapshot;
 use crate::spinner::Spinner;
 use crate::ui::{
     json_fields, parse_yes_no, primary_argument, response_label, tool_call_fields, AgentEvent,
@@ -460,45 +461,21 @@ pub fn tool_lines(access: &crate::config::ToolAccessSettings) -> Vec<String> {
 
 /// What a line-mode clanker knows about its session, which the worker owns.
 ///
-/// Read off the session once, before it moves into the worker, and kept
-/// current from the worker's events after that — the same arrangement the
-/// TUI's `App` has. It is what the read-only commands (`/model`, `/status`,
-/// …) are answered from, and what tells a change from a repeat when a
-/// setting's event says what it ended up as.
+/// Built from the worker's first event, [`Event::Snapshot`], and kept
+/// current from its events after that — the same arrangement the TUI's
+/// `App` has. It is what the read-only commands (`/model`, `/status`, …) are
+/// answered from, and what tells a change from a repeat when a setting's
+/// event says what it ended up as.
+///
+/// [`Event::Snapshot`]: crate::conversation::Event::Snapshot
 #[derive(Debug, Clone)]
 pub struct SessionView {
-    pub short_id: String,
-    pub title: String,
-    pub model: String,
-    pub effort_level: Option<String>,
-    pub temperature: Option<f32>,
-    pub max_iterations: Option<usize>,
-    pub verbose: bool,
-    pub highlight: bool,
-    pub sandbox: bool,
-    pub stream: bool,
-    pub working_dir: Option<String>,
-    pub tool_access: crate::config::ToolAccessSettings,
-    pub total_tokens: i64,
+    pub state: Snapshot,
 }
 
 impl SessionView {
-    pub fn of(session: &crate::session::ChatSession) -> Self {
-        SessionView {
-            short_id: session.short_id().to_string(),
-            title: session.title().to_string(),
-            model: session.model().to_string(),
-            effort_level: session.effort_level().map(str::to_string),
-            temperature: session.temperature(),
-            max_iterations: session.max_iterations(),
-            verbose: session.verbose(),
-            highlight: session.highlight(),
-            sandbox: session.sandbox(),
-            stream: session.stream(),
-            working_dir: session.working_dir().map(str::to_string),
-            tool_access: session.tool_access().clone(),
-            total_tokens: session.total_tokens(),
-        }
+    pub fn of(state: Snapshot) -> Self {
+        SessionView { state }
     }
 
     /// Takes in what `event` says about the session, and returns the lines
@@ -524,25 +501,22 @@ impl SessionView {
             text.blue().to_string()
         }
 
+        // A model switch also reports the effort it landed on, but only the
+        // model is what "set to" or "is" describes.
+        let model_before = self.state.model.clone();
+        let changed = self.state.apply(event);
         match event {
-            Event::ModelChanged {
-                model,
-                effort_level,
-            } => {
-                let changed = *model != self.model;
-                self.model = model.clone();
-                self.effort_level = effort_level.clone();
-                vec![done(format!("Model {} {model}", set_or_is(changed)))]
+            Event::ModelChanged { model, .. } => {
+                vec![done(format!(
+                    "Model {} {model}",
+                    set_or_is(*model != model_before)
+                ))]
             }
             Event::EffortChanged { effort_level } => {
-                let changed = *effort_level != self.effort_level;
-                self.effort_level = effort_level.clone();
                 let label = effort_level.as_deref().unwrap_or("default");
                 vec![done(format!("Effort {} {label}", set_or_is(changed)))]
             }
             Event::MaxIterationsChanged { max_iterations } => {
-                let changed = *max_iterations != self.max_iterations;
-                self.max_iterations = *max_iterations;
                 let label = max_iterations.map_or_else(|| "default".to_string(), |n| n.to_string());
                 vec![done(format!(
                     "Max iterations {} {label}",
@@ -550,14 +524,10 @@ impl SessionView {
                 ))]
             }
             Event::TemperatureChanged { temperature } => {
-                let changed = *temperature != self.temperature;
-                self.temperature = *temperature;
                 let label = temperature.map_or_else(|| "default".to_string(), |t| t.to_string());
                 vec![done(format!("Temperature {} {label}", set_or_is(changed)))]
             }
             Event::ToolAccessChanged { access } => {
-                let changed = *access != self.tool_access;
-                self.tool_access = access.clone();
                 // The whole list, not just the row that moved: naming one
                 // state tells you neither what else is set nor what it was
                 // set from, and this is the readout people check before
@@ -567,36 +537,21 @@ impl SessionView {
                 lines.extend(tool_lines(access));
                 lines
             }
-            Event::VerboseChanged { verbose } => {
-                self.verbose = *verbose;
-                vec![info(ui::verbose_notice(*verbose, true))]
-            }
+            Event::VerboseChanged { verbose } => vec![info(ui::verbose_notice(*verbose, true))],
+            // Recorded either way: the CLI draws no band, but the setting
+            // belongs to the session, so switching it here is what the TUI
+            // picks up on its next resume.
             Event::HighlightChanged { highlight } => {
-                // Recorded either way: the CLI draws no band, but the
-                // setting belongs to the session, so switching it here is
-                // what the TUI picks up on its next resume.
-                self.highlight = *highlight;
                 vec![info(ui::highlight_notice(*highlight, true))]
             }
-            Event::StreamChanged { stream } => {
-                self.stream = *stream;
-                vec![info(ui::stream_notice(*stream, true))]
-            }
-            Event::SandboxChanged { sandbox } => {
-                self.sandbox = *sandbox;
-                vec![info(ui::sandbox_notice(*sandbox, true))]
-            }
+            Event::StreamChanged { stream } => vec![info(ui::stream_notice(*stream, true))],
+            Event::SandboxChanged { sandbox } => vec![info(ui::sandbox_notice(*sandbox, true))],
             // Only a change is announced: the worker says what the title is
             // after every turn, which the TUI takes in silently.
-            Event::TitleChanged { title } if *title != self.title => {
-                self.title = title.clone();
-                vec![info(ui::title_notice(title, true))]
-            }
+            Event::TitleChanged { title } if changed => vec![info(ui::title_notice(title, true))],
             Event::TitleChanged { .. } => Vec::new(),
-            Event::TokensUsed { total_tokens } => {
-                self.total_tokens = *total_tokens;
-                Vec::new()
-            }
+            // Kept for `/status`, not announced.
+            Event::TokensUsed { .. } | Event::Snapshot(_) => Vec::new(),
             Event::Compacting { model } => vec![info(ui::compacting_notice(model))],
             Event::Compacted { folded } => vec![info(ui::compacted_notice(*folded))],
             Event::CompactionSkipped { reason } => vec![done(reason.clone())],
@@ -625,22 +580,26 @@ mod tests {
     use crate::config::ToolAccessSettings;
     use crate::conversation::Event;
 
-    fn view() -> SessionView {
-        SessionView {
-            short_id: "a1b2c3d4".to_string(),
+    fn snapshot() -> Snapshot {
+        Snapshot {
+            id: "a1b2c3d4-0000-0000-0000-000000000000".to_string(),
             title: "Fix the parser".to_string(),
             model: "model-a".to_string(),
             effort_level: None,
             temperature: None,
             max_iterations: Some(20),
+            tool_access: ToolAccessSettings::none(),
             verbose: false,
             highlight: true,
             sandbox: true,
             stream: true,
             working_dir: None,
-            tool_access: ToolAccessSettings::none(),
             total_tokens: 0,
         }
+    }
+
+    fn view() -> SessionView {
+        SessionView::of(snapshot())
     }
 
     /// Joined, so a test reads the words rather than the escape codes
@@ -663,8 +622,8 @@ mod tests {
             },
         );
         assert!(changed.contains("Model set to model-b"), "{changed}");
-        assert_eq!(view.model, "model-b");
-        assert_eq!(view.effort_level.as_deref(), Some("high"));
+        assert_eq!(view.state.model, "model-b");
+        assert_eq!(view.state.effort_level.as_deref(), Some("high"));
 
         let repeated = shown(
             &mut view,
@@ -685,7 +644,7 @@ mod tests {
             nullified.contains("Max iterations set to default"),
             "{nullified}"
         );
-        assert_eq!(view.max_iterations, None);
+        assert_eq!(view.state.max_iterations, None);
     }
 
     #[test]
@@ -702,7 +661,7 @@ mod tests {
             },
         );
         assert!(renamed.contains("Fix the lexer"), "{renamed}");
-        assert_eq!(view.title, "Fix the lexer");
+        assert_eq!(view.state.title, "Fix the lexer");
     }
 
     #[test]
@@ -713,7 +672,7 @@ mod tests {
         });
         assert!(lines[0].contains("Tools set to:"), "{}", lines[0]);
         assert!(lines.iter().any(|line| line.contains("read_file")));
-        assert_eq!(view.tool_access, ToolAccessSettings::defaults());
+        assert_eq!(view.state.tool_access, ToolAccessSettings::defaults());
     }
 
     #[test]
@@ -735,6 +694,18 @@ mod tests {
                 total_tokens: 1_234
             })
             .is_empty());
-        assert_eq!(view.total_tokens, 1_234);
+        assert_eq!(view.state.total_tokens, 1_234);
+    }
+
+    #[test]
+    fn a_snapshot_replaces_the_view_without_a_word() {
+        let mut view = view();
+        let fresh = Snapshot {
+            model: "model-z".to_string(),
+            title: "Something else".to_string(),
+            ..snapshot()
+        };
+        assert!(view.apply(&Event::Snapshot(fresh.clone())).is_empty());
+        assert_eq!(view.state, fresh);
     }
 }

@@ -106,6 +106,111 @@ pub enum Command {
     /// long history triggers on its own; what it skips is the check for
     /// whether it was needed.
     Compact,
+    /// Send [`Event::Snapshot`] again, for a front end that has lost track
+    /// or arrived late. Answered mid-turn too: it changes nothing.
+    Snapshot,
+}
+
+/// A clanker's identity and settings as the worker holds them: everything
+/// a front end shows about a session before anything has happened in it.
+///
+/// The worker sends one as its first event and again on
+/// [`Command::Snapshot`]; from there the `*Changed` events keep a copy
+/// current, which [`Snapshot::apply`] does. That is how a front end that
+/// never held the [`ChatSession`] — one in another process, say — knows
+/// what it is driving.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Snapshot {
+    /// The full id. [`Snapshot::short_id`] is the part people read.
+    pub id: String,
+    pub title: String,
+    pub model: String,
+    pub effort_level: Option<String>,
+    pub temperature: Option<f32>,
+    pub max_iterations: Option<usize>,
+    pub tool_access: ToolAccessSettings,
+    pub verbose: bool,
+    pub highlight: bool,
+    pub sandbox: bool,
+    pub stream: bool,
+    pub working_dir: Option<String>,
+    pub total_tokens: i64,
+}
+
+impl Snapshot {
+    pub fn of(session: &ChatSession) -> Self {
+        Snapshot {
+            id: session.id().to_string(),
+            title: session.title().to_string(),
+            model: session.model().to_string(),
+            effort_level: session.effort_level().map(str::to_string),
+            temperature: session.temperature(),
+            max_iterations: session.max_iterations(),
+            tool_access: session.tool_access().clone(),
+            verbose: session.verbose(),
+            highlight: session.highlight(),
+            sandbox: session.sandbox(),
+            stream: session.stream(),
+            working_dir: session.working_dir().map(str::to_string),
+            total_tokens: session.total_tokens(),
+        }
+    }
+
+    pub fn short_id(&self) -> &str {
+        &self.id[..self.id.len().min(8)]
+    }
+
+    /// Takes in what `event` says about the session, reporting whether it
+    /// changed anything. A setting's event says what the setting ended up
+    /// as, not whether it moved — a repeat of the current value arrives the
+    /// same way — so telling the two apart is up to whoever holds what it
+    /// was before, which is this.
+    pub fn apply(&mut self, event: &Event) -> bool {
+        fn set<T: PartialEq + Clone>(field: &mut T, value: &T) -> bool {
+            let changed = field != value;
+            if changed {
+                *field = value.clone();
+            }
+            changed
+        }
+        match event {
+            Event::Snapshot(snapshot) => set(self, snapshot),
+            // Both, because a model switch reports the effort it landed on.
+            Event::ModelChanged {
+                model,
+                effort_level,
+            } => set(&mut self.model, model) | set(&mut self.effort_level, effort_level),
+            Event::EffortChanged { effort_level } => set(&mut self.effort_level, effort_level),
+            Event::MaxIterationsChanged { max_iterations } => {
+                set(&mut self.max_iterations, max_iterations)
+            }
+            Event::TemperatureChanged { temperature } => set(&mut self.temperature, temperature),
+            Event::ToolAccessChanged { access } => set(&mut self.tool_access, access),
+            Event::VerboseChanged { verbose } => set(&mut self.verbose, verbose),
+            Event::HighlightChanged { highlight } => set(&mut self.highlight, highlight),
+            Event::StreamChanged { stream } => set(&mut self.stream, stream),
+            Event::SandboxChanged { sandbox } => set(&mut self.sandbox, sandbox),
+            Event::TitleChanged { title } => set(&mut self.title, title),
+            Event::TokensUsed { total_tokens } => set(&mut self.total_tokens, total_tokens),
+            // Named rather than caught by `_`, so a setting given an event
+            // of its own can't be left out of here unnoticed.
+            Event::Agent(_)
+            | Event::ApprovalRequested(_)
+            | Event::ModelsListed(_)
+            | Event::ModelsUnavailable(_)
+            | Event::Busy(_)
+            | Event::Queued { .. }
+            | Event::ShellStarted { .. }
+            | Event::ShellFinished { .. }
+            | Event::Cancelled
+            | Event::UserMessage(_)
+            | Event::Compacting { .. }
+            | Event::Compacted { .. }
+            | Event::McpReconnected { .. }
+            | Event::CompactionSkipped { .. }
+            | Event::Ready => false,
+        }
+    }
 }
 
 /// What the conversation reports back. Agent progress is forwarded verbatim
@@ -113,6 +218,9 @@ pub enum Command {
 /// render status.
 #[derive(Debug)]
 pub enum Event {
+    /// The session as it stands — see [`Snapshot`]. Always the worker's
+    /// first event, and the answer to [`Command::Snapshot`].
+    Snapshot(Snapshot),
     /// Progress from the agent loop.
     Agent(AgentEvent),
     /// A tool needs a decision; reply with [`Command::Approve`].
@@ -505,6 +613,7 @@ struct Worker {
 impl Worker {
     async fn run(mut self, mut commands: mpsc::UnboundedReceiver<Command>) {
         let mut queue: VecDeque<String> = VecDeque::new();
+        self.send_snapshot();
 
         while let Some(command) = commands.recv().await {
             match command {
@@ -596,6 +705,7 @@ impl Worker {
             Command::ResetToolAccess => self.reset_tool_access(),
             Command::SetTemperature(temperature) => self.set_temperature(temperature),
             Command::ResetTemperature => self.reset_temperature(),
+            Command::Snapshot => self.send_snapshot(),
             // Handled by whoever is running one, and meaningless when
             // nobody is: an approval with no question, a cancellation with
             // nothing to cancel.
@@ -605,6 +715,12 @@ impl Worker {
             // this, and both callers match them out first.
             Command::Send(_) | Command::Compact | Command::ReconnectMcp => {}
         }
+    }
+
+    fn send_snapshot(&self) {
+        let _ = self
+            .events
+            .send(Event::Snapshot(Snapshot::of(&self.session)));
     }
 
     async fn run_turn(
@@ -819,6 +935,7 @@ impl Worker {
                         // using, and browsing models while a reply streams
                         // is a reasonable thing to want.
                         Some(Command::ListModels) => self.list_models(),
+                        Some(Command::Snapshot) => self.send_snapshot(),
                         Some(Command::SetModel(model)) => self.set_model(model),
                         Some(Command::SetEffort(effort_level)) => self.set_effort(effort_level),
                         Some(Command::ResetEffort) => self.reset_effort(),
@@ -1544,6 +1661,81 @@ impl AgentUi for ChannelUi {
 mod tests {
 
     use super::*;
+
+    fn spawn_test(session: ChatSession) -> Conversation {
+        let claim = crate::session::Heartbeat::for_test(session.id());
+        Conversation::spawn(
+            Arc::new(Client::for_test(crate::config::Config::default())),
+            session,
+            None,
+            None,
+            None,
+            ToolAccessSettings::default(),
+            None,
+            None,
+            claim,
+        )
+    }
+
+    #[tokio::test]
+    async fn the_worker_says_what_the_session_is_before_anything_else() {
+        let session = crate::session::test_session();
+        let expected = Snapshot::of(&session);
+        let mut conversation = spawn_test(session);
+        match conversation.next_event().await {
+            Some(Event::Snapshot(snapshot)) => assert_eq!(snapshot, expected),
+            other => panic!("expected a snapshot first, got {other:?}"),
+        }
+        conversation.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_copy_kept_from_events_matches_a_snapshot_asked_for_later() {
+        // The arrangement a front end in another process would rely on: one
+        // snapshot to start from, the change events to keep it current, and
+        // a fresh snapshot on request agreeing with the result.
+        let mut conversation = spawn_test(crate::session::test_session());
+        let Some(Event::Snapshot(mut kept)) = conversation.next_event().await else {
+            panic!("no snapshot first");
+        };
+        conversation.send(Command::SetVerbose(true));
+        conversation.send(Command::SetModel("model-b".to_string()));
+        conversation.send(Command::SetTitle("Renamed".to_string()));
+        conversation.send(Command::Snapshot);
+
+        let mut ready = 0;
+        let mut asked = None;
+        while ready < 4 {
+            match conversation.next_event().await.expect("worker gone") {
+                Event::Ready => ready += 1,
+                Event::Snapshot(snapshot) => asked = Some(snapshot),
+                event => {
+                    kept.apply(&event);
+                }
+            }
+        }
+        let asked = asked.expect("Command::Snapshot was not answered");
+        assert!(asked.verbose);
+        assert_eq!(asked.model, "model-b");
+        assert_eq!(asked.title, "Renamed");
+        assert_eq!(kept, asked);
+        conversation.shutdown().await;
+    }
+
+    #[test]
+    fn applying_an_event_reports_whether_it_changed_anything() {
+        let mut snapshot = Snapshot::of(&crate::session::test_session());
+        let same = Event::StreamChanged {
+            stream: snapshot.stream,
+        };
+        assert!(!snapshot.apply(&same));
+        let flipped = Event::StreamChanged {
+            stream: !snapshot.stream,
+        };
+        assert!(snapshot.apply(&flipped));
+        // Nothing about the session's settings in a busy flag.
+        assert!(!snapshot.apply(&Event::Busy(true)));
+    }
 
     /// Every submission that changes session state, paired with the command
     /// it must produce. Listed rather than derived, so a mapping that

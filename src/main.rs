@@ -1874,10 +1874,6 @@ async fn cmd_clanker(
     // label either, again matching the TUI transcript. Seeded from the
     // session rather than hardcoded, so a resumed session that had
     // `/verbose` on comes back showing detail.
-    let mut ui = TerminalAgentUi::new(session.verbose(), false);
-    ui.mark_as(session.id());
-    let mut view = terminal_ui::SessionView::of(&session);
-
     // The same worker the TUI drives, so a clanker means the same thing
     // whichever front end it is opened in: this loop only reads lines,
     // sends what they mean, and prints what comes back.
@@ -1892,6 +1888,14 @@ async fn cmd_clanker(
         compact_at,
         claim,
     );
+    // Everything below knows the session only as the worker reports it,
+    // starting from the snapshot it always sends first.
+    let Some(conversation::Event::Snapshot(state)) = conversation.next_event().await else {
+        anyhow::bail!("The clanker stopped before it started");
+    };
+    let mut ui = TerminalAgentUi::new(state.verbose, false);
+    ui.mark_as(&state.id);
+    let mut view = terminal_ui::SessionView::of(state);
 
     loop {
         // Blocks this thread until a line arrives, so the runtime is told to
@@ -1958,7 +1962,7 @@ async fn cmd_clanker(
     println!(
         "{} Clanker saved. Resume with: clank clanker --resume {}",
         "✓".green(),
-        view.short_id
+        view.state.short_id()
     );
 
     Ok(())
@@ -2042,38 +2046,38 @@ fn answer_locally(
             );
         }
         ui::Submission::ShowModel => {
-            println!("Model: {}", response_label(&view.model, &view.effort_level));
+            println!("Model: {}", response_label(&view.state.model, &view.state.effort_level));
         }
         ui::Submission::ShowEffort => {
             println!(
                 "{}",
-                ui::effort_notice(view.effort_level.as_deref(), false).blue()
+                ui::effort_notice(view.state.effort_level.as_deref(), false).blue()
             );
         }
         ui::Submission::ShowVerbose => {
-            println!("{}", ui::verbose_notice(view.verbose, false).blue());
+            println!("{}", ui::verbose_notice(view.state.verbose, false).blue());
         }
         ui::Submission::ShowHighlight => {
-            println!("{}", ui::highlight_notice(view.highlight, false).blue());
+            println!("{}", ui::highlight_notice(view.state.highlight, false).blue());
         }
         ui::Submission::ShowStream => {
-            println!("{}", ui::stream_notice(view.stream, false).blue());
+            println!("{}", ui::stream_notice(view.state.stream, false).blue());
         }
         ui::Submission::ShowTemperature => {
             println!(
                 "{}",
-                ui::temperature_notice(view.temperature, false).blue()
+                ui::temperature_notice(view.state.temperature, false).blue()
             );
         }
         ui::Submission::ShowSandbox => {
-            println!("{}", ui::sandbox_notice(view.sandbox, false).blue());
+            println!("{}", ui::sandbox_notice(view.state.sandbox, false).blue());
         }
         ui::Submission::ShowTitle => {
-            println!("{}", ui::title_notice(&view.title, false).blue());
+            println!("{}", ui::title_notice(&view.state.title, false).blue());
         }
         ui::Submission::ShowTools => {
             println!("{}", "Tools:".blue());
-            print_tools(&view.tool_access);
+            print_tools(&view.state.tool_access);
         }
         ui::Submission::ShowMcp => {
             let servers = load_config().map(|c| c.mcp_servers).unwrap_or_default();
@@ -2095,19 +2099,19 @@ fn answer_locally(
         }
         ui::Submission::ShowStatus => {
             let rows = ui::session_settings_rows(&ui::SessionSettings {
-                id: &view.short_id,
-                title: &view.title,
-                model: &view.model,
-                effort_level: view.effort_level.as_deref(),
-                temperature: view.temperature,
-                max_iterations: view.max_iterations,
-                verbose: view.verbose,
-                highlight: view.highlight,
-                sandbox: view.sandbox,
-                stream: view.stream,
-                working_dir: view.working_dir.as_deref(),
-                tool_access: &view.tool_access,
-                total_tokens: view.total_tokens,
+                id: view.state.short_id(),
+                title: &view.state.title,
+                model: &view.state.model,
+                effort_level: view.state.effort_level.as_deref(),
+                temperature: view.state.temperature,
+                max_iterations: view.state.max_iterations,
+                verbose: view.state.verbose,
+                highlight: view.state.highlight,
+                sandbox: view.state.sandbox,
+                stream: view.state.stream,
+                working_dir: view.state.working_dir.as_deref(),
+                tool_access: &view.state.tool_access,
+                total_tokens: view.state.total_tokens,
                 compactor,
                 compact_at,
             });

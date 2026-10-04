@@ -95,6 +95,29 @@ impl Heartbeat {
     }
 }
 
+#[cfg(test)]
+impl Heartbeat {
+    /// A claim held in a database of its own, for a worker under test: the
+    /// real one is never touched, and with nothing renewing it there is
+    /// nothing to stop.
+    pub(crate) fn for_test(session_id: &str) -> Self {
+        let conn = Connection::open_in_memory().unwrap();
+        store::ensure_schema(&conn).unwrap();
+        Heartbeat {
+            conn,
+            session_id: session_id.to_string(),
+            owner: uuid::Uuid::new_v4().to_string(),
+            ticker: None,
+        }
+    }
+}
+
+/// A session in an in-memory database, for tests outside this module.
+#[cfg(test)]
+pub(crate) fn test_session() -> ChatSession {
+    tests::memory_session()
+}
+
 impl Heartbeat {
     /// The token identifying this claim, for binding a session's writes to it.
     pub fn owner(&self) -> &str {
@@ -990,7 +1013,7 @@ mod tests {
         conn
     }
 
-    fn memory_session() -> ChatSession {
+    pub(super) fn memory_session() -> ChatSession {
         ChatSession::create(
             memory_conn(),
             new_id(),
