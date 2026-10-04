@@ -773,8 +773,8 @@ fn report_once(key: &str, context: &str, message: &str) {
 /// print — a missing `npx` or a server that will not start is a reason to
 /// carry on without it, not a reason to refuse to open a clanker.
 ///
-/// This is the *reconnect* path — `/mcp reconnect`, and the CLI's version
-/// of it — so it starts from nothing: everything up is stopped and every
+/// This is the *reconnect* path — `/mcp reconnect`, in either front end —
+/// so it starts from nothing: everything up is stopped and every
 /// failure forgotten, because the reason to run it is a server that was
 /// rebuilt. Opening a clanker goes through [`ensure_connected`] instead,
 /// which starts only what a turn needs.

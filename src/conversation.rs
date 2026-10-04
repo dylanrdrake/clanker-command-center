@@ -235,6 +235,15 @@ pub enum Event {
     CompactionSkipped {
         reason: String,
     },
+    /// The worker has done everything it was asked so far — a message's
+    /// whole turn included — and is waiting for the next command.
+    ///
+    /// So a front end that sends one command at a time can wait for this
+    /// rather than guessing which event ends each one: a setting answers
+    /// with one event, a refused one with an error and nothing else, a
+    /// message with a turn. Work the worker spawns rather than awaits — a
+    /// `$` command, the model list — can still report after it.
+    Ready,
 }
 
 /// Handle to a running conversation worker.
@@ -503,10 +512,6 @@ impl Worker {
                 // message it was, or one typed while it ran — and the drain
                 // below is the single place that takes it.
                 Command::Send(text) => queue.push_back(text),
-                // Awaited rather than spawned, unlike `$` and `/models`: it
-                // rewrites the history the next turn will be built from, so
-                // letting a message overtake it would send the very request
-                // it exists to shrink.
                 // Awaited rather than spawned, for the same reason as
                 // `Compact`: it replaces the tools the next turn would be
                 // built from, so letting a message overtake it would send a
@@ -515,6 +520,10 @@ impl Worker {
                 Command::SetToolAccess { target, access } => {
                     self.set_tool_access_connecting(&target, access).await
                 }
+                // Awaited rather than spawned, unlike `$` and `/models`: it
+                // rewrites the history the next turn will be built from, so
+                // letting a message overtake it would send the very request
+                // it exists to shrink.
                 Command::Compact => match self.compact(&mut commands, &mut queue, true).await {
                     CompactOutcome::Done => {}
                     CompactOutcome::Cancelled => {
@@ -549,6 +558,8 @@ impl Worker {
                     }
                 }
             }
+
+            let _ = self.events.send(Event::Ready);
         }
 
         // The front end has gone. Clear any activity first: a `working` left

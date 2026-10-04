@@ -1,5 +1,6 @@
+use clanker_command_center::conversation::{self, Conversation};
 use clanker_command_center::{
-    agent, client, compact, config, mcp, session, spinner, store, terminal_ui, tools, tui, ui, wrap,
+    agent, client, config, mcp, session, spinner, store, terminal_ui, tui, ui, wrap,
 };
 
 use anyhow::Result;
@@ -462,9 +463,9 @@ async fn main() -> Result<()> {
 /// These servers, resolved for starting, with what could not be resolved
 /// said out loud.
 ///
-/// Shared by the reconnect path and by the `clank tools` commands that have
-/// to name a server's tools — the places that connect on purpose rather
-/// than lazily. Takes the servers rather than the config so a caller that
+/// For the `clank tools` commands that have to name a server's tools — the
+/// one place outside the worker that connects on purpose rather than
+/// lazily. Takes the servers rather than the config so a caller that
 /// needs one of them resolves one of them: a broken server it is not about
 /// has no business complaining here.
 fn resolve_configured(servers: &[config::McpServerConfig]) -> Vec<mcp::ServerSpec> {
@@ -488,50 +489,11 @@ fn resolve_configured(servers: &[config::McpServerConfig]) -> Vec<mcp::ServerSpe
     specs
 }
 
-/// Stops every server and starts them all again, reporting what came up.
-///
-/// The `/mcp reconnect` path, and the only thing that still connects
-/// unconditionally: the reason to run it is a server that was rebuilt, so
-/// it starts from nothing rather than from what a turn happened to need.
-/// Everything else connects lazily — see `mcp::ensure_for_access`.
-///
-/// A server that will not start costs that server and is reported. The
-/// alternative — refusing to open a clanker because something unrelated to
-/// the conversation is broken — is worse, and the tools simply are not
-/// there, which `clank tools` then shows.
-async fn connect_mcp_servers() {
-    let Ok(config) = load_config() else {
-        // A config that will not parse is reported by every other path
-        // already; failing here as well would say it twice.
-        return;
-    };
-    if config.mcp_servers.is_empty() {
-        return;
-    }
-
-    let specs = resolve_configured(&config.mcp_servers);
-
-    for started in mcp::connect_all(&specs).await {
-        match started.outcome {
-            Ok(count) => {
-                if config.verbose {
-                    eprintln!(
-                        "{} {} offered {count} tool{}",
-                        "✓".green(),
-                        started.name,
-                        if count == 1 { "" } else { "s" }
-                    );
-                }
-            }
-            Err(e) => eprintln!("{} {}: {e}", "✗".red(), started.name),
-        }
-    }
-}
-
 /// Brings up the servers a `tools` command has to see before it can set
 /// `target`, reporting any that will not start — see
-/// `config::servers_to_name`. Shared by `clank tools` and the line-mode
-/// `/tools`, so the two cover the same tools.
+/// `config::servers_to_name` — the CLI's counterpart to the worker's
+/// `set_tool_access_connecting`, so `clank tools` and `/tools` cover the
+/// same tools.
 async fn connect_to_name(
     target: &str,
     access: ToolAccess,
@@ -1085,18 +1047,8 @@ async fn cmd_tools(state: Option<String>, target: Option<String>) -> Result<()> 
 
 /// The tool listing, shared by `clank tools` and `clank status`.
 fn print_tools(access: &ToolAccessSettings) {
-    let rows = ui::tool_rows(access);
-    // Measured rather than fixed. The width used to be the longest built-in
-    // plus a space; a tool from a server is named `server/tool` and routinely
-    // longer than that, which ran the name into the column beside it.
-    let width = rows
-        .iter()
-        .map(|(name, _)| name.chars().count())
-        .max()
-        .unwrap_or(0)
-        .max(20);
-    for (name, value) in &rows {
-        println!("  {name:<width$} {}", value.bright_black());
+    for line in terminal_ui::tool_lines(access) {
+        println!("{line}");
     }
 }
 
@@ -1711,355 +1663,6 @@ fn user_prompts(messages: &[store::StoredMessage]) -> Vec<String> {
         .collect()
 }
 
-/// Handles one non-message line — a `/model`, `/tools`, `/effort`,
-/// `/verbose`, `/max-iterations`, or `/temperature` command — updating the session (and
-/// `ui`'s live verbosity, which isn't session state) and printing a
-/// confirmation in the same "set to X" / "already X" style the TUI's status
-/// notices use, so the two front ends read the same way.
-#[allow(clippy::too_many_arguments)]
-async fn apply_submission(
-    submission: ui::Submission,
-    session: &mut ChatSession,
-    ui: &mut TerminalAgentUi,
-    default_max_iterations: Option<usize>,
-    default_temperature: Option<f32>,
-    default_effort_level: Option<String>,
-    compactor: &str,
-    compact_at: Option<u64>,
-) -> Result<()> {
-    match submission {
-        ui::Submission::Message(_) => unreachable!("handled by the caller"),
-        // TUI-only for now. The box that shows a command's output and asks
-        // whether to send it has no equivalent in a blocking prompt loop, so
-        // `$` here would have to mean something different — see TODO.
-        ui::Submission::Shell(_)
-        | ui::Submission::SendShell
-        | ui::Submission::DiscardShell
-        // The CLI answers an approval at its own blocking prompt, and has no
-        // launch screen to go back to.
-        | ui::Submission::AllowTool
-        | ui::Submission::DenyTool
-        // A cursor moving through a list of 400 names, which a blocking
-        // prompt has nowhere to draw. `clank models` lists them here.
-        | ui::Submission::BrowseModels
-        // A pane beside the conversation; `git diff` is right there instead.
-        | ui::Submission::ToggleDiff
-        | ui::Submission::Back => {
-            println!(
-                "{} that's a TUI command (`clank tui`), not available here",
-                "✗".red()
-            );
-        }
-        ui::Submission::SetModel(model) => {
-            let changed = model != session.model();
-            session.set_model(model)?;
-            println!(
-                "{} Model {} {}",
-                "✓".green(),
-                if changed { "set to" } else { "is" },
-                session.model()
-            );
-        }
-        ui::Submission::ShowModel => {
-            println!(
-                "Model: {}",
-                response_label(session.model(), &session.effort_level().map(String::from))
-            );
-        }
-        ui::Submission::SetEffort(effort_level) => {
-            let changed = effort_level != session.effort_level().map(String::from);
-            session.set_effort_level(effort_level)?;
-            let label = session.effort_level().unwrap_or("default").to_string();
-            println!(
-                "{} Effort {} {label}",
-                "✓".green(),
-                if changed { "set to" } else { "is" }
-            );
-        }
-        ui::Submission::ResetEffort => {
-            let changed = default_effort_level != session.effort_level().map(String::from);
-            session.set_effort_level(default_effort_level)?;
-            let label = session.effort_level().unwrap_or("default").to_string();
-            println!(
-                "{} Effort {} {label}",
-                "✓".green(),
-                if changed { "set to" } else { "is" }
-            );
-        }
-        ui::Submission::SetVerbose(verbose) => {
-            session.set_verbose(verbose)?;
-            ui.set_verbose(verbose);
-            println!("{}", ui::verbose_notice(verbose, true).blue());
-        }
-        ui::Submission::SetHighlight(highlight) => {
-            // Recorded either way: the CLI draws no band, but the setting
-            // belongs to the session, so switching it here is what the TUI
-            // picks up on its next resume.
-            session.set_highlight(highlight)?;
-            println!("{}", ui::highlight_notice(highlight, true).blue());
-        }
-        ui::Submission::ShowHighlight => {
-            println!(
-                "{}",
-                ui::highlight_notice(session.highlight(), false).blue()
-            );
-        }
-        ui::Submission::SetStream(stream) => {
-            session.set_stream(stream)?;
-            println!("{}", ui::stream_notice(stream, true).blue());
-        }
-        ui::Submission::ShowStream => {
-            println!("{}", ui::stream_notice(session.stream(), false).blue());
-        }
-        ui::Submission::ShowVerbose => {
-            println!("{}", ui::verbose_notice(session.verbose(), false).blue());
-        }
-        ui::Submission::ShowTemperature => {
-            println!(
-                "{}",
-                ui::temperature_notice(session.temperature(), false).blue()
-            );
-        }
-        ui::Submission::SetMaxIterations(max_iterations) => {
-            let changed = max_iterations != session.max_iterations();
-            session.set_max_iterations(max_iterations)?;
-            let label = session
-                .max_iterations()
-                .map(|n| n.to_string())
-                .unwrap_or_else(|| "default".to_string());
-            println!(
-                "{} Max iterations {} {label}",
-                "✓".green(),
-                if changed { "set to" } else { "is" }
-            );
-        }
-        ui::Submission::ResetMaxIterations => {
-            let changed = default_max_iterations != session.max_iterations();
-            session.set_max_iterations(default_max_iterations)?;
-            let label = default_max_iterations
-                .map(|n| n.to_string())
-                .unwrap_or_else(|| "(not set)".to_string());
-            println!(
-                "{} Max iterations {} {label}",
-                "✓".green(),
-                if changed { "set to" } else { "is" }
-            );
-        }
-        ui::Submission::SetTemperature(temperature) => {
-            let changed = temperature != session.temperature();
-            session.set_temperature(temperature)?;
-            let label = session
-                .temperature()
-                .map(|n| n.to_string())
-                .unwrap_or_else(|| "default".to_string());
-            println!(
-                "{} Temperature {} {label}",
-                "✓".green(),
-                if changed { "set to" } else { "is" }
-            );
-        }
-        ui::Submission::ResetTemperature => {
-            let changed = default_temperature != session.temperature();
-            session.set_temperature(default_temperature)?;
-            let label = default_temperature
-                .map(|n| n.to_string())
-                .unwrap_or_else(|| "(not set)".to_string());
-            println!(
-                "{} Temperature {} {label}",
-                "✓".green(),
-                if changed { "set to" } else { "is" }
-            );
-        }
-        ui::Submission::SetToolAccess { target, access } => {
-            // What naming `target` needs comes up first, the same as for
-            // `clank tools` — a category typed before the first turn would
-            // otherwise miss every server's tools.
-            let servers = load_config().map(|c| c.mcp_servers).unwrap_or_default();
-            connect_to_name(&target, access, session.tool_access(), &servers).await;
-            let updated = match session.tool_access().with(&target, access) {
-                Some(updated) => updated,
-                // A configured server that is not connected has no tools to
-                // be named with, and `with` cannot tell that from a typo.
-                // `never` for a whole server is a standing policy keyed by
-                // the name alone, so it can be stored all the same.
-                None => {
-                    match (config::server_target(&target, &servers), access) {
-                        (Some((server, true)), ToolAccess::Never) => {
-                            session.tool_access().never_server(&server)
-                        }
-                        (Some((server, _)), _) => {
-                            println!(
-                                "{} {server} is configured but did not connect, so its tools \
-                                 have no names — /mcp reconnect to try again.",
-                                "✗".red()
-                            );
-                            return Ok(());
-                        }
-                        _ => {
-                            println!(
-                                "{} No tool, category or server called '{target}'.",
-                                "✗".red()
-                            );
-                            return Ok(());
-                        }
-                    }
-                }
-            };
-            let changed = updated != *session.tool_access();
-            session.set_tool_access(updated)?;
-            // The whole list, not just the row that moved: naming one state
-            // tells you neither what else is set nor what it was set from,
-            // and this is the readout people check before walking away.
-            println!("{} Tools {}:", "✓".green(), if changed { "set to" } else { "are" });
-            print_tools(session.tool_access());
-        }
-        ui::Submission::ResetToolAccess => {
-            // The configured access, not the built-in defaults: `clank
-            // tools` is the policy for tools once they are on.
-            session.set_tool_access(load_config()?.tool_access())?;
-            println!("{} Tools set to:", "✓".green());
-            print_tools(session.tool_access());
-        }
-        ui::Submission::ShowTools => {
-            println!("{}", "Tools:".blue());
-            print_tools(session.tool_access());
-        }
-        ui::Submission::ShowMcp => {
-            let servers = load_config().map(|c| c.mcp_servers).unwrap_or_default();
-            println!("{}", "MCP servers:".blue());
-            for (name, state) in ui::mcp_rows(&servers, &mcp::connected_counts()) {
-                println!("  {name}: {}", state.bright_black());
-            }
-        }
-        // `ReconnectMcp` is handled in the loop instead: it awaits, and
-        // this is where a submission that cannot is listed explicitly
-        // rather than caught by `_`.
-        ui::Submission::ReconnectMcp => {
-            unreachable!("the clanker loop reconnects before reaching here")
-        }
-        ui::Submission::SetSandbox(sandbox) => {
-            session.set_sandbox(sandbox)?;
-            println!("{}", ui::sandbox_notice(sandbox, true).blue());
-        }
-        ui::Submission::SetTitle(title) => {
-            session.set_title(title)?;
-            println!("{}", ui::title_notice(session.title(), true).blue());
-        }
-        ui::Submission::ShowTitle => {
-            println!("{}", ui::title_notice(session.title(), false).blue());
-        }
-        ui::Submission::ShowHelp => {
-            let rows = ui::help_rows();
-            let width = rows.iter().map(|(name, _)| name.len()).max().unwrap_or(0);
-            println!("\n{}", "Commands:".blue());
-            for (name, blurb) in rows {
-                // Padded before colouring, since the escape codes count
-                // toward a format width and would misalign the column.
-                println!("  {}  {blurb}", format!("{name:<width$}").bright_black());
-            }
-            println!();
-        }
-        ui::Submission::ShowEffort => {
-            println!(
-                "{}",
-                ui::effort_notice(session.effort_level(), false).blue()
-            );
-        }
-        ui::Submission::ShowStatus => {
-            let tool_access = session.tool_access().clone();
-            let rows = ui::session_settings_rows(&ui::SessionSettings {
-                id: session.short_id(),
-                title: session.title(),
-                model: session.model(),
-                effort_level: session.effort_level(),
-                temperature: session.temperature(),
-                max_iterations: session.max_iterations(),
-                verbose: session.verbose(),
-                highlight: session.highlight(),
-                sandbox: session.sandbox(),
-                stream: session.stream(),
-                working_dir: session.working_dir(),
-                tool_access: &tool_access,
-                total_tokens: session.total_tokens(),
-                compactor,
-                compact_at,
-            });
-            let width = rows.iter().map(|(label, _)| label.len()).max().unwrap_or(0);
-            println!("\n{}", "Clanker:".blue());
-            for (label, value) in rows {
-                // Padded before colouring: the escape codes count toward a
-                // format width, so colouring first misaligns the column.
-                println!("  {}  {value}", format!("{label:<width$}").bright_black());
-            }
-            println!();
-        }
-        ui::Submission::ShowSandbox => {
-            println!("{}", ui::sandbox_notice(session.sandbox(), false).blue());
-        }
-        // Needs the client and an await, which this has neither of — the
-        // chat loop takes it before reaching here, the same way it takes an
-        // ordinary message.
-        ui::Submission::Compact => unreachable!("handled by the caller"),
-        ui::Submission::UnknownCommand(message) => {
-            println!("{} {}", "✗".red(), message);
-        }
-    }
-    Ok(())
-}
-
-/// Compacts a plain-CLI session's history, printing what happened in the
-/// same words the TUI puts in its transcript.
-///
-/// The worker's [`conversation::Worker::compact`] equivalent, minus the
-/// select loop: this front end is a blocking prompt, so there is nothing to
-/// stay responsive for while the summary is written.
-///
-/// `forced` is `/compact` rather than the threshold firing, and decides only
-/// whether having nothing to fold is worth saying — see the worker's for why.
-async fn compact_cli(
-    client: &Client,
-    session: &mut ChatSession,
-    model: &str,
-    compact_at: Option<u64>,
-    guard: &mut compact::CompactionGuard,
-    reads: &tools::FileReads,
-    forced: bool,
-) -> Result<()> {
-    let from = session.compacted_seq();
-    let Some(cut) = compact::seam(session.messages(), from, compact_at) else {
-        if forced {
-            println!(
-                "{} There isn't enough history past the last compaction to fold away yet",
-                "✓".green()
-            );
-        }
-        return Ok(());
-    };
-
-    println!("{}", ui::compacting_notice(model).blue());
-    let span = session.messages()[from..cut].to_vec();
-    let previous = session.compaction_summary().map(str::to_string);
-    // A compaction is a full round trip with the whole folded span in it, so
-    // on a long history it is the longest silence `clank` ever produces. The
-    // same spinner a turn gets, for the same reason.
-    let spinner = Spinner::start("Compacting...");
-    let compacted = compact::compact(client, model, previous.as_deref(), &span, compact_at).await;
-    spinner.stop().await;
-    let compacted = compacted?;
-
-    // Spent on this clanker's behalf, so it counts against this clanker.
-    if let Err(e) = session.add_tokens(compacted.tokens as i64) {
-        eprintln!("{} Failed to save token usage: {}", "✗".red(), e);
-    }
-    session.set_compaction(cut, compacted.summary)?;
-    guard.compacted();
-    // The files' text went with what was folded, so a change needs a fresh
-    // read.
-    reads.forget();
-    println!("{}", ui::compacted_notice(cut).blue());
-    Ok(())
-}
-
 /// Asks for a session title, for `clank session` without `--title`.
 ///
 /// Refuses a blank one rather than falling back to naming the session from
@@ -2104,10 +1707,9 @@ async fn cmd_clanker(
     // against — see `Config::compactor`.
     let compactor = resolve_compactor(&config);
     let compact_at = config.compact_at;
-    let mut guard = compact::CompactionGuard::default();
 
     let mut prior_prompts: Vec<String> = Vec::new();
-    let mut session = match resume {
+    let session = match resume {
         Some(id_or_prefix) => {
             let summary = resolve_resume_target(&conn, &id_or_prefix)?;
             // A resumed session keeps its own saved settings; `-m` (like any
@@ -2198,7 +1800,25 @@ async fn cmd_clanker(
         }
     };
 
-    let client = Client::new(config)?;
+    // The claim, not merely the reporting: two processes appending turns to
+    // one history write colliding `seq` values, and the result reloads as a
+    // conversation with its turns shuffled and its tool results detached
+    // from the calls they answer. Nothing detects that and nothing repairs
+    // it, so a session that cannot be claimed is not run.
+    let claim = match session::Heartbeat::claim(session.id().to_string()) {
+        Ok(Some(claim)) => claim,
+        Ok(None) => anyhow::bail!(
+            "Session {} is already being run by another process.\n\n\
+             Wait for it to finish. A claim left behind by a process that \
+             died expires on its own within half a minute.",
+            session.short_id()
+        ),
+        Err(e) => anyhow::bail!("Could not claim clanker {}: {e}", session.short_id()),
+    };
+
+    // What `/tools on` turns on — read before `config` moves into the client.
+    let tool_access_default = config.tool_access();
+    let client = Arc::new(Client::new(config)?);
 
     println!("{}\n", "Starting clanker (type 'exit' to quit)".blue());
 
@@ -2208,36 +1828,35 @@ async fn cmd_clanker(
     for prompt in prior_prompts {
         let _ = rl.add_history_entry(prompt);
     }
-    // No `-v` here (unlike `agent`) — matching the TUI, a session always
-    // starts quiet; `/verbose` is the only way to turn it on. No model
-    // label either, again matching the TUI transcript.
-    // Seeded from the session rather than hardcoded, so a resumed session
-    // that had `/verbose` on comes back showing detail.
+    // No `-v` here (unlike a one-off run) — matching the TUI, a clanker
+    // always starts quiet; `/verbose` is the only way to turn it on. No model
+    // label either, again matching the TUI transcript. Seeded from the
+    // session rather than hardcoded, so a resumed session that had
+    // `/verbose` on comes back showing detail.
     let mut ui = TerminalAgentUi::new(session.verbose(), false);
-    // Lets a CLI session report approvals the way a TUI one does — the
-    // prompt blocks on stdin, so without this it would look merely busy to
-    // anyone watching the picker.
-    // The claim, not merely the reporting: two processes appending turns to
-    // one history write colliding `seq` values, and the result reloads as a
-    // conversation with its turns shuffled and its tool results detached
-    // from the calls they answer. Nothing detects that and nothing repairs
-    // it, so a session that cannot be claimed is not run.
-    match terminal_ui::ActivityWriter::claim(session.id().to_string()) {
-        Ok(Some(activity)) => ui.watch(activity),
-        Ok(None) => anyhow::bail!(
-            "Session {} is already being run by another process.\n\n\
-             Wait for it to finish. A claim left behind by a process that \
-             died expires on its own within half a minute.",
-            session.short_id()
-        ),
-        Err(e) => anyhow::bail!("Could not claim clanker {}: {e}", session.short_id()),
-    }
+    ui.mark_as(session.id());
+    let mut view = terminal_ui::SessionView::of(&session);
 
-    // Outlives the gates, which are built afresh each turn: a file read in
-    // one turn can be edited in the next.
-    let reads = tools::FileReads::default();
+    // The same worker the TUI drives, so a clanker means the same thing
+    // whichever front end it is opened in: this loop only reads lines,
+    // sends what they mean, and prints what comes back.
+    let mut conversation = Conversation::spawn(
+        client,
+        session,
+        default_max_iterations,
+        default_temperature,
+        default_effort_level,
+        tool_access_default,
+        Some(compactor.clone()),
+        compact_at,
+        claim,
+    );
+
     loop {
-        let readline = rl.readline(&format!("{} ", "❯".green().bold()));
+        // Blocks this thread until a line arrives, so the runtime is told to
+        // move its other work — the worker, the claim's heartbeat — off it.
+        let readline =
+            tokio::task::block_in_place(|| rl.readline(&format!("{} ", "❯".green().bold())));
 
         let line = match readline {
             Ok(line) => line,
@@ -2261,167 +1880,31 @@ async fn cmd_clanker(
             break;
         }
 
-        match ui::classify(&line) {
-            ui::Submission::ReconnectMcp => {
-                // Nothing to refuse against, unlike the TUI: this loop
-                // reads a line, runs a turn, and comes back, so no turn can
-                // be in flight while a command is being read.
-                let before = mcp::connected_counts();
-                connect_mcp_servers().await;
-                let after = mcp::connected_counts();
-                println!("{}", ui::mcp_reconnected_notice(&before, &after).blue());
-            }
-            ui::Submission::Compact => {
-                if let Err(e) = compact_cli(
-                    &client,
-                    &mut session,
-                    &compactor,
-                    compact_at,
-                    &mut guard,
-                    &reads,
-                    true,
-                )
-                .await
-                {
-                    println!("{} Compaction failed: {}", "✗".red(), e);
+        let submission = ui::classify(&line);
+        // `$` and the model browser go to the worker in the TUI, but each
+        // needs a screen this loop doesn't have — see `answer_locally`.
+        let tui_only = matches!(
+            submission,
+            ui::Submission::Shell(_) | ui::Submission::BrowseModels
+        );
+        match conversation::command_for(&submission).filter(|_| !tui_only) {
+            Some(command) => {
+                let message = matches!(command, conversation::Command::Send(_));
+                if message {
+                    println!();
                 }
-                println!();
-            }
-            ui::Submission::Message(text) => {
-                // Before the message is recorded, so what gets summarized is
-                // the conversation up to now rather than the question that
-                // is about to be asked of it.
-                if compact_at.is_some_and(|threshold| guard.due(session.prompt_tokens(), threshold))
-                {
-                    // Reported, not fatal: an oversized history makes for a
-                    // worse request, not an impossible one.
-                    if let Err(e) = compact_cli(
-                        &client,
-                        &mut session,
-                        &compactor,
-                        compact_at,
-                        &mut guard,
-                        &reads,
-                        false,
-                    )
-                    .await
-                    {
-                        println!("{} Compaction failed: {}", "✗".red(), e);
-                    }
+                conversation.send(command);
+                if !follow(&mut conversation, &mut ui, &mut view).await {
+                    eprintln!("{} The clanker stopped unexpectedly", "✗".red());
+                    break;
                 }
-
-                session.push_user(text);
-                if let Err(e) = session.persist_pending() {
-                    eprintln!("{} Failed to save message: {}", "✗".red(), e);
-                }
-
-                println!();
-                let model = session.model().to_string();
-                let effort_level = session.effort_level().map(str::to_string);
-                let temperature = session.temperature();
-                let session_stream = session.stream();
-                // Coarser than the TUI's, which sees approvals through its
-                // worker: a blocking loop has no such seam. Working and
-                // failed are still the two that a list of sessions most
-                // needs, and both are visible from here.
-                session.set_activity(Some(store::Activity::Working), None);
-                let usage = agent::UsageTracker::default();
-                // What the provider sees, which is not the whole history
-                // once this clanker has been compacted. The turn appends to
-                // this copy and everything past `sent` is folded back into
-                // the session below — the agent loop can no longer be handed
-                // the session's own vector, because the two differ.
-                let mut messages = session.request_messages(compact_at);
-                let sent = messages.len();
-                // Lazy connection, before the agentic check below: a
-                // clanker whose built-ins are all off but whose servers are
-                // not is still agentic, and the check needs the servers'
-                // tools to see it.
-                for started in mcp::ensure_for_access(session.tool_access()).await {
-                    if let Err(e) = started.outcome {
-                        eprintln!("{} {}: {e}", "✗".red(), started.name);
-                    }
-                }
-                let turn = if session.is_agentic() {
-                    let max_iterations = session.max_iterations();
-                    let gates = SessionGates::new(
-                        session.tool_access().clone(),
-                        session.sandbox(),
-                        client.command_timeout(),
-                    )
-                    .with_reads(reads.clone());
-                    agent::run_agent_turn(
-                        &client,
-                        &mut ui,
-                        &mut messages,
-                        &model,
-                        max_iterations,
-                        temperature,
-                        &gates,
-                        effort_level,
-                        session_stream,
-                        // Nowhere to type while this loop runs — it reads a
-                        // line, works, then reads the next one. The TUI is
-                        // where a message can join a turn in progress.
-                        &agent::Steering::default(),
-                        &usage,
-                    )
-                    .await
-                } else {
-                    agent::run_chat_turn(
-                        &client,
-                        &mut ui,
-                        &mut messages,
-                        &model,
-                        temperature,
-                        effort_level,
-                        session_stream,
-                        &usage,
-                    )
-                    .await
-                };
-
-                session.absorb(messages, sent);
-
-                let failed = turn.is_err();
-                match turn {
-                    // The reply itself, and its trailing blank line, are
-                    // printed by the UI now — one blank line after every
-                    // transcript unit, matching the TUI.
-                    Ok(Some(_)) | Ok(None) => {}
-                    Err(e) => println!("{} {}\n", "✗".red(), e),
-                }
-                session.set_activity(failed.then_some(store::Activity::Failed), None);
-                for message in session.record_turn(&usage) {
-                    eprintln!("{} {message}", "✗".red());
-                }
-                // Whether a compaction this turn ran got the request back
-                // under the line. The turn's *first* request, not its last:
-                // the last one carries everything this turn's tool calls
-                // appended — see `CompactionGuard::measured`.
-                if let Some(threshold) = compact_at {
-                    guard.measured(usage.first_prompt(), threshold);
-                }
-
-                if let Err(e) = session.persist_pending() {
-                    eprintln!("{} Failed to save message: {}", "✗".red(), e);
+                // A reply ends with its own blank line; a notice doesn't.
+                if !message {
+                    println!();
                 }
             }
-            submission => {
-                if let Err(e) = apply_submission(
-                    submission,
-                    &mut session,
-                    &mut ui,
-                    default_max_iterations,
-                    default_temperature,
-                    default_effort_level.clone(),
-                    &compactor,
-                    compact_at,
-                )
-                .await
-                {
-                    println!("{} {}", "✗".red(), e);
-                }
+            None => {
+                answer_locally(submission, &view, &compactor, compact_at);
                 // One blank line after every transcript unit, matching a
                 // message reply and the TUI's own Notice spacing.
                 println!();
@@ -2429,13 +1912,180 @@ async fn cmd_clanker(
         }
     }
 
+    // So the worker's last writes land before the process exits.
+    conversation.shutdown().await;
     println!(
         "{} Clanker saved. Resume with: clank clanker --resume {}",
         "✓".green(),
-        session.short_id()
+        view.short_id
     );
 
     Ok(())
+}
+
+/// Prints what the worker reports until it has finished what it was just
+/// sent — [`conversation::Event::Ready`] — answering any approval it asks
+/// for on the way. `false` if the worker has gone.
+async fn follow(
+    conversation: &mut Conversation,
+    ui: &mut TerminalAgentUi,
+    view: &mut terminal_ui::SessionView,
+) -> bool {
+    use conversation::Event;
+    use ui::AgentUi;
+    // A compaction is a full round trip with the whole folded span in it,
+    // so on a long history it is the longest silence `clank` produces. The
+    // same spinner a request gets, until whatever the worker says next.
+    let mut compacting: Option<Spinner> = None;
+    loop {
+        let event = conversation.next_event().await;
+        if let Some(spinner) = compacting.take() {
+            spinner.stop().await;
+        }
+        let Some(event) = event else {
+            return false;
+        };
+        match event {
+            Event::Ready => return true,
+            Event::Agent(event) => ui.event(event).await,
+            Event::ApprovalRequested(request) => {
+                // Unanswerable — stdin closed — reads as a no, the safe
+                // answer to a question nobody can hear.
+                let allowed = ui.approve(request).await.unwrap_or(false);
+                conversation.send(conversation::Command::Approve(allowed));
+            }
+            event => {
+                if let Event::VerboseChanged { verbose } = event {
+                    ui.set_verbose(verbose);
+                }
+                for line in view.apply(&event) {
+                    println!("{line}");
+                }
+                if matches!(event, Event::Compacting { .. }) {
+                    compacting = Some(Spinner::start("Compacting..."));
+                }
+            }
+        }
+    }
+}
+
+/// Answers a submission that changes nothing, from what the view already
+/// holds — the read-only half of [`conversation::command_for`]'s split —
+/// or says why a command can't run here.
+fn answer_locally(
+    submission: ui::Submission,
+    view: &terminal_ui::SessionView,
+    compactor: &str,
+    compact_at: Option<u64>,
+) {
+    match submission {
+        // TUI-only for now. The box that shows a command's output and asks
+        // whether to send it has no equivalent in a blocking prompt loop, so
+        // `$` here would have to mean something different — see TODO.
+        ui::Submission::Shell(_)
+        | ui::Submission::SendShell
+        | ui::Submission::DiscardShell
+        // The CLI answers an approval at its own blocking prompt, and has no
+        // launch screen to go back to.
+        | ui::Submission::AllowTool
+        | ui::Submission::DenyTool
+        // A cursor moving through a list of 400 names, which a blocking
+        // prompt has nowhere to draw. `clank models` lists them here.
+        | ui::Submission::BrowseModels
+        // A pane beside the conversation; `git diff` is right there instead.
+        | ui::Submission::ToggleDiff
+        | ui::Submission::Back => {
+            println!(
+                "{} that's a TUI command (`clank tui`), not available here",
+                "✗".red()
+            );
+        }
+        ui::Submission::ShowModel => {
+            println!("Model: {}", response_label(&view.model, &view.effort_level));
+        }
+        ui::Submission::ShowEffort => {
+            println!(
+                "{}",
+                ui::effort_notice(view.effort_level.as_deref(), false).blue()
+            );
+        }
+        ui::Submission::ShowVerbose => {
+            println!("{}", ui::verbose_notice(view.verbose, false).blue());
+        }
+        ui::Submission::ShowHighlight => {
+            println!("{}", ui::highlight_notice(view.highlight, false).blue());
+        }
+        ui::Submission::ShowStream => {
+            println!("{}", ui::stream_notice(view.stream, false).blue());
+        }
+        ui::Submission::ShowTemperature => {
+            println!(
+                "{}",
+                ui::temperature_notice(view.temperature, false).blue()
+            );
+        }
+        ui::Submission::ShowSandbox => {
+            println!("{}", ui::sandbox_notice(view.sandbox, false).blue());
+        }
+        ui::Submission::ShowTitle => {
+            println!("{}", ui::title_notice(&view.title, false).blue());
+        }
+        ui::Submission::ShowTools => {
+            println!("{}", "Tools:".blue());
+            print_tools(&view.tool_access);
+        }
+        ui::Submission::ShowMcp => {
+            let servers = load_config().map(|c| c.mcp_servers).unwrap_or_default();
+            println!("{}", "MCP servers:".blue());
+            for (name, state) in ui::mcp_rows(&servers, &mcp::connected_counts()) {
+                println!("  {name}: {}", state.bright_black());
+            }
+        }
+        ui::Submission::ShowHelp => {
+            let rows = ui::help_rows();
+            let width = rows.iter().map(|(name, _)| name.len()).max().unwrap_or(0);
+            println!("\n{}", "Commands:".blue());
+            for (name, blurb) in rows {
+                // Padded before colouring, since the escape codes count
+                // toward a format width and would misalign the column.
+                println!("  {}  {blurb}", format!("{name:<width$}").bright_black());
+            }
+            println!();
+        }
+        ui::Submission::ShowStatus => {
+            let rows = ui::session_settings_rows(&ui::SessionSettings {
+                id: &view.short_id,
+                title: &view.title,
+                model: &view.model,
+                effort_level: view.effort_level.as_deref(),
+                temperature: view.temperature,
+                max_iterations: view.max_iterations,
+                verbose: view.verbose,
+                highlight: view.highlight,
+                sandbox: view.sandbox,
+                stream: view.stream,
+                working_dir: view.working_dir.as_deref(),
+                tool_access: &view.tool_access,
+                total_tokens: view.total_tokens,
+                compactor,
+                compact_at,
+            });
+            let width = rows.iter().map(|(label, _)| label.len()).max().unwrap_or(0);
+            println!("\n{}", "Clanker:".blue());
+            for (label, value) in rows {
+                // Padded before colouring: the escape codes count toward a
+                // format width, so colouring first misaligns the column.
+                println!("  {}  {value}", format!("{label:<width$}").bright_black());
+            }
+            println!();
+        }
+        ui::Submission::UnknownCommand(message) => {
+            println!("{} {}", "✗".red(), message);
+        }
+        // Everything else changes the session, which the worker owns —
+        // `command_for` sends those there before this is reached.
+        other => unreachable!("{other:?} goes to the worker"),
+    }
 }
 
 /// Opens the session a `--session` agent run writes to, or `None` for the

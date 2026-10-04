@@ -561,6 +561,9 @@ impl App {
                 self.transcript.push(TranscriptItem::Notice(summary));
             }
             Event::Agent(event) => self.apply_agent(event),
+            // For a front end that waits on each command in turn. This one
+            // never waits: `Busy` is what its display follows.
+            Event::Ready => {}
         }
     }
 

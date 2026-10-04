@@ -30,6 +30,13 @@
 * what else could be added to verbose mode?
 * Live raw request/response screen?
 * Skills? implement Agent Skill Standard: agentskills.io
+* Embedding CCC in another program. The conversation worker is already
+  the API — commands in, events out, `Event::Ready` when a command is
+  done — and both front ends drive it. First gap: a client cannot ask it
+  for the session's state. The TUI and line mode read it off the
+  `ChatSession` before handing it over, which an outside program can't;
+  the worker should send a snapshot when it starts. After that, a wire
+  format: `Command`/`Event` as JSON lines over stdio.
 * A closed stdout panics: `clank tools | head` dies with "failed printing
   to stdout: Broken pipe", because `println!` panics on EPIPE. Every
   command's output piped into something that exits early does it. Exit
