@@ -72,21 +72,28 @@ fn offered_tools(access: &ToolAccessSettings) -> Vec<serde_json::Value> {
         .collect()
 }
 
-// Every parameter here is a distinct, independently-overridable request
-// setting (model, iteration cap, temperature, tool access, effort) —
-// bundling them into a struct wouldn't simplify anything, just move the
-// same list one level out.
-#[allow(clippy::too_many_arguments)]
+/// What a turn's requests are made with. Snapshotted once per turn — from a
+/// clanker's own settings, or from flags and config for a run without one —
+/// so a `/model` or `/stream` typed while a turn runs reaches the next turn
+/// rather than changing this one halfway through.
+#[derive(Clone, Debug)]
+pub struct TurnSettings {
+    pub model: String,
+    pub temperature: Option<f32>,
+    pub effort_level: Option<String>,
+    /// Passed in rather than read off the client: streaming is a per-session
+    /// setting, and one client is shared by every session in a process.
+    pub stream: bool,
+    /// Read only by the agent loop; a plain exchange is one request.
+    pub max_iterations: Option<usize>,
+}
+
 pub async fn run_agent(
     client: &Client,
     ui: &mut impl AgentUi,
     task: &str,
-    model: &str,
-    max_iterations: Option<usize>,
-    temperature: Option<f32>,
+    settings: &TurnSettings,
     gates: &SessionGates,
-    effort_level: Option<String>,
-    stream: bool,
 ) -> Result<Option<String>> {
     let mut messages = vec![ChatMessage {
         role: "user".to_string(),
@@ -100,12 +107,8 @@ pub async fn run_agent(
         client,
         ui,
         &mut messages,
-        model,
-        max_iterations,
-        temperature,
+        settings,
         gates,
-        effort_level,
-        stream,
         &Steering::default(),
         &UsageTracker::default(),
     )
@@ -119,32 +122,24 @@ pub async fn run_agent(
 /// [`AgentEvent::AssistantDelta`] as text arrives, so a front end that can
 /// re-render (a TUI) shows it live while one that can't (the CLI) simply
 /// ignores the deltas and renders the finished message.
-// Same reasoning as `run_agent`: the parameters are the turn's inputs,
-// and a struct would only move the argument list somewhere else.
-#[allow(clippy::too_many_arguments)]
 async fn request_turn(
     client: &Client,
     ui: &mut impl AgentUi,
     mut messages: Vec<ChatMessage>,
-    model: &str,
-    temperature: Option<f32>,
+    settings: &TurnSettings,
     tools: Option<Vec<serde_json::Value>>,
     system: Option<&str>,
-    effort_level: Option<String>,
-    stream: bool,
     usage: &UsageTracker,
 ) -> Result<ChatMessage> {
     normalize_system_prompt(&mut messages, system);
 
-    // Passed in rather than read off the client: streaming is a per-session
-    // setting now, and one client is shared by every session in a process.
-    let mut message = if stream {
+    let mut message = if settings.stream {
         let stream = client.chat_stream(
-            model.to_string(),
+            settings.model.clone(),
             messages,
-            temperature,
+            settings.temperature,
             tools,
-            effort_level,
+            settings.effort_level.clone(),
         );
         pin_mut!(stream);
 
@@ -170,11 +165,11 @@ async fn request_turn(
     } else {
         let response = client
             .chat(
-                model.to_string(),
+                settings.model.clone(),
                 messages,
-                temperature,
+                settings.temperature,
                 tools,
-                effort_level,
+                settings.effort_level.clone(),
             )
             .await?;
         if let Some(request_usage) = response.usage {
@@ -251,34 +246,15 @@ fn drop_dangling_reasoning(message: &mut ChatMessage) {
 /// reply, append it. The `chat` counterpart to [`run_agent_turn`], so both
 /// modes reach a front end through the same events instead of `chat` being
 /// open-coded by each caller.
-// Same reasoning as `run_agent`/`run_agent_turn`: the parameters are the
-// turn's inputs, and a struct would only move the argument list somewhere
-// else.
-#[allow(clippy::too_many_arguments)]
 pub async fn run_chat_turn(
     client: &Client,
     ui: &mut impl AgentUi,
     messages: &mut Vec<ChatMessage>,
-    model: &str,
-    temperature: Option<f32>,
-    effort_level: Option<String>,
-    stream: bool,
+    settings: &TurnSettings,
     usage: &UsageTracker,
 ) -> Result<Option<String>> {
     ui.event(AgentEvent::RequestStarted).await;
-    let turn = request_turn(
-        client,
-        ui,
-        messages.clone(),
-        model,
-        temperature,
-        None,
-        None,
-        effort_level.clone(),
-        stream,
-        usage,
-    )
-    .await;
+    let turn = request_turn(client, ui, messages.clone(), settings, None, None, usage).await;
     ui.event(AgentEvent::RequestFinished).await;
     let message = turn?;
 
@@ -287,8 +263,8 @@ pub async fn run_chat_turn(
     // in it is neither shown nor added to the history.
     if let Some(content) = message.visible_content().map(str::to_string) {
         ui.event(AgentEvent::AssistantMessage {
-            model: model.to_string(),
-            effort_level,
+            model: settings.model.clone(),
+            effort_level: settings.effort_level.clone(),
             text: content.clone(),
         })
         .await;
@@ -307,8 +283,6 @@ pub async fn run_chat_turn(
 /// Progress is reported to `ui` rather than printed, and any tool needing
 /// permission is put to `ui` as an [`ApprovalRequest`], so the same loop
 /// drives the CLI, a GUI, or a test harness unchanged.
-// See `run_agent`'s note on why this isn't bundled into a params struct.
-#[allow(clippy::too_many_arguments)]
 /// Messages typed while a turn is running, waiting to join it.
 ///
 /// A turn is many requests, and the array sent with each one is built fresh,
@@ -439,17 +413,12 @@ impl UsageTracker {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub async fn run_agent_turn(
     client: &Client,
     ui: &mut impl AgentUi,
     messages: &mut Vec<ChatMessage>,
-    model: &str,
-    max_iterations: Option<usize>,
-    temperature: Option<f32>,
+    settings: &TurnSettings,
     gates: &SessionGates,
-    effort_level: Option<String>,
-    stream: bool,
     steering: &Steering,
     usage: &UsageTracker,
 ) -> Result<Option<String>> {
@@ -457,7 +426,7 @@ pub async fn run_agent_turn(
     // to a default for this — it never leaves the process, so a missing cap
     // can't be sent as "no value" the way an omitted request field can. Fail
     // clearly up front rather than picking a number on the caller's behalf.
-    let max_iterations = max_iterations.ok_or_else(|| {
+    let max_iterations = settings.max_iterations.ok_or_else(|| {
         anyhow::anyhow!(
             "No max-iterations cap is set. Set one with /max-iterations <n> for this session, \
              or clank max-iterations <n> as the persistent default."
@@ -506,12 +475,9 @@ pub async fn run_agent_turn(
             client,
             ui,
             messages.clone(),
-            model,
-            temperature,
+            settings,
             Some(tool_definitions.clone()),
             Some(&system),
-            effort_level.clone(),
-            stream,
             usage,
         )
         .await;
@@ -523,8 +489,8 @@ pub async fn run_agent_turn(
         // If the LLM generated text, show it
         if let Some(content) = message.visible_content() {
             ui.event(AgentEvent::AssistantMessage {
-                model: model.to_string(),
-                effort_level: effort_level.clone(),
+                model: settings.model.clone(),
+                effort_level: settings.effort_level.clone(),
                 text: content.to_string(),
             })
             .await;
@@ -622,6 +588,16 @@ pub async fn run_agent_turn(
 #[cfg(test)]
 mod tests {
 
+    fn test_settings(max_iterations: Option<usize>) -> TurnSettings {
+        TurnSettings {
+            model: "test-model".to_string(),
+            temperature: None,
+            effort_level: None,
+            stream: false,
+            max_iterations,
+        }
+    }
+
     /// The drain happens before the request is built, so a request that
     /// fails still proves the message was injected — and where.
     #[tokio::test]
@@ -643,12 +619,8 @@ mod tests {
             &client,
             &mut ui,
             &mut messages,
-            "test-model",
-            Some(1),
-            None,
+            &test_settings(Some(1)),
             &SessionGates::default(),
-            None,
-            false,
             &steering,
             &UsageTracker::default(),
         )
@@ -793,12 +765,8 @@ mod tests {
             &client,
             &mut ui,
             &mut messages,
-            "test-model",
-            None,
-            None,
+            &test_settings(None),
             &SessionGates::default(),
-            None,
-            false,
             &Steering::default(),
             &UsageTracker::default(),
         )

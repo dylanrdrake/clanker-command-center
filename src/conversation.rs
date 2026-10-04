@@ -659,10 +659,9 @@ impl Worker {
         // until a compaction makes them differ, and then only this one is
         // right.
         let sent = messages.len();
-        let model = self.session.model().to_string();
-        let effort_level = self.session.effort_level().map(|s| s.to_string());
-        let max_iterations = self.session.max_iterations();
-        let temperature = self.session.temperature();
+        // Snapshotted per turn: a `/model` or `/stream` typed while it runs
+        // shapes the next turn's requests, not this one's.
+        let settings = self.session.turn_settings();
         let gates = self.gates.clone();
         let steering = self.steering.clone();
         // Cloned into the spawned task below; this handle stays here so the
@@ -671,9 +670,6 @@ impl Worker {
         // through the task's return value instead.
         let usage = agent::UsageTracker::default();
         let usage_for_turn = usage.clone();
-        // Snapshotted per turn, like model and effort: streaming shapes how
-        // the next request is made, not what a running tool may do.
-        let stream = self.session.stream();
         // Read per turn rather than held: a clanker has tools when at
         // least one of them is not `never`, so `/tools off` mid-session
         // makes the next turn a plain exchange with nothing to carry it.
@@ -686,28 +682,15 @@ impl Worker {
                     &client,
                     &mut ui,
                     &mut messages,
-                    &model,
-                    max_iterations,
-                    temperature,
+                    &settings,
                     &gates,
-                    effort_level,
-                    stream,
                     &steering,
                     &usage_for_turn,
                 )
                 .await
             } else {
-                agent::run_chat_turn(
-                    &client,
-                    &mut ui,
-                    &mut messages,
-                    &model,
-                    temperature,
-                    effort_level,
-                    stream,
-                    &usage_for_turn,
-                )
-                .await
+                agent::run_chat_turn(&client, &mut ui, &mut messages, &settings, &usage_for_turn)
+                    .await
             };
             (result, messages)
         });

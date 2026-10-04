@@ -805,6 +805,17 @@ impl ChatSession {
         &self.id[..8]
     }
 
+    /// The settings a turn starting now would make its requests with.
+    pub fn turn_settings(&self) -> crate::agent::TurnSettings {
+        crate::agent::TurnSettings {
+            model: self.model().to_string(),
+            temperature: self.temperature(),
+            effort_level: self.effort_level().map(str::to_string),
+            stream: self.stream(),
+            max_iterations: self.max_iterations(),
+        }
+    }
+
     pub fn model(&self) -> &str {
         &self.model
     }

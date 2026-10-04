@@ -1588,10 +1588,14 @@ async fn cmd_ask(
     effort_level: Option<String>,
 ) -> Result<()> {
     let config = load_config()?;
-    let model = resolve_model(&config, model);
-    let effort_level = resolve_effort_level(&config, effort_level);
-    let temperature = resolve_temperature(&config, temperature);
-    let stream = config.stream;
+    let settings = agent::TurnSettings {
+        model: resolve_model(&config, model),
+        temperature: resolve_temperature(&config, temperature),
+        effort_level: resolve_effort_level(&config, effort_level),
+        stream: config.stream,
+        // One request, whatever the configured cap.
+        max_iterations: None,
+    };
     let client = Client::new(config)?;
 
     let mut messages = vec![ChatMessage {
@@ -1608,10 +1612,7 @@ async fn cmd_ask(
         &client,
         &mut ui,
         &mut messages,
-        &model,
-        temperature,
-        effort_level,
-        stream,
+        &settings,
         &agent::UsageTracker::default(),
     )
     .await?;
@@ -2166,27 +2167,24 @@ async fn cmd_agent(
 
     // A session's own settings are the ones it runs with; the flag-plus-config
     // merge only applies to a run that has no session to remember anything.
-    let (model, max_iterations, temperature, effort_level, tool_access, sandbox, stream) =
-        match &stored {
-            Some((session, _)) => (
-                session.model().to_string(),
-                session.max_iterations(),
-                session.temperature(),
-                session.effort_level().map(str::to_string),
-                session.tool_access().clone(),
-                session.sandbox(),
-                session.stream(),
-            ),
-            None => (
-                resolve_model(&config, model),
-                resolve_max_iterations(&config, max_iterations),
-                resolve_temperature(&config, temperature),
-                resolve_effort_level(&config, effort_level),
-                access,
-                config.sandbox,
-                config.stream,
-            ),
-        };
+    let (mut settings, tool_access, sandbox) = match &stored {
+        Some((session, _)) => (
+            session.turn_settings(),
+            session.tool_access().clone(),
+            session.sandbox(),
+        ),
+        None => (
+            agent::TurnSettings {
+                model: resolve_model(&config, model),
+                temperature: resolve_temperature(&config, temperature),
+                effort_level: resolve_effort_level(&config, effort_level),
+                stream: config.stream,
+                max_iterations: resolve_max_iterations(&config, max_iterations),
+            },
+            access,
+            config.sandbox,
+        ),
+    };
 
     // Lazy connection, before the agentic checks just below: a clanker
     // whose built-ins are all off but whose servers are not is still
@@ -2199,11 +2197,9 @@ async fn cmd_agent(
 
     // Nothing to call means nothing to loop over: one iteration is the whole
     // of the turn, so a nullified cap is no reason to refuse the run.
-    let max_iterations = if tool_access.any_tools() {
-        max_iterations
-    } else {
-        max_iterations.or(Some(1))
-    };
+    if !tool_access.any_tools() {
+        settings.max_iterations = settings.max_iterations.or(Some(1));
+    }
 
     let client = Client::new(config)?;
 
@@ -2218,18 +2214,7 @@ async fn cmd_agent(
     let gates = SessionGates::new(tool_access, sandbox, client.command_timeout());
 
     let Some((mut session, activity)) = stored else {
-        agent::run_agent(
-            &client,
-            &mut ui,
-            task,
-            &model,
-            max_iterations,
-            temperature,
-            &gates,
-            effort_level,
-            stream,
-        )
-        .await?;
+        agent::run_agent(&client, &mut ui, task, &settings, &gates).await?;
         return Ok(());
     };
 
@@ -2252,12 +2237,8 @@ async fn cmd_agent(
         &client,
         &mut ui,
         session.messages_mut(),
-        &model,
-        max_iterations,
-        temperature,
+        &settings,
         &gates,
-        effort_level,
-        stream,
         // Nothing can join a turn that has no input to type into.
         &agent::Steering::default(),
         &usage,
