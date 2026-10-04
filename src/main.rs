@@ -1647,36 +1647,30 @@ async fn cmd_ask(
     let model = resolve_model(&config, model);
     let effort_level = resolve_effort_level(&config, effort_level);
     let temperature = resolve_temperature(&config, temperature);
+    let stream = config.stream;
     let client = Client::new(config)?;
 
-    let messages = vec![ChatMessage {
+    let mut messages = vec![ChatMessage {
         role: "user".to_string(),
         content: Some(prompt.to_string()),
-        tool_calls: None,
-        tool_call_id: None,
         ..Default::default()
     }];
 
-    let spinner = Spinner::start("Thinking...");
-    let response = client
-        .chat(
-            model.clone(),
-            messages,
-            temperature,
-            None,
-            effort_level.clone(),
-        )
-        .await;
-    spinner.stop().await;
-    let response = response?;
-    let choice = &response.choices[0];
-
-    println!("{} ", "✓".green());
-    println!("\n{}:", response_label(&model, &effort_level).cyan());
-    if choice.message.has_visible_content() {
-        println!("{}", wrap::wrap(choice.message.content.as_deref().unwrap()));
-    }
-
+    // The same exchange every other path runs, so a one-off reply is shown
+    // the way a `--tools` run's is. Labelled, like `cmd_agent`'s: a one-off
+    // has no other way to show which model answered.
+    let mut ui = TerminalAgentUi::new(false, true);
+    agent::run_chat_turn(
+        &client,
+        &mut ui,
+        &mut messages,
+        &model,
+        temperature,
+        effort_level,
+        stream,
+        &agent::UsageTracker::default(),
+    )
+    .await?;
     Ok(())
 }
 
