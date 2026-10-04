@@ -876,6 +876,13 @@ async fn connect_needed(specs: &[ServerSpec], wanted: impl Fn(&str) -> bool) -> 
     if let Err(e) = crate::tools::set_registered(offered) {
         // The tools are refused as a set — a collision or a duplicate — so
         // nothing is registered and nothing should be reachable either.
+        // Remembered as failed like a server that would not start: the
+        // collision is in what they offer, so the next turn would spawn
+        // them only to refuse them again.
+        FAILED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend(fresh.iter().map(|(name, _)| name.clone()));
         for (_, server) in &fresh {
             server.shutdown().await;
         }

@@ -512,6 +512,9 @@ impl Worker {
                 // built from, so letting a message overtake it would send a
                 // request describing servers that are being restarted.
                 Command::ReconnectMcp => self.reconnect_mcp().await,
+                Command::SetToolAccess { target, access } => {
+                    self.set_tool_access_connecting(&target, access).await
+                }
                 Command::Compact => match self.compact(&mut commands, &mut queue, true).await {
                     CompactOutcome::Done => {}
                     CompactOutcome::Cancelled => {
@@ -623,13 +626,8 @@ impl Worker {
         // below, because a clanker whose built-ins are all off but whose
         // servers are not is still agentic, and that check needs the
         // servers' tools to see it.
-        for started in crate::mcp::ensure_for_access(&self.gates.access()).await {
-            if let Err(e) = started.outcome {
-                let _ = self.events.send(Event::Agent(AgentEvent::Error {
-                    message: format!("{}: {e}", started.name),
-                }));
-            }
-        }
+        let started = crate::mcp::ensure_for_access(&self.gates.access()).await;
+        self.report_started(started);
 
         // The agent loop runs on its own task so commands stay responsive
         // while it works; `approvals` carries decisions back into it.
@@ -1001,40 +999,10 @@ impl Worker {
             }
         };
 
-        let mut specs = Vec::new();
-        for server in &config.mcp_servers {
-            match crate::config::resolve_server(server) {
-                Ok((spec, missing)) => {
-                    // Worth saying here, where the point of the command is
-                    // to bring servers up: a name with no value anywhere is
-                    // the one failure that says itself, rather than waiting
-                    // out the connect timeout first. The CLI's version of
-                    // this prints the same thing.
-                    for variable in missing {
-                        let _ = self.events.send(Event::Agent(AgentEvent::Error {
-                            message: format!(
-                                "{}: {variable} is not set — clank mcp env {} {variable}",
-                                server.name, server.name
-                            ),
-                        }));
-                    }
-                    specs.push(spec);
-                }
-                Err(e) => {
-                    let _ = self.events.send(Event::Agent(AgentEvent::Error {
-                        message: format!("{}: {e}", server.name),
-                    }));
-                }
-            }
-        }
+        let specs = self.resolve_servers(&config.mcp_servers);
 
-        for started in crate::mcp::connect_all(&specs).await {
-            if let Err(e) = started.outcome {
-                let _ = self.events.send(Event::Agent(AgentEvent::Error {
-                    message: format!("{}: {e}", started.name),
-                }));
-            }
-        }
+        let started = crate::mcp::connect_all(&specs).await;
+        self.report_started(started);
 
         let after = crate::mcp::connected_counts();
         let _ = self.events.send(Event::McpReconnected {
@@ -1175,6 +1143,12 @@ impl Worker {
                             let _ = self.events.send(Event::CompactionSkipped {
                                 reason: "Already compacting".to_string(),
                             });
+                        }
+                        // Awaited here, not in `apply`: the compaction
+                        // runs on its own task, so this holds up nothing
+                        // but the next command.
+                        Some(Command::SetToolAccess { target, access }) => {
+                            self.set_tool_access_connecting(&target, access).await
                         }
                         Some(other) => self.apply(other),
                         None => {
@@ -1382,6 +1356,70 @@ impl Worker {
         let _ = self.events.send(Event::SandboxChanged { sandbox });
     }
 
+    /// These servers resolved for starting, with what could not be resolved
+    /// said in the transcript — the paths that bring servers up on purpose,
+    /// where a missing variable is worth saying before the connect timeout
+    /// is waited out. The CLI's version of this prints the same thing.
+    fn resolve_servers(
+        &self,
+        servers: &[crate::config::McpServerConfig],
+    ) -> Vec<crate::mcp::ServerSpec> {
+        let mut specs = Vec::new();
+        for server in servers {
+            match crate::config::resolve_server(server) {
+                Ok((spec, missing)) => {
+                    for variable in missing {
+                        let _ = self.events.send(Event::Agent(AgentEvent::Error {
+                            message: format!(
+                                "{}: {variable} is not set — clank mcp env {} {variable}",
+                                server.name, server.name
+                            ),
+                        }));
+                    }
+                    specs.push(spec);
+                }
+                Err(e) => {
+                    let _ = self.events.send(Event::Agent(AgentEvent::Error {
+                        message: format!("{}: {e}", server.name),
+                    }));
+                }
+            }
+        }
+        specs
+    }
+
+    /// Every server that would not come up, said in the transcript.
+    fn report_started(&self, started: Vec<crate::mcp::Started>) {
+        for started in started {
+            if let Err(e) = started.outcome {
+                let _ = self.events.send(Event::Agent(AgentEvent::Error {
+                    message: format!("{}: {e}", started.name),
+                }));
+            }
+        }
+    }
+
+    /// [`Self::set_tool_access`] after bringing up the servers `target`
+    /// has to see — see `config::servers_to_name`. Without it a category
+    /// typed before the first turn has started anything would cover the
+    /// built-ins alone, and the servers' tools would arrive at their
+    /// default on the next turn.
+    ///
+    /// Not used mid-turn, where nothing needs it: the turn has already
+    /// brought up every server its gates leave room for, so what is still
+    /// down is either off wholesale or failed.
+    async fn set_tool_access_connecting(&mut self, target: &str, access: ToolAccess) {
+        let servers = self.configured_servers();
+        let needed =
+            crate::config::servers_to_name(target, access, self.session.tool_access(), &servers);
+        if !needed.is_empty() {
+            let specs = self.resolve_servers(&needed);
+            let started = crate::mcp::ensure_connected(&specs, |_| true).await;
+            self.report_started(started);
+        }
+        self.set_tool_access(target, access);
+    }
+
     fn set_tool_access(&mut self, target: &str, access: ToolAccess) {
         let updated = match self.session.tool_access().with(target, access) {
             Some(updated) => updated,
@@ -1439,14 +1477,14 @@ impl Worker {
     /// What to say about a target the gate refused.
     ///
     /// A configured server that is not connected is not a typo, and saying
-    /// so saves the hunt: its tools arrive on the next turn, and
-    /// `/mcp reconnect` brings it up now.
+    /// so saves the hunt. By the time this is reached a connection has been
+    /// tried — see [`Self::set_tool_access_connecting`] — and a failed one
+    /// is not retried until `/mcp reconnect`.
     fn unknown_target_message(&self, target: &str) -> String {
         match crate::config::server_target(target, &self.configured_servers()) {
             Some((server, _)) => format!(
-                "{server} is configured but not connected, so its tools have no names yet — \
-                 they arrive on the next turn; try again after one, or /mcp reconnect to bring \
-                 it up now"
+                "{server} is configured but did not connect, so its tools have no names — \
+                 /mcp reconnect to try again"
             ),
             None => format!("No tool, category or server called {target}"),
         }

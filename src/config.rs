@@ -166,6 +166,45 @@ pub fn server_target(target: &str, servers: &[McpServerConfig]) -> Option<(Strin
     None
 }
 
+/// The configured servers that have to be up before `target` can be set to
+/// `access` — what the lazy connection owes a `tools` command.
+///
+/// A category or `all` set to anything but a standing policy writes an
+/// entry per tool it can see, so every server whose tools it could cover
+/// has to be visible first: otherwise `never write` typed before a turn has
+/// started anything would cover the built-ins and nothing else, and the
+/// servers' write tools would arrive at their default on the next turn.
+/// For `never` a server already switched off wholesale is left down — its
+/// entries would be redundant with the standing key, and starting it is
+/// what that key exists to prevent.
+///
+/// A tool or the whole of one server needs only that server, unless it is
+/// `never` for the whole server, which is one standing key and needs
+/// nothing. `never all` is a standing policy too. Anything else names no
+/// server, and needs none.
+pub fn servers_to_name(
+    target: &str,
+    access: ToolAccess,
+    current: &ToolAccessSettings,
+    servers: &[McpServerConfig],
+) -> Vec<McpServerConfig> {
+    match server_target(target, servers) {
+        Some((_, true)) if access == ToolAccess::Never => Vec::new(),
+        Some((name, _)) => servers
+            .iter()
+            .filter(|server| server.name == name)
+            .cloned()
+            .collect(),
+        None if target == "all" && access == ToolAccess::Never => Vec::new(),
+        None if target == "all" || crate::tools::CATEGORIES.contains(&target) => servers
+            .iter()
+            .filter(|server| access != ToolAccess::Never || current.server_needed(&server.name))
+            .cloned()
+            .collect(),
+        None => Vec::new(),
+    }
+}
+
 /// What a tool does when nothing has been said about it.
 ///
 /// The shell is off. It is the one tool whose blast radius is everything the
@@ -1350,6 +1389,44 @@ mod tests {
         // that happens to share the name.
         for target in ["all", "read", "write_file", "nonesuch", "gj__", ""] {
             assert_eq!(server_target(target, &servers), None, "{target:?}");
+        }
+    }
+
+    #[test]
+    fn a_category_brings_up_every_server_it_could_cover() {
+        // The gap the lazy connection opened: a category is a list of what
+        // is visible, so before a turn has started anything `never write`
+        // would miss every server's write tools.
+        let servers = [configured("gj"), configured("fs")];
+        let names = |target: &str, access, current: &ToolAccessSettings| -> Vec<String> {
+            servers_to_name(target, access, current, &servers)
+                .into_iter()
+                .map(|server| server.name)
+                .collect()
+        };
+        let default = ToolAccessSettings::default();
+        assert_eq!(names("write", ToolAccess::Never, &default), ["gj", "fs"]);
+        assert_eq!(names("read", ToolAccess::Allow, &default), ["gj", "fs"]);
+        assert_eq!(names("all", ToolAccess::Ask, &default), ["gj", "fs"]);
+
+        // A server already off wholesale stays down for a `never`: its
+        // entries would be redundant, and starting it is what the key
+        // exists to prevent.
+        let gj_off = default.never_server("gj");
+        assert_eq!(names("write", ToolAccess::Never, &gj_off), ["fs"]);
+        assert_eq!(names("write", ToolAccess::Allow, &gj_off), ["gj", "fs"]);
+
+        // One server, or none at all.
+        assert_eq!(names("gj__find", ToolAccess::Never, &default), ["gj"]);
+        assert_eq!(names("gj", ToolAccess::Ask, &default), ["gj"]);
+        for (target, access) in [
+            ("gj", ToolAccess::Never),
+            ("gj__*", ToolAccess::Never),
+            ("all", ToolAccess::Never),
+            ("write_file", ToolAccess::Allow),
+            ("nonesuch", ToolAccess::Allow),
+        ] {
+            assert!(names(target, access, &default).is_empty(), "{target:?}");
         }
     }
 

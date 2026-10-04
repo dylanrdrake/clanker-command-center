@@ -543,6 +543,24 @@ async fn connect_mcp_servers() {
     }
 }
 
+/// Brings up the servers a `tools` command has to see before it can set
+/// `target`, reporting any that will not start — see
+/// `config::servers_to_name`. Shared by `clank tools` and the line-mode
+/// `/tools`, so the two cover the same tools.
+async fn connect_to_name(
+    target: &str,
+    access: ToolAccess,
+    current: &config::ToolAccessSettings,
+    servers: &[config::McpServerConfig],
+) {
+    let specs = resolve_configured(&config::servers_to_name(target, access, current, servers));
+    for started in mcp::ensure_connected(&specs, |_| true).await {
+        if let Err(e) = started.outcome {
+            eprintln!("{} {}: {e}", "✗".red(), started.name);
+        }
+    }
+}
+
 async fn dispatch(cli: Cli) -> Result<()> {
     // Nothing here connects MCP servers. They come up where they are
     // needed — a turn that could offer one of their tools, or the one
@@ -1041,38 +1059,12 @@ async fn cmd_tools(state: Option<String>, target: Option<String>) -> Result<()> 
                 anyhow::anyhow!("Unknown state '{state}'. Use ask, allow or never.")
             })?;
 
-            // Only what naming `target` actually needs comes up. A whole
-            // server set to `never` is one standing key and needs no tool
-            // list at all — which is what lets a server be switched off
-            // without first being started, the pair the lazy connection
-            // turns on. A category or `all` set to anything writes an entry
-            // per tool it can see, so it is claimed with everything visible
-            // that will be visible, as it was when connecting was
-            // unconditional.
+            // Only what naming `target` actually needs comes up — see
+            // `config::servers_to_name`.
             let servers = config.mcp_servers.clone();
-            let specs = match config::server_target(target, &servers) {
-                Some((_, true)) if access == ToolAccess::Never => Vec::new(),
-                Some((name, _)) => {
-                    let named: Vec<_> = servers
-                        .iter()
-                        .filter(|server| server.name == name)
-                        .cloned()
-                        .collect();
-                    resolve_configured(&named)
-                }
-                None if target == "all" && access == ToolAccess::Never => Vec::new(),
-                None if target == "all" || tools::CATEGORIES.contains(&target) => {
-                    resolve_configured(&servers)
-                }
-                None => Vec::new(),
-            };
-            for started in mcp::ensure_connected(&specs, |_| true).await {
-                if let Err(e) = started.outcome {
-                    eprintln!("{} {}: {e}", "✗".red(), started.name);
-                }
-            }
-
             let access_settings = config.tool_access();
+            connect_to_name(target, access, &access_settings, &servers).await;
+
             match access_settings.with(target, access) {
                 Some(updated) => updated,
                 // A configured server that is not connected has no tools to
@@ -1746,7 +1738,7 @@ fn user_prompts(messages: &[store::StoredMessage]) -> Vec<String> {
 /// confirmation in the same "set to X" / "already X" style the TUI's status
 /// notices use, so the two front ends read the same way.
 #[allow(clippy::too_many_arguments)]
-fn apply_submission(
+async fn apply_submission(
     submission: ui::Submission,
     session: &mut ChatSession,
     ui: &mut TerminalAgentUi,
@@ -1900,6 +1892,11 @@ fn apply_submission(
             );
         }
         ui::Submission::SetToolAccess { target, access } => {
+            // What naming `target` needs comes up first, the same as for
+            // `clank tools` — a category typed before the first turn would
+            // otherwise miss every server's tools.
+            let servers = load_config().map(|c| c.mcp_servers).unwrap_or_default();
+            connect_to_name(&target, access, session.tool_access(), &servers).await;
             let updated = match session.tool_access().with(&target, access) {
                 Some(updated) => updated,
                 // A configured server that is not connected has no tools to
@@ -1907,16 +1904,14 @@ fn apply_submission(
                 // `never` for a whole server is a standing policy keyed by
                 // the name alone, so it can be stored all the same.
                 None => {
-                    let servers = load_config().map(|c| c.mcp_servers).unwrap_or_default();
                     match (config::server_target(&target, &servers), access) {
                         (Some((server, true)), ToolAccess::Never) => {
                             session.tool_access().never_server(&server)
                         }
                         (Some((server, _)), _) => {
                             println!(
-                                "{} {server} is configured but not connected, so its tools have \
-                                 no names yet — they arrive on the next turn; try again after \
-                                 one, or /mcp reconnect to bring it up now.",
+                                "{} {server} is configured but did not connect, so its tools \
+                                 have no names — /mcp reconnect to try again.",
                                 "✗".red()
                             );
                             return Ok(());
@@ -2453,7 +2448,9 @@ async fn cmd_clanker(
                     default_effort_level.clone(),
                     &compactor,
                     compact_at,
-                ) {
+                )
+                .await
+                {
                     println!("{} {}", "✗".red(), e);
                 }
                 // One blank line after every transcript unit, matching a
