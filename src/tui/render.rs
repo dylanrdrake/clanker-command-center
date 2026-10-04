@@ -9,7 +9,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// One frame of the busy animation: two braille cells of scattered dots.
 ///
@@ -1823,6 +1823,31 @@ fn push_block(
     }
 }
 
+/// `text` cut into pieces no wider than `width` columns, each with its
+/// width — measured in cells rather than characters, so a run of emoji or
+/// CJK, two cells apiece, breaks at the edge rather than at twice it.
+///
+/// A character wider than `width` on its own still gets a piece of its
+/// own, over the edge: the alternative is never placing it at all.
+fn break_to_width(text: &str, width: usize) -> Vec<(String, usize)> {
+    let mut pieces = Vec::new();
+    let mut piece = String::new();
+    let mut piece_width = 0;
+    for ch in text.chars() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if piece_width + ch_width > width && !piece.is_empty() {
+            pieces.push((std::mem::take(&mut piece), piece_width));
+            piece_width = 0;
+        }
+        piece.push(ch);
+        piece_width += ch_width;
+    }
+    if !piece.is_empty() {
+        pieces.push((piece, piece_width));
+    }
+    pieces
+}
+
 /// Word-wraps one styled line to `width` columns, keeping each span's style
 /// attached to the text it colors. Breaks preferentially at spaces; a
 /// single word longer than `width` is hard-broken so no row ever exceeds
@@ -1915,15 +1940,12 @@ fn wrap_styled(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
 
         if token_width > width {
             // Doesn't fit on a row by itself either way: hard-break it.
-            let chars: Vec<char> = text.chars().collect();
-            for chunk in chars.chunks(width) {
+            for (chunk, chunk_width) in break_to_width(&text, width) {
                 if col > 0 {
                     rows.push(Vec::new());
                 }
-                col = chunk.len();
-                rows.last_mut()
-                    .unwrap()
-                    .push(Span::styled(chunk.iter().collect::<String>(), style));
+                col = chunk_width;
+                rows.last_mut().unwrap().push(Span::styled(chunk, style));
             }
             continue;
         }
@@ -2707,6 +2729,36 @@ mod tests {
                 flat(row)
             );
         }
+    }
+
+    #[test]
+    fn a_word_too_wide_for_a_row_breaks_at_the_edge_in_cells() {
+        // Ten CJK characters are twenty cells. Broken by character count, a
+        // six-column row would hold six of them — twelve cells, twice the
+        // row — and be clipped rather than re-wrapped when drawn.
+        let rows = wrap_styled(Line::from(Span::raw("漢字漢字漢字漢字漢字")), 6);
+        assert_eq!(
+            rows.len(),
+            4,
+            "{:?}",
+            rows.iter().map(flat).collect::<Vec<_>>()
+        );
+        for row in &rows {
+            assert!(display_width(&flat(row)) <= 6, "{:?}", flat(row));
+        }
+        assert_eq!(
+            rows.iter().map(flat).collect::<String>(),
+            "漢字漢字漢字漢字漢字",
+            "nothing lost at the breaks"
+        );
+    }
+
+    #[test]
+    fn a_character_wider_than_the_row_still_gets_one() {
+        // A two-cell glyph in a one-column pane can't fit anywhere; it goes
+        // on a row of its own rather than never being placed.
+        let rows = wrap_styled(Line::from(Span::raw("漢字")), 1);
+        assert_eq!(rows.iter().map(flat).collect::<Vec<_>>(), ["漢", "字"]);
     }
 
     #[test]
