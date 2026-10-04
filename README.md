@@ -569,8 +569,12 @@ back on afterwards (`clank tools allow fs__read_text_file`). A tool set to
 paying for a server's schemas.
 
 A server called `read` (or any other category word) keeps meaning the
-category; reach the server as `read__*`. Only a server that is connected can
-be named, so a typo is reported instead of stored.
+category; reach the server as `read__*`. Naming one of a server's tools needs
+it to be connected — the tool names are what the entry is keyed by — so a
+typo is reported instead of stored. `never` for the whole server is the
+exception: it is one standing entry keyed by the name alone, so
+`clank tools never fs` works on a server that has never started, and is how
+you switch one off without first paying to start it.
 
 **Secrets stay out of `config.json`.** The file holds variable *names*; the
 values live in your OS keychain next to your API key. At startup each name is
@@ -579,6 +583,15 @@ in, so a token you already export for other tools works without being copied
 anywhere. A name with no value in either place is reported and left unset —
 a server that checks for its token should find it missing rather than blank.
 
+**A server starts when a turn could use it.** Not at startup: a server comes
+up on the first turn whose [tools](#tools) still leave room for one of its
+tools, so a clanker with tools off — or with the server set to `never` —
+never spawns it, and neither does a listing — `clank tools` with no state, or
+`/tools` — which reports what is up without bringing anything up. What is up
+is shared for the life of the `clank` process, as before, so a second clanker
+in the same one finds it already running rather than starting another. `/mcp`
+says which servers are up and which are merely configured.
+
 **What it costs.** A server's schemas ride every request for as long as it's
 connected, and they aren't small: the reference filesystem server's 14 tools
 add about 2,100 tokens, against roughly 900 for all seven built-ins. That's
@@ -586,18 +599,22 @@ fixed overhead no [compaction](#compact-at-value) can fold away, so it raises th
 floor every request sits on. Worth knowing before adding several.
 
 **A failing server costs only itself.** It's reported and skipped; the other
-servers connect and the clanker opens without it. CCC starts servers fresh
-on each invocation and stops them when it exits — including anything they
-started themselves, which matters more than it sounds: a server launched
-through a runner like `npx` is a grandchild process, and killing only what
-was spawned leaves the real server alive holding its pipe open.
+servers connect and the clanker opens without it. It is not retried for the
+rest of the process either — one attempt, so a server that will not start
+doesn't cost twenty seconds a turn — and `/mcp reconnect` is how to try
+again. CCC starts servers fresh on each invocation and stops them when it
+exits — including anything they started themselves, which matters more than
+it sounds: a server launched through a runner like `npx` is a grandchild
+process, and killing only what was spawned leaves the real server alive
+holding its pipe open.
 
 **Picking up a rebuilt server.** The tool list is read once per `clank`
-process, at startup — so a server you rebuild while a clanker is open goes
-on offering the list it had when that process started. `/mcp reconnect`
-inside the clanker restarts the servers and re-reads them; opening a clanker
-in a fresh `clank` also gets the current list. Each terminal is its own
-process with its own server children, so each one reconnects separately.
+process, when the server connects — so a server you rebuild while a clanker
+is open goes on offering the list it had when that process started.
+`/mcp reconnect` inside the clanker restarts the servers and re-reads them;
+opening a clanker in a fresh `clank` also gets the current list. Each
+terminal is its own process with its own server children, so each one
+reconnects separately.
 
 **Current limits.** stdio transport only — no HTTP or SSE. Servers are
 global rather than per-clanker, so every clanker with tools carries every

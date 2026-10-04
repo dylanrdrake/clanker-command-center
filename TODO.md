@@ -1,29 +1,21 @@
 
 **TODOs**
 * TOP PRIORITY: agent accuracy, the gaps against Claude Code that matter
-  most, in order of payoff per effort:
-  1. ~~`replace_in_file` replaced every occurrence~~ — done: anything but a
-     unique match is refused with the count, `replace_all` opts in to every
-     one, and an empty search is refused.
-  2. ~~The agent system prompt said nothing about how to work~~ — done: read
-     before editing, find with `search_files`, keep changes small, unique
-     `replace_in_file` searches, test when the terminal is on, and report
-     failures and unchecked work plainly.
-  3. ~~Project instructions~~ — done as `CLANKERS.md`, from the clanker's
-     own directory only, re-read every turn, never truncated (a notice past
-     40,000 characters, as Claude Code does). Possibly later: files in
-     subdirectories delivered when the agent first touches them, a personal
-     `~/.clank/CLANKERS.md`, `@path` imports, reading `AGENTS.md`/`CLAUDE.md`
-     too. And coordinating clankers deployed to one directory, through the
-     database rather than the file.
-  4. A build/test loop by default. `run_terminal_command` is `never` until
-     enabled, so a default clanker can edit code but never compile or test
-     it. Something like a per-clanker allowlist (`cargo test`, `npm test`).
-  5. ~~Refuse a write or replace on a file the session hasn't read~~ —
-     done: also refused when the file changed since the read (by content
-     hash), creating and appending exempt, the session's own writes count
-     as reads, forgotten on compaction.
+  most, in order of payoff per effort. The list is nearly spent —
+  `replace_in_file` unique matches, the agent system prompt, `CLANKERS.md`
+  and the unread-file refusal all landed — and what is left of it:
+  - Project instructions, later rounds: files in subdirectories delivered
+    when the agent first touches them, a personal `~/.clank/CLANKERS.md`,
+    `@path` imports, reading `AGENTS.md`/`CLAUDE.md` too. And coordinating
+    clankers deployed to one directory, through the database rather than
+    the file.
   After those: task lists, plan mode, memory across clankers.
+
+  A build/test loop by default was considered and dropped: the capability
+  is already there as a setting, and users who want it can set their own
+  defaults in config.json after installing (`clank tools allow
+  run_terminal_command`, or `ask` if they'd rather approve each one). Not
+  a gap against Claude Code, a choice.
 
 * connect providers directly, like Anthropic, OpenAI, etc..
 
@@ -41,7 +33,7 @@
 
 NEXT:
 * MCP, what is left of it. The client, the config entries, `clank mcp
-  add`/`list`/`remove`/`env`, the startup connect and the dispatch are built
+  add`/`list`/`remove`/`env`, the connect and the dispatch are built
   (7814084 and the four commits before it) — a server's tools arrive as
   `server__tool`, land in a category from its `readOnlyHint`, and are
   governed by the same gates as the built-ins with no new policy. What is
@@ -54,17 +46,18 @@ NEXT:
     ~911 for all seven built-ins. But `agent::offered_tools` already drops
     a tool set to `never` from the request entirely, so a clanker can stop
     paying for a server today — the schemas genuinely do not go on the
-    wire. The capability is there; what was missing is three smaller things, the first now done:
-    - ~~A per-*server* switch~~ — done: `clank tools never gj` (or `gj__*`)
-      is one standing entry that also holds for tools the server grows
-      later. Only a *connected* server can be named, so a configured one
-      that failed to start can't be switched off by name; that is the same
-      gap as the next item, and goes away when gating no longer needs the
-      connection.
-    - Not spawning the process at all. Gating happens after connecting, so
-      every invocation that can run a tool starts every server and stops it
-      again — 0.30s for gj, ~0.9s warm and ~4s cold for anything behind
-      `npx`, paid even by a bare `clank tools`.
+    wire. The capability is there; what was missing is two smaller things,
+    the first now done:
+    - ~~Not spawning the process at all~~ — done: a server connects on the
+      first turn whose gates could still offer one of its tools, so a
+      clanker with tools off, or with the server set to `never`, never
+      starts it — and neither does a listing command. `never` for a whole
+      configured server is storable before it has ever connected, which is
+      what lets it be switched off without paying for the start, and fixes
+      the related gap where a server that failed to start could not be
+      named. What is up is still shared process-wide, so the question the
+      item below raises — what "connected" means when three clankers share
+      one server — answers itself: the servers are the process's.
     - Tool-list noise. Two servers and the built-ins is 31 tools with real
       overlap (`read_file` against `fs__read_text_file`), which costs
       selection quality in a way gating does not fix as cleanly as the
@@ -74,10 +67,10 @@ NEXT:
     was grouped with: `get_tool_definitions`, `any_tools` and
     `category_of` are free functions over a process-wide registry, and
     making the list per-clanker means they have to know which clanker is
-    asking — which the agent loop never tells them. Filtering the global
-    list per session gets the ergonomics; connecting lazily gets the
-    latency too, and has to decide what "connected" means when three
-    clankers share one server.
+    asking — which the agent loop never tells them. Lazy connection got the
+    latency without that: the registry is still the process's, and the
+    gates are what decide what a turn offers. What is left here is the
+    ergonomics, not the cost.
   - **`notifications/tools/list_changed` is read and ignored.** A server
     that gains or loses a tool mid-session is not re-read on its own.
     `/mcp reconnect` is the manual version and covers the case that
@@ -248,10 +241,7 @@ NEXT:
   and there's no indication they exist. The two blank lines between sections
   cost two more rows. Wants a scroll offset that follows the selection, and
   probably some hint that the list continues past the edge.
-* East Asian Width Ambiguous glyphs, mostly done. `·`, `—`, `…`, the arrow
-  keys' `↑↓←→`, `→` and `▲▼` are fixed in the TUI's rendered strings via
-  `src/glyphs.rs`, and the reply avatar was already fixed by moving to
-  braille. Still Ambiguous and still width-sensitive: the box drawing — the
+* East Asian Width Ambiguous glyphs, the last of them: the box drawing — the
   horizontal rules, built from `─` (U+2500) with `"─".repeat(width)`, and the
   `│` borders. A terminal that draws `─` two cells wide overshoots by one per
   character and the rule wraps. Needs a Neutral glyph that still joins

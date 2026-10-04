@@ -164,8 +164,10 @@ pub static BUILTIN: LazyLock<Vec<ToolInfo>> = LazyLock::new(|| {
 
 /// Tools that were not compiled in, as [`set_registered`] last left them.
 ///
-/// Written by `mcp::connect_all` at startup, from the servers that came
-/// up. Empty whenever no server is configured, which is the default.
+/// Written by `mcp::ensure_connected` as servers come up — which, since
+/// connecting is lazy, is the first turn that could offer one of their
+/// tools rather than startup. Empty whenever no server is configured,
+/// which is the default, and empty at startup even when one is.
 ///
 /// Process-wide rather than per-clanker because what goes in here is
 /// process-wide: one MCP server per config entry, shared by every clanker,

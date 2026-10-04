@@ -18,12 +18,19 @@
 //!   JSON, tested against payloads captured from the reference servers.
 //! - [`StdioServer`], the process. Spawning, and the part that is not what
 //!   it looks like — see [`StdioServer::shutdown`].
+//!
+//! And a fourth concern that arrived with lazy connection: *when* a server
+//! connects. It used to be once, at startup, unconditionally; now a server
+//! comes up the first time a turn could offer one of its tools — see
+//! [`ensure_connected`] and [`ensure_for_access`]. A clanker whose gates
+//! drop a server therefore never pays to start it, and neither does a
+//! command that only lists.
 
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot};
@@ -710,11 +717,53 @@ fn connected() -> std::sync::RwLockReadGuard<'static, Option<HashMap<String, Arc
     CONNECTED.read().unwrap_or_else(|e| e.into_inner())
 }
 
-/// What happened to one server at startup.
+/// What happened to one server as it was brought up.
 pub struct Started {
     pub name: String,
     /// How many tools it offered, or why it did not get that far.
     pub outcome: Result<usize>,
+}
+
+/// Serialises every connect.
+///
+/// Two clankers whose first turns land together would otherwise each see
+/// the same server missing and spawn a copy of it. A `tokio` mutex rather
+/// than a `std` one because connecting awaits, and it is always taken
+/// first, before anything touches [`CONNECTED`], so there is no order to
+/// get wrong.
+static CONNECTING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Servers that would not come up, by name, for the life of the process.
+///
+/// Without this a server that will not start is retried at every turn that
+/// wants it — and the failure is not always the fast spawn error of a
+/// missing binary, but a handshake that waits out [`CONNECT_TIMEOUT`],
+/// twenty seconds a turn. One attempt per process; `/mcp reconnect` is how
+/// to try again, and clears this.
+static FAILED: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// What has already been said about a server that would not start, so the
+/// per-turn path says it once rather than once a turn.
+///
+/// [`ensure_for_access`] runs before every turn, and a server whose token is
+/// not set would otherwise write the same line every time — into a log that
+/// keeps a hundred entries, so a handful of turns would push everything else
+/// out of it. Keyed by what was wrong rather than by the server, so a second
+/// missing variable is still reported. `/mcp reconnect` clears it along with
+/// [`FAILED`], which is the point at which the reason to complain may have
+/// gone away.
+static REPORTED: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// [`crate::error_log::log_error`] for the first time `key` is seen this
+/// process — see [`REPORTED`].
+fn report_once(key: &str, context: &str, message: &str) {
+    let first = REPORTED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key.to_string());
+    if first {
+        crate::error_log::log_error(context, message);
+    }
 }
 
 /// Connects every configured server and registers everything they offer.
@@ -724,38 +773,102 @@ pub struct Started {
 /// print — a missing `npx` or a server that will not start is a reason to
 /// carry on without it, not a reason to refuse to open a clanker.
 ///
-/// The registry is rebuilt wholesale from the servers that came up, because
-/// `set_registered` is total: that is what makes a reconnect, a removal and
-/// a first run the same code path with no stale entry to clean up.
+/// This is the *reconnect* path — `/mcp reconnect`, and the CLI's version
+/// of it — so it starts from nothing: everything up is stopped and every
+/// failure forgotten, because the reason to run it is a server that was
+/// rebuilt. Opening a clanker goes through [`ensure_connected`] instead,
+/// which starts only what a turn needs.
 pub async fn connect_all(specs: &[ServerSpec]) -> Vec<Started> {
+    let _connecting = CONNECTING.lock().await;
+
     // Whatever was up before this call. Publishing a new map would only
     // *drop* the old servers, and a drop reaps the process we spawned
     // without touching the group it started — which for anything behind a
-    // runner leaves the real server alive holding its pipes. Harmless
-    // while this ran once per process; `/mcp reconnect` is what made it
-    // reachable.
+    // runner leaves the real server alive holding its pipes.
     shutdown_all().await;
+    FAILED.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    REPORTED.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    // The tools go with the servers. [`connect_needed`] rebuilds the
+    // registry from what is up, but only when something came up — so
+    // without this a reconnect where every server failed would leave the
+    // model offered tools whose server is gone. An empty set cannot be
+    // refused, since there is nothing in it to collide, so there is no
+    // failure here to report.
+    let _ = crate::tools::set_registered(Vec::new());
+
+    connect_needed(specs, |_| true).await
+}
+
+/// Brings up the servers `wanted` asks for, and leaves the rest alone.
+///
+/// The lazy half of connecting, and the reason a clanker that never calls a
+/// server never starts it: a server already up is left as it is, one that
+/// failed earlier this process is not retried, and one `wanted` says no to
+/// is not touched at all. What comes up is shared with every other clanker,
+/// because the servers are the process's — see [`CONNECTED`].
+///
+/// The registry is rebuilt wholesale from the servers that are up, because
+/// `set_registered` is total: that is what makes a first connection, a
+/// reconnect and a removal the same code path with no stale entry to clean
+/// up.
+pub async fn ensure_connected(specs: &[ServerSpec], wanted: impl Fn(&str) -> bool) -> Vec<Started> {
+    let _connecting = CONNECTING.lock().await;
+    connect_needed(specs, wanted).await
+}
+
+/// [`ensure_connected`] with the lock already held — see [`CONNECTING`].
+async fn connect_needed(specs: &[ServerSpec], wanted: impl Fn(&str) -> bool) -> Vec<Started> {
+    let up: HashSet<String> = connected()
+        .as_ref()
+        .map(|live| live.keys().cloned().collect())
+        .unwrap_or_default();
+    let failed = FAILED.lock().unwrap_or_else(|e| e.into_inner()).clone();
 
     let mut started = Vec::new();
-    let mut live: HashMap<String, Arc<StdioServer>> = HashMap::new();
-    let mut offered: Vec<ToolInfo> = Vec::new();
+    let mut fresh: Vec<(String, Arc<StdioServer>)> = Vec::new();
 
     for spec in specs {
+        if !wants_connecting(&spec.name, &wanted, &up, &failed) {
+            continue;
+        }
         match StdioServer::connect(spec).await {
             Ok(server) => {
-                let tools = server.tools().to_vec();
+                let count = server.tools().len();
                 started.push(Started {
                     name: spec.name.clone(),
-                    outcome: Ok(tools.len()),
+                    outcome: Ok(count),
                 });
-                offered.extend(tools);
-                live.insert(spec.name.clone(), Arc::new(server));
+                fresh.push((spec.name.clone(), Arc::new(server)));
             }
-            Err(e) => started.push(Started {
-                name: spec.name.clone(),
-                outcome: Err(e),
-            }),
+            Err(e) => {
+                FAILED
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(spec.name.clone());
+                started.push(Started {
+                    name: spec.name.clone(),
+                    outcome: Err(e),
+                });
+            }
         }
+    }
+
+    if fresh.is_empty() {
+        // Nothing new, so nothing to publish and nothing to re-register:
+        // the tools of the servers already up are already in the registry.
+        return started;
+    }
+
+    // The servers that were up, plus the ones that just came. Cloned out of
+    // the lock before anything is awaited — the map is a handful of `Arc`s.
+    let mut live: HashMap<String, Arc<StdioServer>> =
+        connected().as_ref().cloned().unwrap_or_default();
+    let mut offered: Vec<ToolInfo> = Vec::new();
+    for server in live.values() {
+        offered.extend(server.tools().iter().cloned());
+    }
+    for (_, server) in &fresh {
+        offered.extend(server.tools().iter().cloned());
     }
 
     // Registered before the servers are published, so a tool can never be
@@ -763,7 +876,7 @@ pub async fn connect_all(specs: &[ServerSpec]) -> Vec<Started> {
     if let Err(e) = crate::tools::set_registered(offered) {
         // The tools are refused as a set — a collision or a duplicate — so
         // nothing is registered and nothing should be reachable either.
-        for server in live.values() {
+        for (_, server) in &fresh {
             server.shutdown().await;
         }
         started.push(Started {
@@ -773,8 +886,97 @@ pub async fn connect_all(specs: &[ServerSpec]) -> Vec<Started> {
         return started;
     }
 
+    for (name, server) in fresh {
+        live.insert(name, server);
+    }
     *CONNECTED.write().unwrap_or_else(|e| e.into_inner()) = Some(live);
     started
+}
+
+/// Whether `spec` is a server this call should try to start.
+///
+/// Split out from the spawning so the decision is testable on its own: the
+/// async path around it mutates process-wide state, which a test running
+/// beside others has no business doing.
+fn wants_connecting(
+    name: &str,
+    wanted: &impl Fn(&str) -> bool,
+    up: &HashSet<String>,
+    failed: &HashSet<String>,
+) -> bool {
+    wanted(name) && !up.contains(name) && !failed.contains(name)
+}
+
+/// Whether a configured server is worth resolving at all.
+///
+/// [`ensure_for_access`] runs before every turn, and resolving a server
+/// reads the OS keychain once per environment variable it declares — so one
+/// that is already up, one that already failed this process, and one the
+/// gates say no to are all skipped before that cost is paid. Only the
+/// resolution is saved: the same three questions are asked again, under the
+/// lock, by [`connect_needed`], so nothing here is load-bearing.
+fn worth_resolving(name: &str, access: &crate::config::ToolAccessSettings) -> bool {
+    let up: HashSet<String> = connected()
+        .as_ref()
+        .map(|servers| servers.keys().cloned().collect())
+        .unwrap_or_default();
+    let failed = FAILED.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    wants_connecting(name, &|name: &str| access.server_needed(name), &up, &failed)
+}
+
+/// Connects the configured servers this clanker's gates still leave room
+/// for.
+///
+/// The glue between the gates (config's business) and the connection (this
+/// module's), called by a turn before it builds its request: a server comes
+/// up only if the gates could offer one of its tools, which is what lets
+/// `tools never gj` keep gj's process from ever being spawned, and lets a
+/// clanker that is not agentic start nothing at all.
+///
+/// Returns what happened, for the caller to report through its own channel.
+/// A success is silent, because the evidence is the tools arriving in the
+/// next request.
+pub async fn ensure_for_access(access: &crate::config::ToolAccessSettings) -> Vec<Started> {
+    let Ok(config) = crate::config::load_config() else {
+        // A config that will not parse is reported by every other path
+        // already; failing here as well would say it twice.
+        return Vec::new();
+    };
+    if config.mcp_servers.is_empty() {
+        return Vec::new();
+    }
+
+    let mut specs = Vec::new();
+    for server in &config.mcp_servers {
+        if !worth_resolving(&server.name, access) {
+            continue;
+        }
+        match crate::config::resolve_server(server) {
+            Ok((spec, missing)) => {
+                for variable in missing {
+                    // The log rather than the screen: this runs inside a
+                    // turn, where a TUI owns the display. It is where a
+                    // server that will not start explains itself.
+                    report_once(
+                        &format!("env:{}:{variable}", server.name),
+                        &format!("mcp {}", server.name),
+                        &format!(
+                            "{variable} is not set — clank mcp env {} {variable}",
+                            server.name
+                        ),
+                    );
+                }
+                specs.push(spec);
+            }
+            Err(e) => report_once(
+                &format!("spec:{}", server.name),
+                &format!("mcp {}", server.name),
+                &e.to_string(),
+            ),
+        }
+    }
+
+    ensure_connected(&specs, |name| access.server_needed(name)).await
 }
 
 /// Routes a call to the server that owns the tool.
@@ -847,6 +1049,12 @@ fn group_alive(pgid: libc::pid_t) -> bool {
 mod tests {
     use super::*;
     use tokio::io::duplex;
+
+    /// Whether the process has no server up — an unpublished map and an
+    /// empty one say the same thing, so both count.
+    fn nothing_is_up() -> bool {
+        connected().as_ref().is_none_or(HashMap::is_empty)
+    }
 
     /// One entry from the reference filesystem server's `tools/list`,
     /// copied verbatim from a captured reply rather than written by hand.
@@ -1099,18 +1307,15 @@ mod tests {
     #[tokio::test]
     async fn connecting_again_stops_what_was_connected_before() {
         // Not a spawn test — `connect_all` with no specs still has to clear
-        // the previous set, because the map it publishes would otherwise
-        // drop those servers rather than shut them down, and a drop cannot
-        // reach the processes they started.
+        // the previous set, because a map left behind would hold servers
+        // that are no longer running, and a drop cannot reach the processes
+        // they started.
         let _ = connect_all(&[]).await;
-        assert!(
-            connected().as_ref().is_some_and(HashMap::is_empty),
-            "the map is published, and empty"
-        );
+        assert!(nothing_is_up(), "the previous set is gone, not replaced");
         // Idempotent: a second pass over an already-empty set is a no-op
         // rather than a second round of signals at a reused pgid.
         let _ = connect_all(&[]).await;
-        assert!(connected().as_ref().is_some_and(HashMap::is_empty));
+        assert!(nothing_is_up());
     }
 
     #[tokio::test]
@@ -1341,5 +1546,26 @@ mod tests {
         let ready = server.next_request().await;
         assert_eq!(ready["method"], "notifications/initialized");
         assert!(ready.get("id").is_none(), "a notification has no id");
+    }
+
+    /// The decision a lazy connection turns on, tested without the
+    /// process-wide state the async path around it mutates.
+    #[test]
+    fn only_a_server_that_is_wanted_up_and_unfailed_is_started() {
+        let up: HashSet<String> = ["live".to_string()].into_iter().collect();
+        let failed: HashSet<String> = ["broken".to_string()].into_iter().collect();
+        let wanted = |name: &str| name != "unwanted";
+
+        assert!(wants_connecting("fresh", &wanted, &up, &failed));
+        // Already up: connecting again would spawn a second copy of a
+        // server the process already has, which is the whole reason the
+        // lazy path checks first.
+        assert!(!wants_connecting("live", &wanted, &up, &failed));
+        // Failed earlier in this process, so the turn does not pay the
+        // connect timeout again — `/mcp reconnect` is how to retry.
+        assert!(!wants_connecting("broken", &wanted, &up, &failed));
+        // The gates said no, which is what keeps a server set to `never`
+        // from ever being spawned.
+        assert!(!wants_connecting("unwanted", &wanted, &up, &failed));
     }
 }

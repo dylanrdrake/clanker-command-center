@@ -616,6 +616,21 @@ impl Worker {
         let _ = self.events.send(Event::Busy(true));
         self.session.set_activity(Some(Activity::Working), None);
 
+        // Lazy connection: the servers this clanker's gates still leave
+        // room for come up here, on the turn that could offer one of their
+        // tools — not at startup, where every clanker paid for every server
+        // whether or not it ever called one. Before the agentic check just
+        // below, because a clanker whose built-ins are all off but whose
+        // servers are not is still agentic, and that check needs the
+        // servers' tools to see it.
+        for started in crate::mcp::ensure_for_access(&self.gates.access()).await {
+            if let Err(e) = started.outcome {
+                let _ = self.events.send(Event::Agent(AgentEvent::Error {
+                    message: format!("{}: {e}", started.name),
+                }));
+            }
+        }
+
         // The agent loop runs on its own task so commands stay responsive
         // while it works; `approvals` carries decisions back into it.
         let (approval_tx, mut approval_rx) =
@@ -989,7 +1004,22 @@ impl Worker {
         let mut specs = Vec::new();
         for server in &config.mcp_servers {
             match crate::config::resolve_server(server) {
-                Ok((spec, _missing)) => specs.push(spec),
+                Ok((spec, missing)) => {
+                    // Worth saying here, where the point of the command is
+                    // to bring servers up: a name with no value anywhere is
+                    // the one failure that says itself, rather than waiting
+                    // out the connect timeout first. The CLI's version of
+                    // this prints the same thing.
+                    for variable in missing {
+                        let _ = self.events.send(Event::Agent(AgentEvent::Error {
+                            message: format!(
+                                "{}: {variable} is not set — clank mcp env {} {variable}",
+                                server.name, server.name
+                            ),
+                        }));
+                    }
+                    specs.push(spec);
+                }
                 Err(e) => {
                     let _ = self.events.send(Event::Agent(AgentEvent::Error {
                         message: format!("{}: {e}", server.name),
@@ -1353,11 +1383,22 @@ impl Worker {
     }
 
     fn set_tool_access(&mut self, target: &str, access: ToolAccess) {
-        let Some(updated) = self.session.tool_access().with(target, access) else {
-            let _ = self.events.send(Event::Agent(AgentEvent::Error {
-                message: format!("No tool, category or server called {target}"),
-            }));
-            return;
+        let updated = match self.session.tool_access().with(target, access) {
+            Some(updated) => updated,
+            // A configured server that is not connected has no tools to be
+            // named with, and `with` cannot tell that from a typo. `never`
+            // for a whole server is a standing policy keyed by the name
+            // alone, so it can be stored all the same — which is what lets
+            // a server be switched off before a turn has started it.
+            None => match self.unconnected_server(target, access) {
+                Some(updated) => updated,
+                None => {
+                    let _ = self.events.send(Event::Agent(AgentEvent::Error {
+                        message: self.unknown_target_message(target),
+                    }));
+                    return;
+                }
+            },
         };
         // Through the shared handle as well as the session, so a turn
         // already running sees it at its next tool call — including a tool
@@ -1372,6 +1413,51 @@ impl Worker {
         let _ = self.events.send(Event::ToolAccessChanged {
             access: self.session.tool_access().clone(),
         });
+    }
+
+    /// The gates to store for a target that names a configured server
+    /// nothing is connected for — or `None` if it names no such server.
+    ///
+    /// `never` for the whole server needs no tool list, so it is stored;
+    /// anything else is about tools that have no names yet, and waits for
+    /// the connection the next turn brings.
+    fn unconnected_server(
+        &self,
+        target: &str,
+        access: ToolAccess,
+    ) -> Option<crate::config::ToolAccessSettings> {
+        if access != ToolAccess::Never {
+            return None;
+        }
+        let servers = self.configured_servers();
+        match crate::config::server_target(target, &servers) {
+            Some((server, true)) => Some(self.session.tool_access().never_server(&server)),
+            _ => None,
+        }
+    }
+
+    /// What to say about a target the gate refused.
+    ///
+    /// A configured server that is not connected is not a typo, and saying
+    /// so saves the hunt: its tools arrive on the next turn, and
+    /// `/mcp reconnect` brings it up now.
+    fn unknown_target_message(&self, target: &str) -> String {
+        match crate::config::server_target(target, &self.configured_servers()) {
+            Some((server, _)) => format!(
+                "{server} is configured but not connected, so its tools have no names yet — \
+                 they arrive on the next turn; try again after one, or /mcp reconnect to bring \
+                 it up now"
+            ),
+            None => format!("No tool, category or server called {target}"),
+        }
+    }
+
+    /// The configured servers, for telling one of them from a typo. Empty
+    /// if the config will not read, which the paths that report that cover.
+    fn configured_servers(&self) -> Vec<crate::config::McpServerConfig> {
+        crate::config::load_config()
+            .map(|config| config.mcp_servers)
+            .unwrap_or_default()
     }
 
     /// Tools on, as `clank tools` allows them — what `/tools on` means.

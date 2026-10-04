@@ -129,6 +129,43 @@ fn server_of(tool_name: &str) -> Option<&str> {
     crate::mcp::route(tool_name).map(|(server, _)| server)
 }
 
+/// Which configured server a `clank tools` target names, and whether it
+/// names the whole of it.
+///
+/// `gj` and `gj__*` are the whole server; `gj__read_file` is one of its
+/// tools, which is a different thing to store and has to exist to be
+/// validated. `None` for anything that is not a configured server's name —
+/// a built-in, a category, `all`, or something unknown, which the gate
+/// itself refuses in its own words.
+///
+/// The order mirrors [`ToolAccessSettings::with_in`]'s: a category or a
+/// built-in wins over a server that happens to share its name, so `tools
+/// never read` stays about the read tools and `tools never read_file` stays
+/// about the built-in.
+pub fn server_target(target: &str, servers: &[McpServerConfig]) -> Option<(String, bool)> {
+    if target == "all" || crate::tools::CATEGORIES.contains(&target) {
+        return None;
+    }
+    if crate::tools::BUILTIN.iter().any(|tool| tool.name == target) {
+        return None;
+    }
+    for server in servers {
+        if target == server.name {
+            return Some((server.name.clone(), true));
+        }
+        let prefix = format!("{}{}", server.name, crate::mcp::SEPARATOR);
+        if target == format!("{prefix}*") {
+            return Some((server.name.clone(), true));
+        }
+        // A prefix with nothing after it names no tool of the server, which
+        // is the same refusal [`ToolAccessSettings::with_in`] makes.
+        if target.len() > prefix.len() && target.starts_with(&prefix) {
+            return Some((server.name.clone(), false));
+        }
+    }
+    None
+}
+
 /// What a tool does when nothing has been said about it.
 ///
 /// The shell is off. It is the one tool whose blast radius is everything the
@@ -173,6 +210,22 @@ impl ToolAccessSettings {
             .or_else(|| self.overrides.get(EVERYTHING_ELSE))
             .copied()
             .unwrap_or_else(|| default_access(tool_name))
+    }
+
+    /// Whether any tool from `server` could still be offered — the one
+    /// question a lazy connection can answer without connecting.
+    ///
+    /// Only the two standing policies can answer it in the negative,
+    /// because they are the only things that drop a tool sight unseen:
+    /// `tools off` ([`EVERYTHING_ELSE`]) and `tools never <server>` (the
+    /// `server__*` key). Anything else — a `never` on one of the server's
+    /// tools, a standing `ask` — leaves the rest of them offered, and which
+    /// tools those are is exactly what connecting is for. So this is
+    /// deliberately optimistic: a server comes up unless a policy covering
+    /// all of it says no.
+    pub fn server_needed(&self, server: &str) -> bool {
+        self.overrides.get(EVERYTHING_ELSE) != Some(&ToolAccess::Never)
+            && self.overrides.get(&server_key(server)) != Some(&ToolAccess::Never)
     }
 
     /// Whether this clanker has any tools at all — the thing that used to be
@@ -289,7 +342,9 @@ impl ToolAccessSettings {
     /// `None` also for a server that is configured but did not connect,
     /// because this only sees tools. That is a limit rather than a choice —
     /// a server that is down has nothing to name — and it is why a typo is
-    /// still reported instead of quietly stored.
+    /// still reported instead of quietly stored. A caller that can tell a
+    /// configured server from a typo resolves it with [`Self::never_server`]
+    /// for the one case that needs no tool list.
     fn with_server_in(
         &self,
         tools: &[crate::tools::ToolInfo],
@@ -325,6 +380,31 @@ impl ToolAccessSettings {
             }
         }
         Some(updated)
+    }
+
+    /// `self` with a standing `never` for every tool `server` has or ever
+    /// grows — what `tools never <server>` stores when the server is not
+    /// connected and its tools cannot be enumerated.
+    ///
+    /// [`Self::with_server_in`] refuses that case rather than guess,
+    /// because from a list of tools it cannot tell a server that is down
+    /// from one that was mistyped. The caller here has already checked the
+    /// name against the configured servers, which is the difference — and
+    /// storing the policy is what lets a server be switched off without
+    /// first being started, which is the pair the lazy connection turns on.
+    ///
+    /// The same one key [`Self::with_server_in`] writes, so a connection
+    /// later changes nothing about what it means.
+    pub fn never_server(&self, server: &str) -> Self {
+        let mut updated = self.clone();
+        let prefix = format!("{server}{}", crate::mcp::SEPARATOR);
+        updated.overrides.retain(|key, _| !key.starts_with(&prefix));
+        if updated.overrides.get(EVERYTHING_ELSE) != Some(&ToolAccess::Never) {
+            updated
+                .overrides
+                .insert(server_key(server), ToolAccess::Never);
+        }
+        updated
     }
 
     /// Records `access` for one tool, held only while it differs from what
@@ -1241,6 +1321,92 @@ mod tests {
             serde_json::to_string(&settings).unwrap(),
             r#"{"*":"never"}"#
         );
+    }
+
+    /// A configured server, for the two things that have to read a name
+    /// without a tool list: [`server_target`] and [`never_server`].
+    fn configured(name: &str) -> McpServerConfig {
+        McpServerConfig {
+            name: name.to_string(),
+            command: "run-it".to_string(),
+            args: Vec::new(),
+            env: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_whole_server_is_recognised_from_the_config_alone() {
+        // What a lazy connection needs: the name of a server nothing is
+        // connected for, told apart from a typo and from a tool of it.
+        let servers = [configured("gj"), configured("fs")];
+        assert_eq!(server_target("gj", &servers), Some(("gj".into(), true)));
+        assert_eq!(server_target("gj__*", &servers), Some(("gj".into(), true)));
+        assert_eq!(
+            server_target("gj__find", &servers),
+            Some(("gj".into(), false))
+        );
+        // Everything that is not a configured server, in the order the gate
+        // itself resolves them: a category and a built-in win over a server
+        // that happens to share the name.
+        for target in ["all", "read", "write_file", "nonesuch", "gj__", ""] {
+            assert_eq!(server_target(target, &servers), None, "{target:?}");
+        }
+    }
+
+    #[test]
+    fn a_server_can_be_switched_off_before_it_has_ever_connected() {
+        // The pair the lazy connection turns on: `never` for a whole server
+        // is one standing key, so it needs no tool list — and a server set
+        // to `never` is then never started at all.
+        let off = ToolAccessSettings::default().never_server("gj");
+        assert_eq!(off.access("gj__find"), ToolAccess::Never);
+        assert_eq!(off.access("gj__grown_a_tool_since"), ToolAccess::Never);
+        assert_eq!(off.access("fs__read_text_file"), ToolAccess::Ask);
+        // The same one key a connected server would have written, so the
+        // connection later changes nothing about what it means.
+        assert_eq!(serde_json::to_string(&off).unwrap(), r#"{"gj__*":"never"}"#);
+        assert_eq!(
+            serde_json::to_string(&off).unwrap(),
+            serde_json::to_string(
+                &ToolAccessSettings::default()
+                    .with_in(&two_servers(), "gj", ToolAccess::Never)
+                    .unwrap()
+            )
+            .unwrap()
+        );
+        // Redundant under a global `never`, and left out for the same
+        // reason a tool set to its default is.
+        let none = ToolAccessSettings::none().never_server("gj");
+        assert_eq!(serde_json::to_string(&none).unwrap(), r#"{"*":"never"}"#);
+    }
+
+    #[test]
+    fn a_server_is_needed_unless_a_policy_covers_all_of_it() {
+        // The question a lazy connection answers without connecting. Only
+        // the two standing policies can answer it in the negative, because
+        // they are the only things that drop a tool sight unseen — so a
+        // `never` on one of a server's tools still leaves the server worth
+        // starting, which is what makes this optimistic rather than exact.
+        assert!(ToolAccessSettings::default().server_needed("gj"));
+        assert!(ToolAccessSettings::default()
+            .with_in(&two_servers(), "gj__find", ToolAccess::Never)
+            .unwrap()
+            .server_needed("gj"));
+        assert!(ToolAccessSettings::default()
+            .with_in(&two_servers(), "gj", ToolAccess::Ask)
+            .unwrap()
+            .server_needed("gj"));
+
+        assert!(!ToolAccessSettings::default()
+            .never_server("gj")
+            .server_needed("gj"));
+        // Only the server named: switching one off is not switching them
+        // all off.
+        assert!(ToolAccessSettings::default()
+            .never_server("gj")
+            .server_needed("fs"));
+        assert!(!ToolAccessSettings::none().server_needed("gj"));
+        assert!(!ToolAccessSettings::none().server_needed("fs"));
     }
 
     #[test]

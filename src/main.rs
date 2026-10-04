@@ -474,28 +474,17 @@ async fn main() -> Result<()> {
     outcome
 }
 
-/// Starts every configured MCP server and registers what they offer.
+/// These servers, resolved for starting, with what could not be resolved
+/// said out loud.
 ///
-/// Called only from the paths that can actually run or list a tool, so
-/// `clank model` stays instant. Returns without doing anything when no
-/// server is configured, which is the default.
-///
-/// A server that will not start costs that server and is reported. The
-/// alternative — refusing to open a clanker because something unrelated to
-/// the conversation is broken — is worse, and the tools simply are not
-/// there, which `clank tools` then shows.
-async fn connect_mcp_servers() {
-    let Ok(config) = load_config() else {
-        // A config that will not parse is reported by every other path
-        // already; failing here as well would say it twice.
-        return;
-    };
-    if config.mcp_servers.is_empty() {
-        return;
-    }
-
+/// Shared by the reconnect path and by the `clank tools` commands that have
+/// to name a server's tools — the places that connect on purpose rather
+/// than lazily. Takes the servers rather than the config so a caller that
+/// needs one of them resolves one of them: a broken server it is not about
+/// has no business complaining here.
+fn resolve_configured(servers: &[config::McpServerConfig]) -> Vec<mcp::ServerSpec> {
     let mut specs = Vec::new();
-    for server in &config.mcp_servers {
+    for server in servers {
         match config::resolve_server(server) {
             Ok((spec, missing)) => {
                 for variable in missing {
@@ -511,6 +500,31 @@ async fn connect_mcp_servers() {
             Err(e) => eprintln!("{} {}: {e}", "✗".red(), server.name),
         }
     }
+    specs
+}
+
+/// Stops every server and starts them all again, reporting what came up.
+///
+/// The `/mcp reconnect` path, and the only thing that still connects
+/// unconditionally: the reason to run it is a server that was rebuilt, so
+/// it starts from nothing rather than from what a turn happened to need.
+/// Everything else connects lazily — see `mcp::ensure_for_access`.
+///
+/// A server that will not start costs that server and is reported. The
+/// alternative — refusing to open a clanker because something unrelated to
+/// the conversation is broken — is worse, and the tools simply are not
+/// there, which `clank tools` then shows.
+async fn connect_mcp_servers() {
+    let Ok(config) = load_config() else {
+        // A config that will not parse is reported by every other path
+        // already; failing here as well would say it twice.
+        return;
+    };
+    if config.mcp_servers.is_empty() {
+        return;
+    }
+
+    let specs = resolve_configured(&config.mcp_servers);
 
     for started in mcp::connect_all(&specs).await {
         match started.outcome {
@@ -530,11 +544,15 @@ async fn connect_mcp_servers() {
 }
 
 async fn dispatch(cli: Cli) -> Result<()> {
+    // Nothing here connects MCP servers. They come up where they are
+    // needed — a turn that could offer one of their tools, or the one
+    // `clank tools` command that has to name one — so a command that only
+    // reads settings, or a clanker that never calls a server, doesn't pay
+    // to start one. See `mcp::ensure_for_access`.
     match cli.command {
         // A prompt on its own is a one-off run; nothing at all opens the TUI.
         None => match cli.prompt {
             Some(prompt) => {
-                connect_mcp_servers().await;
                 cmd_run(
                     &prompt,
                     cli.tools,
@@ -547,10 +565,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 )
                 .await?
             }
-            None => {
-                connect_mcp_servers().await;
-                cmd_tui().await?
-            }
+            None => cmd_tui().await?,
         },
         Some(Commands::Login) => cmd_login().await?,
         Some(Commands::Logout) => cmd_logout().await?,
@@ -563,15 +578,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Some(Commands::CompactAt { value, clear }) => cmd_compact_at(value, clear).await?,
         Some(Commands::EffortStyle { value, clear }) => cmd_effort_style(value, clear).await?,
         Some(Commands::Headers { action }) => cmd_headers(action).await?,
-        Some(Commands::Tools { state, target }) => {
-            // Connected first on purpose, even though this only reads and
-            // writes settings. A server's tools can't be listed or gated
-            // while they are unknown — `with()` refuses a name it has
-            // never heard of — so `clank tools ask fs/read_file` would
-            // report a typo that isn't one.
-            connect_mcp_servers().await;
-            cmd_tools(state, target).await?
-        }
+        Some(Commands::Tools { state, target }) => cmd_tools(state, target).await?,
         Some(Commands::MaxIterations { value, clear }) => cmd_max_iterations(value, clear).await?,
         Some(Commands::Temperature { value, clear }) => cmd_temperature(value, clear).await?,
         Some(Commands::Stream { value }) => cmd_stream(value).await?,
@@ -590,7 +597,6 @@ async fn dispatch(cli: Cli) -> Result<()> {
             here,
             title,
         }) => {
-            connect_mcp_servers().await;
             cmd_clanker(
                 model,
                 max_iterations,
@@ -1009,6 +1015,16 @@ async fn cmd_tools(state: Option<String>, target: Option<String>) -> Result<()> 
     let updated = match (state.as_deref(), target.as_deref()) {
         (None, _) => {
             print_tools(&config.tool_access());
+            // What a server would add, which is not in the list above: a
+            // fresh process has nothing connected, so this says what is
+            // configured and whether it is up rather than leaving the
+            // servers out of the picture entirely.
+            if !config.mcp_servers.is_empty() {
+                println!();
+                for (name, state) in ui::mcp_rows(&config.mcp_servers, &mcp::connected_counts()) {
+                    println!("  {name}: {}", state.bright_black());
+                }
+            }
             println!("\n{}", "Usage:".bright_black());
             println!("  clank tools <ask|allow|never> <tool|category|server|all>");
             println!("  clank tools on                 Every tool back to its default");
@@ -1024,10 +1040,57 @@ async fn cmd_tools(state: Option<String>, target: Option<String>) -> Result<()> 
             let access = ToolAccess::parse(state).ok_or_else(|| {
                 anyhow::anyhow!("Unknown state '{state}'. Use ask, allow or never.")
             })?;
-            config
-                .tool_access()
-                .with(target, access)
-                .ok_or_else(|| anyhow::anyhow!("No tool, category or server called '{target}'."))?
+
+            // Only what naming `target` actually needs comes up. A whole
+            // server set to `never` is one standing key and needs no tool
+            // list at all — which is what lets a server be switched off
+            // without first being started, the pair the lazy connection
+            // turns on. A category or `all` set to anything writes an entry
+            // per tool it can see, so it is claimed with everything visible
+            // that will be visible, as it was when connecting was
+            // unconditional.
+            let servers = config.mcp_servers.clone();
+            let specs = match config::server_target(target, &servers) {
+                Some((_, true)) if access == ToolAccess::Never => Vec::new(),
+                Some((name, _)) => {
+                    let named: Vec<_> = servers
+                        .iter()
+                        .filter(|server| server.name == name)
+                        .cloned()
+                        .collect();
+                    resolve_configured(&named)
+                }
+                None if target == "all" && access == ToolAccess::Never => Vec::new(),
+                None if target == "all" || tools::CATEGORIES.contains(&target) => {
+                    resolve_configured(&servers)
+                }
+                None => Vec::new(),
+            };
+            for started in mcp::ensure_connected(&specs, |_| true).await {
+                if let Err(e) = started.outcome {
+                    eprintln!("{} {}: {e}", "✗".red(), started.name);
+                }
+            }
+
+            let access_settings = config.tool_access();
+            match access_settings.with(target, access) {
+                Some(updated) => updated,
+                // A configured server that is not connected has no tools to
+                // be named with, and `with` cannot tell that from a typo —
+                // the same case `/tools` handles. `never` for the whole
+                // server is a standing key that needs no tool list, which is
+                // what lets it be switched off without being started.
+                None => match config::server_target(target, &servers) {
+                    Some((server, true)) if access == ToolAccess::Never => {
+                        access_settings.never_server(&server)
+                    }
+                    _ => {
+                        return Err(anyhow::anyhow!(
+                            "No tool, category or server called '{target}'."
+                        ))
+                    }
+                },
+            }
         }
         (Some(state), None) => {
             anyhow::bail!(
@@ -1837,9 +1900,36 @@ fn apply_submission(
             );
         }
         ui::Submission::SetToolAccess { target, access } => {
-            let Some(updated) = session.tool_access().with(&target, access) else {
-                println!("{} No tool, category or server called '{target}'.", "✗".red());
-                return Ok(());
+            let updated = match session.tool_access().with(&target, access) {
+                Some(updated) => updated,
+                // A configured server that is not connected has no tools to
+                // be named with, and `with` cannot tell that from a typo.
+                // `never` for a whole server is a standing policy keyed by
+                // the name alone, so it can be stored all the same.
+                None => {
+                    let servers = load_config().map(|c| c.mcp_servers).unwrap_or_default();
+                    match (config::server_target(&target, &servers), access) {
+                        (Some((server, true)), ToolAccess::Never) => {
+                            session.tool_access().never_server(&server)
+                        }
+                        (Some((server, _)), _) => {
+                            println!(
+                                "{} {server} is configured but not connected, so its tools have \
+                                 no names yet — they arrive on the next turn; try again after \
+                                 one, or /mcp reconnect to bring it up now.",
+                                "✗".red()
+                            );
+                            return Ok(());
+                        }
+                        _ => {
+                            println!(
+                                "{} No tool, category or server called '{target}'.",
+                                "✗".red()
+                            );
+                            return Ok(());
+                        }
+                    }
+                }
             };
             let changed = updated != *session.tool_access();
             session.set_tool_access(updated)?;
@@ -2269,6 +2359,15 @@ async fn cmd_clanker(
                 // the session's own vector, because the two differ.
                 let mut messages = session.request_messages(compact_at);
                 let sent = messages.len();
+                // Lazy connection, before the agentic check below: a
+                // clanker whose built-ins are all off but whose servers are
+                // not is still agentic, and the check needs the servers'
+                // tools to see it.
+                for started in mcp::ensure_for_access(session.tool_access()).await {
+                    if let Err(e) = started.outcome {
+                        eprintln!("{} {}: {e}", "✗".red(), started.name);
+                    }
+                }
                 let turn = if session.is_agentic() {
                     let max_iterations = session.max_iterations();
                     let gates = SessionGates::new(
@@ -2480,6 +2579,15 @@ async fn cmd_agent(
                 config.stream,
             ),
         };
+
+    // Lazy connection, before the agentic checks just below: a clanker
+    // whose built-ins are all off but whose servers are not is still
+    // agentic, and they need the servers' tools to see it.
+    for started in mcp::ensure_for_access(&tool_access).await {
+        if let Err(e) = started.outcome {
+            eprintln!("{} {}: {e}", "✗".red(), started.name);
+        }
+    }
 
     // Nothing to call means nothing to loop over: one iteration is the whole
     // of the turn, so a nullified cap is no reason to refuse the run.
