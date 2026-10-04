@@ -139,6 +139,14 @@ pub fn open_db() -> Result<Connection> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
 
+    ensure_schema(&conn)?;
+    Ok(conn)
+}
+
+/// Creates whatever of the schema is missing on `conn`, and migrates what
+/// an older database lacks. Split from [`open_db`] so a test's in-memory
+/// database is built from the real schema rather than a copy of it.
+pub(crate) fn ensure_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "
         PRAGMA foreign_keys = ON;
@@ -211,28 +219,28 @@ pub fn open_db() -> Result<Connection> {
 
     // `model`/`effort_level` were added after messages already shipped without
     // them; back them onto any database created before this change.
-    ensure_column(&conn, "messages", "model", "TEXT")?;
-    ensure_column(&conn, "messages", "effort_level", "TEXT")?;
+    ensure_column(conn, "messages", "model", "TEXT")?;
+    ensure_column(conn, "messages", "effort_level", "TEXT")?;
     // A reasoning model's own thinking blocks, needed to keep a follow-up
     // request valid when a tool-calling turn continues past one — see
     // `ChatMessage::reasoning_details`.
-    ensure_column(&conn, "messages", "reasoning_details", "TEXT")?;
+    ensure_column(conn, "messages", "reasoning_details", "TEXT")?;
     // The same thinking as prose, kept only to show back to the user under
     // `/verbose` — never resent, unlike the blocks above.
-    ensure_column(&conn, "messages", "reasoning", "TEXT")?;
+    ensure_column(conn, "messages", "reasoning", "TEXT")?;
 
     // Likewise for sessions gaining per-session effort/verbose/max-iterations
     // overrides, so those can be switched mid-conversation and remembered.
-    ensure_column(&conn, "sessions", "effort_level", "TEXT")?;
-    ensure_column(&conn, "sessions", "verbose", "INTEGER NOT NULL DEFAULT 0")?;
-    ensure_column(&conn, "sessions", "max_iterations", "INTEGER")?;
-    ensure_column(&conn, "sessions", "temperature", "REAL")?;
+    ensure_column(conn, "sessions", "effort_level", "TEXT")?;
+    ensure_column(conn, "sessions", "verbose", "INTEGER NOT NULL DEFAULT 0")?;
+    ensure_column(conn, "sessions", "max_iterations", "INTEGER")?;
+    ensure_column(conn, "sessions", "temperature", "REAL")?;
     // Running total of tokens spent across this session's turns. Absent on
     // a row written before this existed, which reads as `0` — indistinguishable
     // from a session that simply hasn't made a request yet, which is the
     // right default for both.
     ensure_column(
-        &conn,
+        conn,
         "sessions",
         "total_tokens",
         "INTEGER NOT NULL DEFAULT 0",
@@ -243,26 +251,26 @@ pub fn open_db() -> Result<Connection> {
     // back as `0`/NULL there — a session that has never been compacted,
     // which is exactly what it is.
     ensure_column(
-        &conn,
+        conn,
         "sessions",
         "compacted_seq",
         "INTEGER NOT NULL DEFAULT 0",
     )?;
-    ensure_column(&conn, "sessions", "compaction_summary", "TEXT")?;
+    ensure_column(conn, "sessions", "compaction_summary", "TEXT")?;
     // What a request actually cost, as the provider priced it. Added after
     // `request_usage` itself, so a row written before this existed reads
     // back as `0` — indistinguishable from a genuinely free request, which
     // is why nothing reasons from it. It is here to check the token counts
     // against: those only become money by way of rates read somewhere else,
     // and this is the figure that says whether those rates were right.
-    ensure_column(&conn, "request_usage", "cost", "REAL NOT NULL DEFAULT 0")?;
+    ensure_column(conn, "request_usage", "cost", "REAL NOT NULL DEFAULT 0")?;
     // The prompt size the provider reported for the session's last request,
     // which is what the compaction threshold is compared against. `0` on a
     // row written before this existed, read as unmeasured rather than as a
     // tiny prompt, so an old session compacts after its next turn rather
     // than never or immediately.
     ensure_column(
-        &conn,
+        conn,
         "sessions",
         "prompt_tokens",
         "INTEGER NOT NULL DEFAULT 0",
@@ -270,28 +278,28 @@ pub fn open_db() -> Result<Connection> {
     // Who holds the session, so a claim can only be renewed or released by
     // the process that took it. Null on rows written before claims existed,
     // which reads as unheld — correct, since no live process owns them.
-    ensure_column(&conn, "sessions", "claim_owner", "TEXT")?;
+    ensure_column(conn, "sessions", "claim_owner", "TEXT")?;
     // What each tool may do, as JSON. NULL in a row written before tools had
     // their own states, and read back as whatever the three `approval_*`
     // booleans beside it meant — see `tool_access_of`. Those columns are
     // left in place rather than dropped: nothing writes them now, dropping a
     // column in SQLite rebuilds the table, and they are the only record of
     // what an old session wanted.
-    ensure_column(&conn, "sessions", "tool_access", "TEXT")?;
+    ensure_column(conn, "sessions", "tool_access", "TEXT")?;
     ensure_column(
-        &conn,
+        conn,
         "sessions",
         "approval_read",
         "INTEGER NOT NULL DEFAULT 1",
     )?;
     ensure_column(
-        &conn,
+        conn,
         "sessions",
         "approval_write",
         "INTEGER NOT NULL DEFAULT 1",
     )?;
     ensure_column(
-        &conn,
+        conn,
         "sessions",
         "approval_terminal",
         "INTEGER NOT NULL DEFAULT 1",
@@ -299,30 +307,29 @@ pub fn open_db() -> Result<Connection> {
     // Where the file-writing tools may write, per session — see
     // `Config::sandbox`. Defaults on, so a session written before this
     // existed comes back confined rather than unbounded.
-    ensure_column(&conn, "sessions", "sandbox", "INTEGER NOT NULL DEFAULT 1")?;
+    ensure_column(conn, "sessions", "sandbox", "INTEGER NOT NULL DEFAULT 1")?;
     // Whether your own messages get a band behind them. On by default, so a
     // session written before this existed comes back looking like a new one
     // rather than subtly plainer.
-    ensure_column(&conn, "sessions", "highlight", "INTEGER NOT NULL DEFAULT 1")?;
+    ensure_column(conn, "sessions", "highlight", "INTEGER NOT NULL DEFAULT 1")?;
     // Whether replies stream token-by-token, per session — see
     // `Config::stream` for the configured default this snapshots.
-    ensure_column(&conn, "sessions", "stream", "INTEGER NOT NULL DEFAULT 1")?;
+    ensure_column(conn, "sessions", "stream", "INTEGER NOT NULL DEFAULT 1")?;
     // The directory a session was started in. Nullable on purpose: rows
     // written before this existed have no answer, and a migration shouldn't
     // start refusing to resume sessions that already worked.
-    ensure_column(&conn, "sessions", "working_dir", "TEXT")?;
+    ensure_column(conn, "sessions", "working_dir", "TEXT")?;
     // What the session's process is doing right now, for anything watching
     // the list. Null means "nothing to say" — see `Activity`.
-    ensure_column(&conn, "sessions", "activity", "TEXT")?;
-    ensure_column(&conn, "sessions", "activity_detail", "TEXT")?;
+    ensure_column(conn, "sessions", "activity", "TEXT")?;
+    ensure_column(conn, "sessions", "activity_detail", "TEXT")?;
     // When the process running this session was last known to be alive. An
     // `activity` says what a process is doing; this says whether that process
     // still exists. Null for a session nobody is running, and for every row
     // written before this existed — which reads as "not running", the safe
     // answer for a session that has been sitting in the database untouched.
-    ensure_column(&conn, "sessions", "heartbeat", "INTEGER")?;
-
-    Ok(conn)
+    ensure_column(conn, "sessions", "heartbeat", "INTEGER")?;
+    Ok(())
 }
 
 /// Adds `column` to `table` if it isn't already there. Used to migrate

@@ -381,7 +381,7 @@ struct Counts {
 }
 
 impl UsageTracker {
-    fn add(&self, usage: Usage) {
+    pub(crate) fn add(&self, usage: Usage) {
         let mut counts = self.counts.lock().expect("usage tracker poisoned");
         counts.total += usage.total_tokens;
         if usage.prompt_tokens > 0 {

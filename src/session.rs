@@ -564,6 +564,49 @@ impl ChatSession {
         Ok(())
     }
 
+    /// Records what a turn's requests measured: the tokens they spent, the
+    /// size of the last one, and each one individually.
+    ///
+    /// Read regardless of how the turn ended — a cancelled or failed turn
+    /// can still have completed requests, and those tokens were spent. One
+    /// place for all three because every front end that runs a turn owes
+    /// them, and a copy that forgot one is how a saved one-shot run came
+    /// back with no prompt size and never compacted.
+    ///
+    /// Returns what could not be saved rather than failing: the turn
+    /// already happened, so each failure is something to report, and the
+    /// caller reports it in its own way.
+    pub fn record_turn(&mut self, usage: &crate::agent::UsageTracker) -> Vec<String> {
+        let mut failures = Vec::new();
+        if let Err(e) = self.add_tokens(usage.total() as i64) {
+            failures.push(format!("Failed to save token usage: {e}"));
+        }
+        // What decides whether the next turn compacts first.
+        if let Err(e) = self.set_prompt_tokens(usage.last_prompt()) {
+            failures.push(format!("Failed to save the prompt size: {e}"));
+        }
+        // What the two above can't say: the total mixes requests together
+        // and the prompt size is overwritten every turn, so neither shows a
+        // history growing or a compaction cutting it back.
+        if let Err(e) = self.record_request_usage(&usage.requests()) {
+            failures.push(format!("Failed to save per-request usage: {e}"));
+        }
+        failures
+    }
+
+    /// Takes the messages a turn produced back into the session.
+    ///
+    /// `sent` is how long the array was when it was handed to the turn;
+    /// everything past that is what the turn appended. The session's own
+    /// length would be the same number for an uncompacted clanker and wrong
+    /// for a compacted one, where the turn was given a summary and a tail
+    /// rather than the whole history.
+    pub fn absorb(&mut self, messages: Vec<ChatMessage>, sent: usize) {
+        for message in messages.into_iter().skip(sent) {
+            self.push(message);
+        }
+    }
+
     /// How many leading messages the summary stands in for.
     pub fn compacted_seq(&self) -> usize {
         self.compacted_seq
@@ -930,52 +973,9 @@ mod tests {
     fn memory_conn() -> Connection {
         crate::crypto::seed_test_key();
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "
-            CREATE TABLE sessions (
-                id              TEXT PRIMARY KEY,
-                title           TEXT NOT NULL,
-                model           TEXT NOT NULL,
-                kind            TEXT NOT NULL,
-                effort_level    TEXT,
-                verbose         INTEGER NOT NULL DEFAULT 0,
-                highlight       INTEGER NOT NULL DEFAULT 1,
-                max_iterations  INTEGER,
-                temperature     REAL,
-                approval_read      INTEGER NOT NULL DEFAULT 1,
-                approval_write     INTEGER NOT NULL DEFAULT 1,
-                approval_terminal  INTEGER NOT NULL DEFAULT 1,
-                tool_access        TEXT,
-                sandbox            INTEGER NOT NULL DEFAULT 1,
-                stream             INTEGER NOT NULL DEFAULT 1,
-                working_dir        TEXT,
-                activity           TEXT,
-                activity_detail    TEXT,
-                heartbeat          INTEGER,
-                claim_owner        TEXT,
-                total_tokens       INTEGER NOT NULL DEFAULT 0,
-                compacted_seq      INTEGER NOT NULL DEFAULT 0,
-                compaction_summary TEXT,
-                prompt_tokens      INTEGER NOT NULL DEFAULT 0,
-                created_at      INTEGER NOT NULL,
-                updated_at      INTEGER NOT NULL
-            );
-            CREATE TABLE messages (
-                id                INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id        TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-                seq               INTEGER NOT NULL,
-                role              TEXT NOT NULL,
-                content           TEXT,
-                tool_calls        TEXT,
-                tool_call_id      TEXT,
-                model             TEXT,
-                effort_level      TEXT,
-                reasoning_details TEXT,
-                reasoning         TEXT
-            );
-            ",
-        )
-        .unwrap();
+        // The real schema, not a copy of it: a copy is one more thing to
+        // keep in step, and the last one fell behind.
+        store::ensure_schema(&conn).unwrap();
         conn
     }
 
@@ -1212,6 +1212,63 @@ mod tests {
         let (resumed, _) =
             ChatSession::resume(session.conn, &summary, summary.model.clone()).unwrap();
         assert_eq!(resumed.total_tokens(), 150);
+    }
+
+    #[test]
+    fn a_turn_records_its_total_its_prompt_size_and_each_request() {
+        // All three, through the one call every front end makes — the
+        // prompt size especially, which a saved one-shot run once left out
+        // and so came back never compacting.
+        let mut session = memory_session();
+        let usage = crate::agent::UsageTracker::default();
+        for (prompt, total) in [(1_000, 1_100), (1_400, 1_500)] {
+            usage.add(crate::client::Usage {
+                prompt_tokens: prompt,
+                total_tokens: total,
+                ..Default::default()
+            });
+        }
+
+        assert_eq!(session.record_turn(&usage), Vec::<String>::new());
+        assert_eq!(session.total_tokens(), 2_600);
+        assert_eq!(session.prompt_tokens(), 1_400, "the last request's size");
+        let rows: i64 = session
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM request_usage WHERE session_id = ?1",
+                [session.id()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 2);
+
+        // And it survives a resume, which is where the next turn reads it.
+        let summary = store::find_session(&session.conn, session.id())
+            .unwrap()
+            .unwrap();
+        let (resumed, _) =
+            ChatSession::resume(session.conn, &summary, summary.model.clone()).unwrap();
+        assert_eq!(resumed.prompt_tokens(), 1_400);
+    }
+
+    #[test]
+    fn absorbing_a_turn_takes_only_what_it_appended() {
+        let mut session = memory_session();
+        session.push_user("first".to_string());
+        // What was sent may be shorter than the session — a compacted
+        // clanker sends a summary and a tail — so `sent` counts the array,
+        // not the history.
+        let mut messages = vec![session.messages()[0].clone()];
+        let sent = messages.len();
+        messages.push(ChatMessage {
+            role: "assistant".to_string(),
+            content: Some("reply".to_string()),
+            ..Default::default()
+        });
+
+        session.absorb(messages, sent);
+        let roles: Vec<_> = session.messages().iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, ["user", "assistant"]);
     }
 
     #[test]

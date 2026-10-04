@@ -722,7 +722,12 @@ impl Worker {
                     match finished {
                         Ok((result, messages)) => {
                             failed = result.is_err();
-                            self.absorb(result, messages, sent);
+                            self.session.absorb(messages, sent);
+                            if let Err(e) = result {
+                                let _ = self.events.send(Event::Agent(AgentEvent::Error {
+                                    message: e.to_string(),
+                                }));
+                            }
                             break TurnOutcome::Completed;
                         }
                         Err(e) if e.is_cancelled() => break TurnOutcome::Cancelled,
@@ -883,14 +888,12 @@ impl Worker {
             queue.push_back(text);
         }
 
-        // Read regardless of how the turn ended: a cancelled or failed turn
-        // can still have completed some requests before that happened, and
-        // those tokens were spent whether or not the turn as a whole
-        // succeeded.
-        if let Err(e) = self.session.add_tokens(usage.total() as i64) {
-            let _ = self.events.send(Event::Agent(AgentEvent::Error {
-                message: format!("Failed to save token usage: {e}"),
-            }));
+        // Read regardless of how the turn ended — see
+        // `ChatSession::record_turn`.
+        for message in self.session.record_turn(&usage) {
+            let _ = self
+                .events
+                .send(Event::Agent(AgentEvent::Error { message }));
         }
         // Whether a compaction this turn ran before actually got the
         // request back under the line, which is what decides whether the
@@ -901,23 +904,6 @@ impl Worker {
         if let Some(threshold) = self.compact_at {
             self.compaction_guard
                 .measured(usage.first_prompt(), threshold);
-        }
-        // How big the last request was, which is what decides whether the
-        // next turn compacts first. Recorded on the same terms as the total:
-        // a turn that failed part-way still measured the requests it made.
-        if let Err(e) = self.session.set_prompt_tokens(usage.last_prompt()) {
-            let _ = self.events.send(Event::Agent(AgentEvent::Error {
-                message: format!("Failed to save the prompt size: {e}"),
-            }));
-        }
-        // Each request individually, which is what the two numbers above
-        // can't say: the total mixes requests together and the prompt size
-        // is overwritten every turn, so neither shows a history growing or a
-        // compaction cutting it back.
-        if let Err(e) = self.session.record_request_usage(&usage.requests()) {
-            let _ = self.events.send(Event::Agent(AgentEvent::Error {
-                message: format!("Failed to save per-request usage: {e}"),
-            }));
         }
 
         self.persist();
@@ -932,33 +918,6 @@ impl Worker {
         match outcome {
             TurnOutcome::Completed if detached => TurnOutcome::Disconnected,
             outcome => outcome,
-        }
-    }
-
-    /// Folds a finished turn's messages back into the session and persists
-    /// them. The agent loop works on a copy (it runs on another task), so the
-    /// session only learns about assistant/tool turns here.
-    /// Takes the messages a turn produced back into the session.
-    ///
-    /// `sent` is how long the array was when it was handed to the turn;
-    /// everything past that is what the turn appended. The session's own
-    /// length would be the same number for an uncompacted clanker and wrong
-    /// for a compacted one, where the turn was given a summary and a tail
-    /// rather than the whole history.
-    fn absorb(
-        &mut self,
-        result: Result<Option<String>>,
-        messages: Vec<crate::client::ChatMessage>,
-        sent: usize,
-    ) {
-        for message in messages.into_iter().skip(sent) {
-            self.session.push(message);
-        }
-
-        if let Err(e) = result {
-            let _ = self.events.send(Event::Agent(AgentEvent::Error {
-                message: e.to_string(),
-            }));
         }
     }
 

@@ -2387,9 +2387,7 @@ async fn cmd_clanker(
                     .await
                 };
 
-                for message in messages.into_iter().skip(sent) {
-                    session.push(message);
-                }
+                session.absorb(messages, sent);
 
                 let failed = turn.is_err();
                 match turn {
@@ -2400,8 +2398,8 @@ async fn cmd_clanker(
                     Err(e) => println!("{} {}\n", "✗".red(), e),
                 }
                 session.set_activity(failed.then_some(store::Activity::Failed), None);
-                if let Err(e) = session.add_tokens(usage.total() as i64) {
-                    eprintln!("{} Failed to save token usage: {}", "✗".red(), e);
+                for message in session.record_turn(&usage) {
+                    eprintln!("{} {message}", "✗".red());
                 }
                 // Whether a compaction this turn ran got the request back
                 // under the line. The turn's *first* request, not its last:
@@ -2409,14 +2407,6 @@ async fn cmd_clanker(
                 // appended — see `CompactionGuard::measured`.
                 if let Some(threshold) = compact_at {
                     guard.measured(usage.first_prompt(), threshold);
-                }
-                // How big the last request was, which is what decides
-                // whether the next one compacts first.
-                if let Err(e) = session.set_prompt_tokens(usage.last_prompt()) {
-                    eprintln!("{} Failed to save the prompt size: {}", "✗".red(), e);
-                }
-                if let Err(e) = session.record_request_usage(&usage.requests()) {
-                    eprintln!("{} Failed to save per-request usage: {}", "✗".red(), e);
                 }
 
                 if let Err(e) = session.persist_pending() {
@@ -2640,11 +2630,10 @@ async fn cmd_agent(
 
     let failed = turn.is_err();
     session.set_activity(failed.then_some(store::Activity::Failed), None);
-    if let Err(e) = session.add_tokens(usage.total() as i64) {
-        eprintln!("{} Failed to save token usage: {}", "✗".red(), e);
-    }
-    if let Err(e) = session.record_request_usage(&usage.requests()) {
-        eprintln!("{} Failed to save per-request usage: {}", "✗".red(), e);
+    // The prompt size among them, which this path used to leave out — so a
+    // saved run resumed into a clanker never compacted on its first turn.
+    for message in session.record_turn(&usage) {
+        eprintln!("{} {message}", "✗".red());
     }
 
     // Persisted before the error is returned: the turn's messages are worth
