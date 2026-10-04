@@ -532,27 +532,27 @@ async fn dispatch(cli: Cli) -> Result<()> {
             }
             None => cmd_tui().await?,
         },
-        Some(Commands::Login) => cmd_login().await?,
-        Some(Commands::Logout) => cmd_logout().await?,
-        Some(Commands::Status) => cmd_status().await?,
-        Some(Commands::Mcp { action }) => cmd_mcp(action).await?,
+        Some(Commands::Login) => cmd_login()?,
+        Some(Commands::Logout) => cmd_logout()?,
+        Some(Commands::Status) => cmd_status()?,
+        Some(Commands::Mcp { action }) => cmd_mcp(action)?,
         Some(Commands::Models) => cmd_models().await?,
-        Some(Commands::Model { name, clear }) => cmd_model(name, clear).await?,
-        Some(Commands::Endpoint { url, clear }) => cmd_endpoint(url, clear).await?,
-        Some(Commands::Compactor { name, clear }) => cmd_compactor(name, clear).await?,
-        Some(Commands::CompactAt { value, clear }) => cmd_compact_at(value, clear).await?,
-        Some(Commands::EffortStyle { value, clear }) => cmd_effort_style(value, clear).await?,
-        Some(Commands::Headers { action }) => cmd_headers(action).await?,
+        Some(Commands::Model { name, clear }) => cmd_model(name, clear)?,
+        Some(Commands::Endpoint { url, clear }) => cmd_endpoint(url, clear)?,
+        Some(Commands::Compactor { name, clear }) => cmd_compactor(name, clear)?,
+        Some(Commands::CompactAt { value, clear }) => cmd_compact_at(value, clear)?,
+        Some(Commands::EffortStyle { value, clear }) => cmd_effort_style(value, clear)?,
+        Some(Commands::Headers { action }) => cmd_headers(action)?,
         Some(Commands::Tools { state, target }) => cmd_tools(state, target).await?,
-        Some(Commands::MaxIterations { value, clear }) => cmd_max_iterations(value, clear).await?,
-        Some(Commands::Temperature { value, clear }) => cmd_temperature(value, clear).await?,
-        Some(Commands::Stream { value }) => cmd_stream(value).await?,
-        Some(Commands::Sandbox { value }) => cmd_sandbox(value).await?,
-        Some(Commands::Highlight { value }) => cmd_highlight(value).await?,
-        Some(Commands::Selection { value }) => cmd_selection(value).await?,
-        Some(Commands::Verbose { value }) => cmd_verbose(value).await?,
-        Some(Commands::EffortLevel { value, clear }) => cmd_effort_level(value, clear).await?,
-        Some(Commands::Timeout { name, secs }) => cmd_timeout(name, secs).await?,
+        Some(Commands::MaxIterations { value, clear }) => cmd_max_iterations(value, clear)?,
+        Some(Commands::Temperature { value, clear }) => cmd_temperature(value, clear)?,
+        Some(Commands::Stream { value }) => cmd_stream(value)?,
+        Some(Commands::Sandbox { value }) => cmd_sandbox(value)?,
+        Some(Commands::Highlight { value }) => cmd_highlight(value)?,
+        Some(Commands::Selection { value }) => cmd_selection(value)?,
+        Some(Commands::Verbose { value }) => cmd_verbose(value)?,
+        Some(Commands::EffortLevel { value, clear }) => cmd_effort_level(value, clear)?,
+        Some(Commands::Timeout { name, secs }) => cmd_timeout(name, secs)?,
         Some(Commands::Clanker {
             model,
             max_iterations,
@@ -573,13 +573,13 @@ async fn dispatch(cli: Cli) -> Result<()> {
             )
             .await?
         }
-        Some(Commands::Clankers { action }) => cmd_clankers(action).await?,
+        Some(Commands::Clankers { action }) => cmd_clankers(action)?,
     }
 
     Ok(())
 }
 
-async fn cmd_login() -> Result<()> {
+fn cmd_login() -> Result<()> {
     let mut config = load_config()?;
 
     // Pre-filled with the current endpoint (which is itself the configured
@@ -625,7 +625,7 @@ async fn cmd_login() -> Result<()> {
     Ok(())
 }
 
-async fn cmd_logout() -> Result<()> {
+fn cmd_logout() -> Result<()> {
     clear_api_key()?;
     println!("{} API key removed", "✓".green());
     Ok(())
@@ -635,20 +635,20 @@ async fn cmd_logout() -> Result<()> {
 ///
 /// Bare `clank mcp` lists, like `clank model` with no argument shows the
 /// current one rather than complaining.
-async fn cmd_mcp(action: Option<McpAction>) -> Result<()> {
+fn cmd_mcp(action: Option<McpAction>) -> Result<()> {
     match action.unwrap_or(McpAction::List) {
-        McpAction::List => cmd_mcp_list().await,
-        McpAction::Add { name, env, command } => cmd_mcp_add(name, env, command).await,
-        McpAction::Remove { name } => cmd_mcp_remove(&name).await,
+        McpAction::List => cmd_mcp_list(),
+        McpAction::Add { name, env, command } => cmd_mcp_add(name, env, command),
+        McpAction::Remove { name } => cmd_mcp_remove(&name),
         McpAction::Env {
             name,
             variable,
             clear,
-        } => cmd_mcp_env(&name, &variable, clear).await,
+        } => cmd_mcp_env(&name, &variable, clear),
     }
 }
 
-async fn cmd_mcp_add(name: String, env: Vec<String>, command: Vec<String>) -> Result<()> {
+fn cmd_mcp_add(name: String, env: Vec<String>, command: Vec<String>) -> Result<()> {
     // Rejected here rather than at connect time: a name with a `/` in it
     // cannot be routed, and finding that out when a tool is called is far
     // too late.
@@ -695,7 +695,7 @@ async fn cmd_mcp_add(name: String, env: Vec<String>, command: Vec<String>) -> Re
     Ok(())
 }
 
-async fn cmd_mcp_list() -> Result<()> {
+fn cmd_mcp_list() -> Result<()> {
     let config = load_config()?;
     if config.mcp_servers.is_empty() {
         println!(
@@ -738,7 +738,7 @@ async fn cmd_mcp_list() -> Result<()> {
     Ok(())
 }
 
-async fn cmd_mcp_remove(name: &str) -> Result<()> {
+fn cmd_mcp_remove(name: &str) -> Result<()> {
     let mut config = load_config()?;
     let before = config.mcp_servers.len();
     let removed: Vec<config::McpServerConfig> = config
@@ -767,7 +767,7 @@ async fn cmd_mcp_remove(name: &str) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_mcp_env(name: &str, variable: &str, clear: bool) -> Result<()> {
+fn cmd_mcp_env(name: &str, variable: &str, clear: bool) -> Result<()> {
     let config = load_config()?;
     if !config.mcp_servers.iter().any(|server| server.name == name) {
         anyhow::bail!("There is no server called {name}. `clank mcp` lists them.");
@@ -798,7 +798,7 @@ async fn cmd_mcp_env(name: &str, variable: &str, clear: bool) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_status() -> Result<()> {
+fn cmd_status() -> Result<()> {
     let config = load_config()?;
     println!("\n{}", "Clanker Command Center Configuration:".blue());
     println!("  Base URL: {}", config.base_url);
@@ -926,7 +926,7 @@ const TIMEOUTS: [TimeoutEntry; 4] = [
     ),
 ];
 
-async fn cmd_timeout(name: Option<String>, secs: Option<u64>) -> Result<()> {
+fn cmd_timeout(name: Option<String>, secs: Option<u64>) -> Result<()> {
     let mut config = load_config()?;
 
     let Some(name) = name else {
@@ -1051,7 +1051,7 @@ fn print_tools(access: &ToolAccessSettings) {
     }
 }
 
-async fn cmd_model(name: Option<String>, clear: bool) -> Result<()> {
+fn cmd_model(name: Option<String>, clear: bool) -> Result<()> {
     let mut config = load_config()?;
 
     if clear {
@@ -1085,7 +1085,7 @@ async fn cmd_model(name: Option<String>, clear: bool) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_endpoint(url: Option<String>, clear: bool) -> Result<()> {
+fn cmd_endpoint(url: Option<String>, clear: bool) -> Result<()> {
     let mut config = load_config()?;
 
     if clear {
@@ -1118,7 +1118,7 @@ async fn cmd_endpoint(url: Option<String>, clear: bool) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_effort_style(value: Option<String>, clear: bool) -> Result<()> {
+fn cmd_effort_style(value: Option<String>, clear: bool) -> Result<()> {
     let mut config = load_config()?;
 
     if clear {
@@ -1159,7 +1159,7 @@ async fn cmd_effort_style(value: Option<String>, clear: bool) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_headers(action: Option<HeaderCommands>) -> Result<()> {
+fn cmd_headers(action: Option<HeaderCommands>) -> Result<()> {
     let mut config = load_config()?;
 
     match action.unwrap_or(HeaderCommands::Show) {
@@ -1197,7 +1197,7 @@ async fn cmd_headers(action: Option<HeaderCommands>) -> Result<()> {
 /// The band behind your own messages. Per-session like `verbose`, so this
 /// only sets what a *new* session starts with; `/highlight` changes one that
 /// already exists.
-async fn cmd_highlight(value: Option<bool>) -> Result<()> {
+fn cmd_highlight(value: Option<bool>) -> Result<()> {
     let mut config = load_config()?;
     let state = |on: bool| if on { "highlighted" } else { "plain" };
 
@@ -1224,7 +1224,7 @@ async fn cmd_highlight(value: Option<bool>) -> Result<()> {
 
 /// The band on the launch screen's selected row. Global only — that screen
 /// belongs to no session, so there is nothing to override it with.
-async fn cmd_selection(value: Option<bool>) -> Result<()> {
+fn cmd_selection(value: Option<bool>) -> Result<()> {
     let mut config = load_config()?;
     let state = |on: bool| if on { "highlighted" } else { "plain" };
 
@@ -1249,7 +1249,7 @@ async fn cmd_selection(value: Option<bool>) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_verbose(value: Option<bool>) -> Result<()> {
+fn cmd_verbose(value: Option<bool>) -> Result<()> {
     let mut config = load_config()?;
 
     match value {
@@ -1276,7 +1276,7 @@ async fn cmd_verbose(value: Option<bool>) -> Result<()> {
 /// The persistent default for confining the agent's file writes. A session
 /// snapshots this when it's created, so changing it here affects new
 /// sessions; `/sandbox` changes the one you're in.
-async fn cmd_sandbox(value: Option<bool>) -> Result<()> {
+fn cmd_sandbox(value: Option<bool>) -> Result<()> {
     let mut config = load_config()?;
 
     match value {
@@ -1293,7 +1293,7 @@ async fn cmd_sandbox(value: Option<bool>) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_stream(value: Option<bool>) -> Result<()> {
+fn cmd_stream(value: Option<bool>) -> Result<()> {
     let mut config = load_config()?;
 
     match value {
@@ -1317,7 +1317,7 @@ async fn cmd_stream(value: Option<bool>) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_max_iterations(value: Option<usize>, clear: bool) -> Result<()> {
+fn cmd_max_iterations(value: Option<usize>, clear: bool) -> Result<()> {
     let mut config = load_config()?;
 
     if clear {
@@ -1352,7 +1352,7 @@ async fn cmd_max_iterations(value: Option<usize>, clear: bool) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_temperature(value: Option<f32>, clear: bool) -> Result<()> {
+fn cmd_temperature(value: Option<f32>, clear: bool) -> Result<()> {
     let mut config = load_config()?;
 
     if clear {
@@ -1389,7 +1389,7 @@ async fn cmd_temperature(value: Option<f32>, clear: bool) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_effort_level(value: Option<String>, clear: bool) -> Result<()> {
+fn cmd_effort_level(value: Option<String>, clear: bool) -> Result<()> {
     let mut config = load_config()?;
 
     if clear {
@@ -1429,7 +1429,7 @@ async fn cmd_effort_level(value: Option<String>, clear: bool) -> Result<()> {
 /// `clank compactor [name] [--clear]` — the model that does the summarizing.
 /// Clearing falls back to the same default an unset model does, rather than
 /// switching compaction off; `clank compact-at --clear` is the off switch.
-async fn cmd_compactor(name: Option<String>, clear: bool) -> Result<()> {
+fn cmd_compactor(name: Option<String>, clear: bool) -> Result<()> {
     let mut config = load_config()?;
 
     if clear {
@@ -1459,7 +1459,7 @@ async fn cmd_compactor(name: Option<String>, clear: bool) -> Result<()> {
 
 /// `clank compact-at [n] [--clear]` — how large a request's prompt has to get
 /// before the next turn summarizes the older part of the conversation first.
-async fn cmd_compact_at(value: Option<u64>, clear: bool) -> Result<()> {
+fn cmd_compact_at(value: Option<u64>, clear: bool) -> Result<()> {
     let mut config = load_config()?;
 
     if clear {
@@ -2305,7 +2305,7 @@ async fn cmd_tui() -> Result<()> {
     tui::run(context).await
 }
 
-async fn cmd_clankers(action: Option<ClankerCommands>) -> Result<()> {
+fn cmd_clankers(action: Option<ClankerCommands>) -> Result<()> {
     let conn = store::open_db()?;
 
     match action.unwrap_or(ClankerCommands::List) {

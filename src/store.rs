@@ -112,8 +112,6 @@ pub struct SessionSummary {
     /// When the process running this session last checked in. `None` means
     /// nothing is running it. See [`heartbeat_is_live`].
     pub heartbeat: Option<i64>,
-    /// Not surfaced by the CLI, but kept for sorting and display.
-    pub created_at: i64,
     /// Drives "12m ago" in the TUI's session lists.
     pub updated_at: i64,
 }
@@ -1029,7 +1027,7 @@ fn message_preview(content: Option<&str>, tool_calls: Option<&str>) -> String {
 pub fn list_sessions(conn: &Connection) -> Result<Vec<SessionSummary>> {
     let mut stmt = conn.prepare(
         "SELECT id, title, model, kind, effort_level, verbose, max_iterations, temperature, \
-         approval_read, approval_write, approval_terminal, sandbox, stream, working_dir, activity, activity_detail, created_at, updated_at, highlight, heartbeat, tool_access, total_tokens, compacted_seq, compaction_summary, prompt_tokens \
+         approval_read, approval_write, approval_terminal, sandbox, stream, working_dir, activity, activity_detail, updated_at, highlight, heartbeat, tool_access, total_tokens, compacted_seq, compaction_summary, prompt_tokens \
          FROM sessions ORDER BY updated_at DESC",
     )?;
 
@@ -1044,7 +1042,7 @@ pub fn list_sessions(conn: &Connection) -> Result<Vec<SessionSummary>> {
             max_iterations: row.get(6)?,
             temperature: row.get(7)?,
             tool_access: tool_access_of(
-                row.get::<_, Option<String>>(20)?.as_deref(),
+                row.get::<_, Option<String>>(19)?.as_deref(),
                 &ApprovalSettings {
                     read_disk: row.get(8)?,
                     write_disk: row.get(9)?,
@@ -1056,14 +1054,13 @@ pub fn list_sessions(conn: &Connection) -> Result<Vec<SessionSummary>> {
             working_dir: row.get(13)?,
             activity: Activity::from_stored(row.get::<_, Option<String>>(14)?.as_deref()),
             activity_detail: row.get(15)?,
-            heartbeat: row.get(19)?,
-            created_at: row.get(16)?,
-            updated_at: row.get(17)?,
-            highlight: row.get(18)?,
-            total_tokens: row.get(21)?,
-            compacted_seq: row.get(22)?,
-            compaction_summary: row.get(23)?,
-            prompt_tokens: row.get(24)?,
+            heartbeat: row.get(18)?,
+            updated_at: row.get(16)?,
+            highlight: row.get(17)?,
+            total_tokens: row.get(20)?,
+            compacted_seq: row.get(21)?,
+            compaction_summary: row.get(22)?,
+            prompt_tokens: row.get(23)?,
         })
     })?;
 
@@ -1131,7 +1128,7 @@ pub fn find_session(conn: &Connection, id_or_prefix: &str) -> Result<Option<Sess
 fn load_summary(conn: &Connection, id: &str) -> Result<Option<SessionSummary>> {
     let mut stmt = conn.prepare(
         "SELECT id, title, model, kind, effort_level, verbose, max_iterations, temperature, \
-         approval_read, approval_write, approval_terminal, sandbox, stream, working_dir, activity, activity_detail, created_at, updated_at, highlight, heartbeat, tool_access, total_tokens, compacted_seq, compaction_summary, prompt_tokens \
+         approval_read, approval_write, approval_terminal, sandbox, stream, working_dir, activity, activity_detail, updated_at, highlight, heartbeat, tool_access, total_tokens, compacted_seq, compaction_summary, prompt_tokens \
          FROM sessions WHERE id = ?1",
     )?;
 
@@ -1149,7 +1146,7 @@ fn load_summary(conn: &Connection, id: &str) -> Result<Option<SessionSummary>> {
             max_iterations: row.get(6)?,
             temperature: row.get(7)?,
             tool_access: tool_access_of(
-                row.get::<_, Option<String>>(20)?.as_deref(),
+                row.get::<_, Option<String>>(19)?.as_deref(),
                 &ApprovalSettings {
                     read_disk: row.get(8)?,
                     write_disk: row.get(9)?,
@@ -1161,14 +1158,13 @@ fn load_summary(conn: &Connection, id: &str) -> Result<Option<SessionSummary>> {
             working_dir: row.get(13)?,
             activity: Activity::from_stored(row.get::<_, Option<String>>(14)?.as_deref()),
             activity_detail: row.get(15)?,
-            heartbeat: row.get(19)?,
-            created_at: row.get(16)?,
-            updated_at: row.get(17)?,
-            highlight: row.get(18)?,
-            total_tokens: row.get(21)?,
-            compacted_seq: row.get(22)?,
-            compaction_summary: crypto::decrypt_opt(row.get(23)?)?,
-            prompt_tokens: row.get(24)?,
+            heartbeat: row.get(18)?,
+            updated_at: row.get(16)?,
+            highlight: row.get(17)?,
+            total_tokens: row.get(20)?,
+            compacted_seq: row.get(21)?,
+            compaction_summary: crypto::decrypt_opt(row.get(22)?)?,
+            prompt_tokens: row.get(23)?,
         }))
     } else {
         Ok(None)
@@ -2283,6 +2279,54 @@ mod tests {
         add_session_tokens(&conn, &id, 120).unwrap();
         add_session_tokens(&conn, &id, 30).unwrap();
         assert_eq!(find_session(&conn, &id).unwrap().unwrap().total_tokens, 150);
+    }
+
+    #[test]
+    fn every_column_after_the_ones_read_by_position_lands_in_its_own_field() {
+        // Both queries read by position, so a column dropped from or added
+        // to the SELECT shifts every field after it. Each one is set to a
+        // value nothing else has, and read back through both paths.
+        let conn = memory_db();
+        let id = crate::session::new_id();
+        create_session(
+            &conn,
+            &id,
+            "model-a",
+            KIND_CHAT,
+            None,
+            None,
+            None,
+            &ToolAccessSettings::default(),
+            true,
+            false,
+            false,
+            true,
+            None,
+        )
+        .unwrap();
+        let access = ToolAccessSettings::default()
+            .with("all", crate::config::ToolAccess::Never)
+            .unwrap();
+        set_session_tool_access(&conn, &id, &access).unwrap();
+        set_session_highlight(&conn, &id, false).unwrap();
+        add_session_tokens(&conn, &id, 777).unwrap();
+        set_session_compaction(&conn, &id, 42, "the summary").unwrap();
+        set_session_prompt_tokens(&conn, &id, 555).unwrap();
+        assert!(claim_session(&conn, &id, "owner").unwrap());
+
+        let listed = list_sessions(&conn).unwrap().remove(0);
+        let found = find_session(&conn, &id).unwrap().unwrap();
+        for summary in [&listed, &found] {
+            assert_eq!(summary.tool_access, access);
+            assert!(!summary.highlight);
+            assert_eq!(summary.total_tokens, 777);
+            assert_eq!(summary.compacted_seq, 42);
+            assert_eq!(summary.prompt_tokens, 555);
+            assert!(heartbeat_is_live(summary.heartbeat));
+            assert!(summary.updated_at > 0);
+        }
+        // Only the single-session read decrypts the summary.
+        assert_eq!(found.compaction_summary.as_deref(), Some("the summary"));
     }
 
     #[test]

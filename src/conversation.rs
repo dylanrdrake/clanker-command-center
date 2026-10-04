@@ -957,6 +957,10 @@ impl Worker {
     /// nothing in another terminal. The notice says so, because it would
     /// otherwise read like every other slash command, all of which change
     /// only the clanker they are typed in.
+    ///
+    /// `&mut` though nothing is changed: a `&self` held across the awaits
+    /// would need the worker to be `Sync` to stay spawnable, and its
+    /// database connection isn't.
     async fn reconnect_mcp(&mut self) {
         let before = crate::mcp::connected_counts();
         let config = match crate::config::load_config() {
@@ -1134,15 +1138,10 @@ impl Worker {
         outcome
     }
 
-    /// Runs a `$` command in the session's directory and reports the result.
-    ///
-    /// Spawned rather than awaited: the worker is in a `select!` loop, and
-    /// blocking it for the length of a command would stall everything else
-    /// the user can do — cancelling a turn included.
     /// Fetches the endpoint's model list on its own task, reporting the
     /// outcome as an event. Both arms are reported: a browser that opened on
     /// a failed fetch has to say why rather than sit empty.
-    fn list_models(&mut self) {
+    fn list_models(&self) {
         let client = Arc::clone(&self.client);
         let events = self.events.clone();
         tokio::spawn(async move {
@@ -1153,7 +1152,12 @@ impl Worker {
         });
     }
 
-    fn run_shell(&mut self, command: String) {
+    /// Runs a `$` command in the session's directory and reports the result.
+    ///
+    /// Spawned rather than awaited: the worker is in a `select!` loop, and
+    /// blocking it for the length of a command would stall everything else
+    /// the user can do — cancelling a turn included.
+    fn run_shell(&self, command: String) {
         let _ = self.events.send(Event::ShellStarted {
             command: command.clone(),
         });

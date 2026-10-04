@@ -493,7 +493,6 @@ dependencies = [
  "syntect",
  "terminal-colorsaurus",
  "textwrap",
- "thiserror 1.0.69",
  "tokio",
  "tui-markdown",
  "unicode-width 0.2.2",

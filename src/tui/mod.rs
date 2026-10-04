@@ -763,7 +763,7 @@ async fn handle_key(
     }
 
     match screen {
-        Screen::Launch(_) => handle_picker_key(context, screen, parked, key).await,
+        Screen::Launch(_) => handle_picker_key(context, screen, parked, key),
         Screen::Deploy(_) => handle_deploy_key(context, screen, key),
         Screen::Chat(chat) => {
             if handle_chat_key(&mut chat.app, &chat.conversation, key) {
@@ -793,7 +793,7 @@ async fn handle_key(
     }
 }
 
-async fn handle_picker_key(
+fn handle_picker_key(
     context: &Context,
     screen: &mut Screen,
     parked: &mut Parked,
